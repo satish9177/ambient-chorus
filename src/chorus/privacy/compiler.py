@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
-from uuid import UUID, uuid5
+from uuid import UUID
 
 from chorus.domain.entities import (
     CaseState,
@@ -28,12 +28,14 @@ from chorus.domain.facts import (
     LocationArea,
     Report,
     ServiceImpact,
+    collapse_evidence_root,
     independent_source_count,
 )
 from chorus.domain.ids import (
     EvidenceItemId,
     ExportFactId,
     FactId,
+    IdGenerator,
     OperationId,
     SafeEvidenceRefId,
     Sha256Digest,
@@ -210,30 +212,32 @@ class _Candidate:
 
 @dataclass(frozen=True, slots=True)
 class _CompileArtifactIds:
-    """UUIDv5 identities derived only from one compile id and stable typed labels."""
+    """Compiler artifact identities obtained only through the injected ID contract."""
 
-    compile_id: UUID
+    generator: IdGenerator
 
     def audit_id(self) -> OperationId:
-        return OperationId(uuid5(self.compile_id, "compiler/v1:audit"))
+        return self.generator.new(OperationId)
 
     def view_id(self) -> ViewId:
-        return ViewId(uuid5(self.compile_id, "compiler/v1:view"))
+        return self.generator.new(ViewId)
 
-    def export_fact_id(self, label: str, facts: tuple[Fact, ...]) -> ExportFactId:
-        source_key = ",".join(sorted(str(fact.fact_id) for fact in facts))
-        return ExportFactId(uuid5(self.compile_id, f"compiler/v1:export-fact:{label}:{source_key}"))
+    def export_fact_id(self) -> ExportFactId:
+        return self.generator.new(ExportFactId)
 
-    def safe_evidence_ref_id(self, source_evidence_id: EvidenceItemId) -> SafeEvidenceRefId:
-        return SafeEvidenceRefId(
-            uuid5(self.compile_id, f"compiler/v1:safe-evidence:{source_evidence_id}")
-        )
+    def safe_evidence_ref_id(self) -> SafeEvidenceRefId:
+        return self.generator.new(SafeEvidenceRefId)
 
 
 class PrivacyCompiler:
     """Run the frozen 22 gates without persistence, AWS, an LLM, or ambient authority."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        id_generator_factory: Callable[[UUID], IdGenerator],
+    ) -> None:
+        self._id_generator_factory = id_generator_factory
         self._policy_build_hash = hash_value(
             {
                 "policy_version": POLICY_VERSION,
@@ -252,7 +256,7 @@ class PrivacyCompiler:
     def compile(self, command: CompileCommand, context: CompileContext) -> CompileResult:
         """Evaluate policy in its normative order and return an auditable typed result."""
 
-        artifact_ids = _CompileArtifactIds(command.compile_id)
+        artifact_ids = _CompileArtifactIds(self._id_generator_factory(command.compile_id))
         audit_id = artifact_ids.audit_id().value
         audit: list[CompilerAuditDecision] = []
 
@@ -438,6 +442,18 @@ class PrivacyCompiler:
                 for candidate in candidates
                 if evidence_id in candidate.fact.evidence_ids
             }
+            try:
+                collapse_evidence_root(evidence.root_id, context.evidence_roots)
+            except ValueError:
+                return self._deny(
+                    command,
+                    context,
+                    audit_id,
+                    audit,
+                    CompilerGate.OWNERSHIP,
+                    CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR,
+                    subject_ref=str(evidence_id),
+                )
             if (
                 root is None
                 or root.community_id != context.case.community_id
@@ -699,6 +715,7 @@ class PrivacyCompiler:
                 if fact.case_id == context.case.case_id
                 and fact.community_id == context.case.community_id
                 and fact.namespace == context.case.namespace
+                and fact.status is FactStatus.ACTIVE
             )
             computed_sources = independent_source_count(
                 case_facts,
@@ -1338,9 +1355,9 @@ class PrivacyCompiler:
         safe_refs_by_source: dict[EvidenceItemId, ShareableEvidenceRef] = {}
         grouped_ids: set[FactId] = set()
 
-        def add_group(group: list[_Candidate], scope: DisclosureScope, stable_label: str) -> None:
+        def add_group(group: list[_Candidate], scope: DisclosureScope) -> None:
             source_facts = tuple(item.fact for item in group)
-            export_id = artifact_ids.export_fact_id(stable_label, source_facts)
+            export_id = artifact_ids.export_fact_id()
             output = transform_facts(
                 export_fact_id=export_id,
                 facts=source_facts,
@@ -1365,13 +1382,11 @@ class PrivacyCompiler:
             add_group(
                 aggregate_groups[fact_type],
                 DisclosureScope.AGGREGATE_ONLY,
-                f"aggregate:{fact_type.value}",
             )
         for scope in sorted(incident_groups, key=str):
             add_group(
                 incident_groups[scope],
                 scope,
-                f"incident:{scope.value}",
             )
 
         for candidate in eligible:
@@ -1390,12 +1405,12 @@ class PrivacyCompiler:
                 if safe_ref is None:
                     safe_ref = build_safe_evidence_ref(
                         candidate=safe_candidate,
-                        safe_evidence_ref_id=artifact_ids.safe_evidence_ref_id(evidence_id),
+                        safe_evidence_ref_id=artifact_ids.safe_evidence_ref_id(),
                         media_type=item.media_type,
                     )
                     safe_refs_by_source[evidence_id] = safe_ref
                     safe_refs.append(safe_ref)
-                export_id = artifact_ids.export_fact_id("evidence-description", (candidate.fact,))
+                export_id = artifact_ids.export_fact_id()
                 output = transform_evidence_description(
                     export_fact_id=export_id,
                     fact=candidate.fact,
@@ -1403,7 +1418,7 @@ class PrivacyCompiler:
                     safe_ref=safe_ref,
                 )
             else:
-                export_id = artifact_ids.export_fact_id("single", (candidate.fact,))
+                export_id = artifact_ids.export_fact_id()
                 output = transform_facts(
                     export_fact_id=export_id,
                     facts=(candidate.fact,),

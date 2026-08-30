@@ -6,12 +6,12 @@ from dataclasses import replace
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from tests.fixtures.elevator import build_elevator_fixture
-from tests.unit.privacy.test_compiler import _command
+from tests.unit.privacy.test_compiler import _command, _compiler
 
 from chorus.domain.entities import FactType
 from chorus.domain.facts import HealthDetail, SubjectRelation
 from chorus.privacy.canonical import to_canonical_primitive
-from chorus.privacy.compiler import CompileAllow, PrivacyCompiler
+from chorus.privacy.compiler import CompileAllow
 
 
 @given(st.text(alphabet=string.ascii_letters + string.digits, min_size=1, max_size=32))
@@ -35,7 +35,7 @@ def test_generated_internal_health_value_never_appears_in_view(secret_suffix: st
         optional_ids=frozenset({fixture.health_fact_id}),
     )
 
-    result = PrivacyCompiler().compile(command, context)
+    result = _compiler().compile(command, context)
 
     assert isinstance(result, CompileAllow)
     assert sentinel not in str(to_canonical_primitive(result.view))
@@ -45,11 +45,9 @@ def test_generated_internal_health_value_never_appears_in_view(secret_suffix: st
 @settings(max_examples=20)
 def test_requested_fact_permutation_preserves_canonical_view_hash(order: list[int]) -> None:
     fixture = build_elevator_fixture()
-    baseline = PrivacyCompiler().compile(
-        _command(fixture, fixture.incident_fact_ids), fixture.context
-    )
+    baseline = _compiler().compile(_command(fixture, fixture.incident_fact_ids), fixture.context)
     permuted_ids = tuple(fixture.incident_fact_ids[index] for index in order)
-    permuted = PrivacyCompiler().compile(_command(fixture, permuted_ids), fixture.context)
+    permuted = _compiler().compile(_command(fixture, permuted_ids), fixture.context)
 
     assert isinstance(baseline, CompileAllow)
     assert isinstance(permuted, CompileAllow)

@@ -7,7 +7,7 @@ import pytest
 from tests.fixtures.elevator import FIXTURE_NAMESPACE_UUID, build_elevator_fixture
 
 from chorus.domain.facts import ReportStatus, independent_source_count
-from chorus.domain.ids import CommunityId, FactId, MessageId, ReportId
+from chorus.domain.ids import CommunityId, FactId, MessageId, Namespace, ReportId
 
 
 def test_forwarded_photo_counts_as_one_root() -> None:
@@ -162,4 +162,28 @@ def test_forwarded_root_ancestry_cannot_cross_community() -> None:
             (forwarded_report,),
             fixture.context.evidence_items,
             roots,
+        )
+
+
+def test_evidence_item_namespace_must_match_fact_namespace() -> None:
+    fixture = build_elevator_fixture()
+    photo_fact = next(
+        fact for fact in fixture.context.facts if fact.fact_id == fixture.photo_fact_id
+    )
+    photo_report = next(
+        report for report in fixture.context.reports if report.report_id == photo_fact.report_id
+    )
+    evidence_items = tuple(
+        replace(item, namespace=Namespace("TEST_foreign"))
+        if item.evidence_id == fixture.photo_evidence_id
+        else item
+        for item in fixture.context.evidence_items
+    )
+
+    with pytest.raises(ValueError, match="namespace"):
+        independent_source_count(
+            (photo_fact,),
+            (photo_report,),
+            evidence_items,
+            fixture.context.evidence_roots,
         )

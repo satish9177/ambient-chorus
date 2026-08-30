@@ -376,6 +376,27 @@ def independent_source_count(
             or report.namespace != fact.namespace
         ):
             raise ValueError("fact report lineage is invalid")
+
+        evidence_sources: list[EvidenceRootSource] = []
+        for evidence_id in fact.evidence_ids:
+            item = evidence_by_id.get(evidence_id)
+            if item is None:
+                raise ValueError("fact evidence item is missing")
+            if (
+                item.case_id != fact.case_id
+                or item.community_id != fact.community_id
+                or item.namespace != fact.namespace
+            ):
+                raise ValueError("fact evidence crosses case, community, or namespace")
+            root = roots_by_id.get(item.root_id)
+            if (
+                root is None
+                or root.community_id != fact.community_id
+                or root.namespace != fact.namespace
+            ):
+                raise ValueError("fact evidence root crosses community or namespace")
+            evidence_sources.append(EvidenceRootSource(collapse_evidence_root(item.root_id, roots)))
+
         if report.status is ReportStatus.DUPLICATE:
             duplicate_of_report_id = report.duplicate_of_report_id
             if duplicate_of_report_id is None:
@@ -392,24 +413,10 @@ def independent_source_count(
         if report.status is ReportStatus.RETRACTED:
             continue
         contributor_sources = sources.setdefault(fact.contributor_id, set())
-        if not fact.evidence_ids:
+        if not evidence_sources:
             contributor_sources.add(ReporterSource(fact.contributor_id))
             continue
-        for evidence_id in fact.evidence_ids:
-            item = evidence_by_id.get(evidence_id)
-            if item is None:
-                raise ValueError("fact evidence item is missing")
-            if item.case_id != fact.case_id or item.community_id != fact.community_id:
-                raise ValueError("fact evidence crosses case or community")
-            root = roots_by_id.get(item.root_id)
-            if (
-                root is None
-                or root.community_id != fact.community_id
-                or root.namespace != fact.namespace
-            ):
-                raise ValueError("fact evidence root crosses community or namespace")
-            collapsed = collapse_evidence_root(item.root_id, roots)
-            contributor_sources.add(EvidenceRootSource(collapsed))
+        contributor_sources.update(evidence_sources)
 
     matched_source_to_contributor: dict[IndependentSource, ContributorId] = {}
 

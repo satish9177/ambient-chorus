@@ -13,6 +13,7 @@ from tests.fixtures.elevator import (
 )
 
 from chorus.domain.entities import (
+    DerivationKind,
     DisclosureScope,
     FactType,
     MandateStatus,
@@ -27,7 +28,17 @@ from chorus.domain.facts import (
     ReportStatus,
     ServiceImpact,
 )
-from chorus.domain.ids import CaseId, EvidenceItemId, FactId, MessageId, ReportId, Sha256Digest
+from chorus.domain.ids import (
+    CaseId,
+    EvidenceItemId,
+    FactId,
+    MessageId,
+    Namespace,
+    ReportId,
+    Sha256Digest,
+    Uuid4Generator,
+    Uuid5Generator,
+)
 from chorus.domain.mandates import CurrentMandatePointer, FactGrant, IdentityGrant
 from chorus.privacy.canonical import hash_mandate_terms, to_canonical_primitive, verify_hash
 from chorus.privacy.compiler import (
@@ -51,7 +62,12 @@ ZERO_DIGEST = Sha256Digest("sha256:" + "0" * 64)
 
 
 def _compiler() -> PrivacyCompiler:
-    return PrivacyCompiler()
+    return PrivacyCompiler(
+        id_generator_factory=lambda compile_id: Uuid5Generator(
+            namespace=compile_id,
+            prefix="compiler-test",
+        )
+    )
 
 
 def _command(
@@ -182,7 +198,7 @@ def test_compile_safe_example_runs_all_22_gates_and_hashes_view() -> None:
         "sha256:9b854cbf8ad4fc5464d3283adeb520bca48750c103d36c5235a6390a6d5d6e9e"
     )
     assert result.view.view_hash == Sha256Digest(
-        "sha256:8f95e6a8a80c399e0178655d7da6c959cdfd60ad6fd89adad26ae5da4368b344"
+        "sha256:48aa0934a21d00b4baef1ce0a94b04559dcb9120e4e85abea84dcd985a2dcd8e"
     )
     assert verify_hash(result.view, result.view.view_hash, omit_fields=frozenset({"view_hash"}))
 
@@ -567,7 +583,7 @@ def test_reviewed_photo_exports_only_opaque_safe_reference() -> None:
     assert "private/" not in rendered
 
 
-def test_reviewed_photo_replay_has_identical_safe_artifact_ids() -> None:
+def test_deterministic_fixture_generator_repeats_safe_artifact_ids() -> None:
     fixture = build_elevator_fixture()
     command = _command(
         fixture,
@@ -749,7 +765,195 @@ def test_duplicate_reports_cannot_satisfy_compiler_corroboration_gate() -> None:
     assert result.audit_decisions[-1].gate is CompilerGate.INDEPENDENCE
 
 
-def test_same_compile_replay_produces_identical_complete_result() -> None:
+def _reverse_context(context: CompileContext) -> CompileContext:
+    return replace(
+        context,
+        facts=tuple(reversed(context.facts)),
+        reports=tuple(reversed(context.reports)),
+        evidence_items=tuple(reversed(context.evidence_items)),
+        evidence_roots=tuple(reversed(context.evidence_roots)),
+        mandates=tuple(reversed(context.mandates)),
+        mandate_pointers=tuple(reversed(context.mandate_pointers)),
+        safe_evidence_candidates=tuple(reversed(context.safe_evidence_candidates)),
+    )
+
+
+def _context_without_photo_evidence(
+    fixture: ElevatorFixture,
+    *,
+    fact_status: FactStatus,
+    report_status: ReportStatus = ReportStatus.ACTIVE,
+) -> CompileContext:
+    photo_fact = next(
+        fact for fact in fixture.context.facts if fact.fact_id == fixture.photo_fact_id
+    )
+    return replace(
+        fixture.context,
+        facts=tuple(
+            replace(fact, status=fact_status) if fact.fact_id == photo_fact.fact_id else fact
+            for fact in fixture.context.facts
+        ),
+        reports=tuple(
+            replace(report, status=report_status)
+            if report.report_id == photo_fact.report_id
+            else report
+            for report in fixture.context.reports
+        ),
+        evidence_items=tuple(
+            item
+            for item in fixture.context.evidence_items
+            if item.evidence_id != fixture.photo_evidence_id
+        ),
+    )
+
+
+def test_foreign_corroboration_evidence_namespace_denies_as_integrity_failure() -> None:
+    fixture = build_elevator_fixture()
+    context = replace(
+        fixture.context,
+        evidence_items=tuple(
+            replace(item, namespace=Namespace("TEST_foreign"))
+            if item.evidence_id == fixture.photo_evidence_id
+            else item
+            for item in fixture.context.evidence_items
+        ),
+    )
+
+    result = _compiler().compile(
+        _command(fixture, fixture.incident_fact_ids),
+        context,
+    )
+
+    assert isinstance(result, CompileDeny)
+    assert _reason_codes(result) == {CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR}
+    assert result.audit_decisions[-1].gate is CompilerGate.INDEPENDENCE
+
+
+def test_foreign_corroboration_evidence_namespace_denial_is_order_independent() -> None:
+    fixture = build_elevator_fixture()
+    context = replace(
+        fixture.context,
+        evidence_items=tuple(
+            replace(item, namespace=Namespace("TEST_foreign"))
+            if item.evidence_id == fixture.photo_evidence_id
+            else item
+            for item in fixture.context.evidence_items
+        ),
+    )
+    command = _command(fixture, fixture.incident_fact_ids)
+
+    forward = _compiler().compile(command, context)
+    reverse = _compiler().compile(command, _reverse_context(context))
+
+    assert isinstance(forward, CompileDeny)
+    assert forward == reverse
+
+
+def test_requested_evidence_root_ancestry_namespace_mismatch_denies_ownership() -> None:
+    fixture = build_elevator_fixture()
+    photo_item = next(
+        item
+        for item in fixture.context.evidence_items
+        if item.evidence_id == fixture.photo_evidence_id
+    )
+    parent_root = next(
+        root
+        for root in fixture.context.evidence_roots
+        if root.root_id
+        == next(
+            item.root_id
+            for item in fixture.context.evidence_items
+            if item.evidence_id == fixture.commitment_evidence_id
+        )
+    )
+    context = replace(
+        fixture.context,
+        facts=tuple(
+            replace(fact, status=FactStatus.WITHDRAWN)
+            if fact.fact_id == fixture.photo_fact_id
+            else fact
+            for fact in fixture.context.facts
+        ),
+        evidence_roots=tuple(
+            replace(
+                root,
+                derivation_kind=DerivationKind.FORWARDED,
+                parent_root_id=parent_root.root_id,
+            )
+            if root.root_id == photo_item.root_id
+            else replace(root, namespace=Namespace("TEST_foreign"))
+            if root.root_id == parent_root.root_id
+            else root
+            for root in fixture.context.evidence_roots
+        ),
+    )
+
+    result = _compiler().compile(
+        _command(
+            fixture,
+            (fixture.photo_fact_id,),
+            usage=IntendedUsage.EVIDENCE,
+            evidence_ids=(fixture.photo_evidence_id,),
+        ),
+        context,
+    )
+
+    assert isinstance(result, CompileDeny)
+    assert _reason_codes(result) == {CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR}
+    assert result.audit_decisions[-1].gate is CompilerGate.OWNERSHIP
+
+
+def test_withdrawn_fact_missing_evidence_is_ignored_without_snapshot_exception() -> None:
+    fixture = build_elevator_fixture()
+    context = _context_without_photo_evidence(fixture, fact_status=FactStatus.WITHDRAWN)
+    command = _command(fixture, fixture.incident_fact_ids)
+
+    forward = _compiler().compile(command, context)
+    reverse = _compiler().compile(command, _reverse_context(context))
+
+    assert isinstance(forward, CompileAllow)
+    assert forward == reverse
+
+
+@pytest.mark.parametrize("report_status", [ReportStatus.ACTIVE, ReportStatus.RETRACTED])
+def test_active_fact_missing_evidence_denies_without_snapshot_exception(
+    report_status: ReportStatus,
+) -> None:
+    fixture = build_elevator_fixture()
+    context = _context_without_photo_evidence(
+        fixture,
+        fact_status=FactStatus.ACTIVE,
+        report_status=report_status,
+    )
+    command = _command(fixture, fixture.incident_fact_ids)
+
+    forward = _compiler().compile(command, context)
+    reverse = _compiler().compile(command, _reverse_context(context))
+
+    assert isinstance(forward, CompileDeny)
+    assert _reason_codes(forward) == {CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR}
+    assert forward.audit_decisions[-1].gate is CompilerGate.INDEPENDENCE
+    assert forward == reverse
+
+
+def test_uuid4_generator_factory_produces_normal_operation_artifact_ids() -> None:
+    fixture = build_elevator_fixture()
+
+    result = PrivacyCompiler(id_generator_factory=lambda _compile_id: Uuid4Generator()).compile(
+        _command(fixture, fixture.incident_fact_ids),
+        fixture.context,
+    )
+
+    assert isinstance(result, CompileAllow)
+    generated_ids = (
+        result.audit_event_id,
+        result.view.view_id.value,
+        *(fact.export_fact_id.value for fact in result.view.shareable_facts),
+    )
+    assert all(identifier.version == 4 for identifier in generated_ids)
+
+
+def test_deterministic_fixture_generator_repeated_compile_is_reproducible() -> None:
     fixture = build_elevator_fixture()
     compiler = _compiler()
     command = _command(fixture, fixture.incident_fact_ids)
@@ -784,7 +988,7 @@ def test_permuted_unordered_inputs_produce_identical_complete_view() -> None:
     assert forward.view == reverse.view
 
 
-def test_new_compile_id_produces_new_artifact_identities_and_hash() -> None:
+def test_deterministic_fixture_generator_scopes_artifacts_to_compile_id() -> None:
     fixture = build_elevator_fixture()
     command = _command(fixture, fixture.incident_fact_ids)
 
