@@ -1,0 +1,34 @@
+# V1 risk register
+
+Scale: likelihood and impact are `Low`, `Medium`, `High`. “Trigger” is the observable condition that changes the plan. Owners are engineering roles until people are assigned.
+
+| ID | Risk | L | I | Mitigation / contingency | Trigger and owner | Status |
+|---|---|---:|---:|---|---|---|
+| R01 | compiler bug exports unauthorized/private data | M | H | closed types/rules, pairwise/property/golden/sentinel tests, sole writer, human preview | any privacy metric/test >0; Privacy owner stops release | Open, zero tolerance |
+| R02 | Action runtime/artifact gains private access | L | H | separate role/artifact, explicit denies, no tools, static/import and deployed IAM canaries | any unexpected allow/import; Security owner blocks deploy | Open, zero tolerance |
+| R03 | model misses/false-links elevator pattern | M | M | bounded summaries, three-run 15-scenario eval, human candidate acceptance, tune prompt/input not policy | recall <0.90 or precision <0.95; Agent owner tunes or marks not ready | Open |
+| R04 | AgentCore cold start/service/deployment threatens demo | M | H | stable CDK resource, preflight/warm harmless fixture, version rollback, recorded backup; Action stays isolated | p95 operation >30s or failed smoke; Platform owner evaluates superseding ADR fallback | Open |
+| R05 | Nova 2 Lite quality insufficient for skeptical investigation/action | M | M | structured output, deterministic checks, prompt eval; model substitution only via ADR | quality target fails after two tuning cycles; Agent owner proposes ADR | Open |
+| R06 | SES sandbox/domain/recipient not ready | M | H | verified sender/recipient/config set and mailbox smoke early; controlled address | preflight cannot send; Platform owner blocks live send/uses recorded backup | Open prerequisite |
+| R07 | SES ambiguous outcome stalls demo | L | H | one call, `SEND_UNKNOWN`, config-event reconciliation, never retry, recorded backup | timeout/process death; Action owner quarantines/reconciles | Accepted behavior |
+| R08 | revoke/send concurrency creates stale disclosure | L | H | final strong revalidation + transactional 60s fence; concurrency tests | race test failure/fence >60s; Privacy owner blocks | Open, zero tolerance |
+| R09 | canonicalization/hash mismatch invalidates approval or hides mutation | L | H | one RFC 8785 module, golden vectors, backend sole hasher, constant-time verify | cross-platform golden mismatch; Domain owner blocks | Open |
+| R10 | duplicate/forwarded evidence inflates corroboration | M | H | content root/forward chain, contributor+root recomputation, corpus tests | scenario 3/4 fails; Investigation owner blocks readiness | Open |
+| R11 | logs/traces leak private prompts/data | M | H | allowlist logs, OTEL content processor, sentinel capture tests, short retention | sentinel/private key in telemetry; Security owner disables deploy/sending | Open, zero tolerance |
+| R12 | demo bearer token/persona exposes private UI | M | M | high entropy/session storage/rotation/throttling/no public production claim | URL/token shared or hostile use; Platform owner rotate/reset | Accepted hackathon residual |
+| R13 | reset deletes or misses non-DEMO/DEMO resources | L | H | exact namespace/confirmation, manifest, all-target validation, reset role/lock, no scan fallback | corrupt/missing manifest or non-demo target; Demo owner stops reset | Open |
+| R14 | scheduler create/replay misses or duplicates verification | M | M | deterministic name/token/generation/event, GetSchedule reconcile, watcher CAS, DLQ/alarms | schedule/DLQ smoke fails; Commitment owner blocks watcher demo | Open |
+| R15 | fixed logical timestamps cannot map to real Scheduler | L | M | audit logical/actual times; create future schedule; demo invokes same watcher contract | schedule rejects past/invalid time; Commitment owner fixes mapping | Mitigated by design |
+| R16 | image parser/metadata leaks or is malicious | M | H | fixed checksum-only fixtures, size/MIME, decode/re-encode, metadata strip, human checklist; arbitrary upload rejected | checksum/decode/review mismatch; Evidence owner excludes photo | Open |
+| R17 | DynamoDB transactions exceed limits or item size | L | M | V1 caps, bounded per-group monitor apply, size tests, no metadata dumps | >80 transaction actions or >300KiB item; Persistence owner splits bounded operation | Open |
+| R18 | AWS region/quota/CDK resource mismatch | M | H | `us-east-1`, account preflight, pinned CDK, synth/deploy early, explicit service quotas | clean deploy/smoke fails; Platform owner resolves before UI polish | Open prerequisite |
+| R19 | shared access/API abuse causes cost/DoS | M | M | token, throttling, body/token limits, bounded agent operations, budgets/alarms | spend/requests exceed budget; Platform owner revoke token/disable API | Open |
+| R20 | scope creep prevents vertical path | H | H | cut list, phase gates, one scenario/adapter/destination, ADR before changes | work outside current phase/core path; Principal engineer cuts immediately | Open |
+| R21 | conservative proposal validator rejects good copy | M | L | bounded re-proposal, visible reason, tune template/prompt; no bypass | >20% valid drafts rejected in eval; Action owner refines deterministic rule | Accepted trade-off |
+| R22 | natural-language claim is cited but not truly entailed | M | H | lexical support, safe facts, skeptical agent, human exact preview, evaluation rating | action support precision <1.0 fixed demo; Action owner blocks | Open |
+| R23 | manager reply spoof/malicious text creates bad commitment | M | M | fixed destination, cited/ranged/safe terms, no agent persistence/resolution | invalid source/date accepted; Commitment owner blocks | Open |
+| R24 | documentation and code diverge | M | H | AGENTS source order, ADR-first architecture changes, doc/link/contract tests in CI | enum/hash/IAM/API diff; maintainer stops merge | Open |
+
+## Architecture-blocking questions
+
+None remain. Operational values must be supplied before deployment: AWS account ID, chosen `us-east-1` account, SES verified sender/recipient, Bedrock/AgentCore quota/access, domain/base URL, budget, and demo token secret. Production identity, retention, arbitrary-upload scanning, and a real ambient adapter are deliberately deferred, not unresolved V1 choices.

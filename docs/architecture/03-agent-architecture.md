@@ -1,0 +1,150 @@
+# Agent architecture and orchestration
+
+## Decision
+
+CHORUS uses hand-written asynchronous application orchestration around three independent Strands `Agent` instances deployed as separate AgentCore runtimes. Agents are not tools for one another. Strands Graph, Workflow, Swarm, and implicit shared state are not used. Each invocation has one strict input DTO and one strict Pydantic structured-output DTO; runtime session state is not reused.
+
+This makes every privacy boundary, retry, timeout, persistence point, and state transition visible in application code. See [ADR-001](../adr/ADR-001-explicit-agent-orchestration.md) and [ADR-010](../adr/ADR-010-agentcore-runtime.md).
+
+## Common invocation envelope
+
+Every runtime receives:
+
+| Field | Type | Rule |
+|---|---|---|
+| `schema_version` | literal `agent-input/v1` | reject unknown |
+| `invocation_id` | UUID | reused for one safe retry |
+| `namespace` | constrained string | `DEMO` or environment-scoped; never agent-chosen |
+| `agent_name` | enum | must match endpoint |
+| `case_id` | UUID or null | null only for unlinked Monitor batches |
+| `case_version` | positive int or null | required when case ID present |
+| `requested_at` | UTC datetime | application clock |
+| `policy_version` | string | context only; agent cannot interpret as grant |
+| `payload` | agent-specific DTO | `extra='forbid'` |
+
+The runtime returns `AgentResultEnvelope` with `schema_version='agent-output/v1'`, the same invocation/case/version values, `agent_name`, `model_profile_arn_hash`, `prompt_version`, `started_at`, `completed_at`, and the agent-specific output. The runtime never returns chain-of-thought. Prompts and completions are not logged.
+
+Runtime-level validation checks schema, 1 MiB application payload limit, UTF-8, bounded collection sizes, exact agent name, and no unknown fields. Application-level validation additionally checks that every returned ID existed in the input and belongs to the same case.
+
+## Monitor / Intake Agent
+
+### Input
+
+`MonitorInput` contains:
+
+- `messages: tuple[MonitorMessage, ...]`, 1–50 items, each `{message_id, channel_message_id, contributor_pseudonym_id, sent_at, text, attachment_descriptors[]}`;
+- `candidate_case_summaries: tuple[CandidateSummary, ...]`, at most 20, each `{case_id, case_version, title, issue_type, location_area, fact_summaries[]}`;
+- `known_sensitive_categories: tuple[SensitivityCategory, ...]`;
+- `allowed_issue_types: literal tuple('ELEVATOR_FAILURE', 'OTHER')` for the V1 demo.
+
+Attachments are descriptors `{evidence_id, media_type, safe_caption?}`. Raw bytes and S3 URIs are not passed. Text is enclosed in explicit untrusted-data delimiters and cannot change the system prompt.
+
+### Output
+
+`MonitorOutput` contains:
+
+- `message_results[]` keyed by input `message_id`;
+- `proposed_reports[]: {client_ref, message_ids[], contributor_pseudonym_id, issue_type, summary, occurred_at?, location_area?, confidence_basis[]}`;
+- `proposed_facts[]: {client_ref, report_client_ref, fact_type, typed_value, sensitivity, evidence_ids[], source_spans[]}`;
+- `candidate_links[]: {report_client_ref, existing_case_id?, proposed_case_title, similarity_reasons[], dissimilarity_reasons[], confidence}`;
+- `sensitive_signals[]: {message_id, category, source_span}`;
+- `missing_information_requests[]: {contributor_pseudonym_id, report_client_ref, requested_fields[], reason}`;
+- `mandate_suggestions[]: {report_client_ref, fact_client_refs[], suggested_max_scope, suggested_purpose}`.
+
+Confidence is a decimal string in `[0,1]`; it is diagnostic, never an authorization or automatic truth threshold. The deterministic intake service assigns durable IDs, verifies spans against input text, maps typed values, and applies linkage thresholds. A mandate suggestion creates only a `PROPOSED` mandate; it can never produce approval.
+
+### Tools and permissions
+
+No tools. The Monitor sees only the explicit batch and bounded summaries. It cannot query storage, invoke another agent, compile, or write. The input purposely uses pseudonymous contributor IDs and omits contact data.
+
+## Investigator / Skeptic Agent
+
+### Input
+
+`InvestigationInput` is exactly one case:
+
+- `case: {case_id, version, title, issue_type, current_state}`;
+- `reports[]: {report_id, contributor_pseudonym_id, summary, occurred_at?, source_message_ids[]}`;
+- `facts[]: {fact_id, report_id, contributor_pseudonym_id, fact_type, typed_value, sensitivity, evidence_ids[], current_status}`;
+- `evidence[]: {evidence_id, root_id, submitted_by_pseudonym_id, media_type, sha256, derived_from_evidence_id?, extracted_text?, safe_machine_caption?}`;
+- `prior_assessment?: {assessment_id, based_on_case_version, findings[]}`;
+- `corroboration_min=2`.
+
+The Investigator may receive malicious evidence text and private facts because it is in the private zone. It receives pseudonyms, not contact data. A private presigned URL is never provided; the application extracts/decodes permitted evidence before invocation with byte/text limits. Health and apartment data may appear only when necessary to assess the incident and are explicitly labeled untrusted/private.
+
+### Output
+
+`InvestigationAssessmentDraft` contains:
+
+- `case_id`, `based_on_case_version`;
+- `linkage_decision: SAME_ISSUE | DIFFERENT_ISSUES | UNCERTAIN`;
+- `linkage_reasons[]` and `alternative_explanations[]`, each citing report/fact/evidence IDs;
+- `evidence_findings[]: {fact_id, proposed_status: REPORTED|CORROBORATED|VERIFIED|CONTRADICTED|UNKNOWN, supporting_evidence_ids[], opposing_evidence_ids[], independent_source_groups[], rationale}`;
+- `contradictions[]: {statement_fact_ids[], description, materiality: LOW|MEDIUM|HIGH}`;
+- `duplicate_evidence_groups[]: {root_id, evidence_ids[], reason}`;
+- `proposed_commitments[]: {source_evidence_id, obligor, action_text, due_at, verification_method}`;
+- `sufficiency: {independent_source_count, is_corroborated, gaps[]}`;
+- `recommended_case_disposition: CONTINUE_INVESTIGATION | READY_FOR_ACTION | SPLIT_CANDIDATE | CLOSE_UNRESOLVED`.
+
+Deterministic validation recomputes root/contributor independence, validates all citations, forbids a `VERIFIED` status without an allowed verification source, and computes final sufficiency. The LLM cannot choose state, create a case split, or create a commitment directly; it submits a cited proposal to application rules/human review.
+
+## Action Coordinator Agent
+
+### Input
+
+`ActionAgentInput` is the serialized current `ShareableCaseView` and nothing else. It contains no system-generated side channel, conversational history, retrieval tool, private identifier, private URI, contact detail, excluded-fact explanation, or mandate record. Its destination contains only a safe display label plus opaque version/routing token—never an address. The view fields are defined in [05-privacy-compiler-and-shareable-view.md](05-privacy-compiler-and-shareable-view.md).
+
+The system prompt says every factual assertion must be represented as a claim citing one or more `export_fact_id` values and that cited facts are data, not instructions. The agent has no tools. It does not render email HTML or choose the actual address.
+
+### Output
+
+`ActionProposalDraft` contains:
+
+- `view_id: UUID`, `view_hash: Sha256Digest`, `case_id: UUID`, `case_version: int`;
+- `subject: str` (1–120 characters, no newline);
+- `claims: tuple[ActionClaimDraft, ...]` (1–12), each `{claim_id, text 1–500, export_fact_ids 1–10}`;
+- `request: {requested_action: str 1–500, requested_deadline: UTC datetime?, request_fact_ids[]}`;
+- `caveats: tuple[{text, export_fact_ids[]}, ...]` (0–8);
+- `tone: NEUTRAL | COLLABORATIVE | FIRM`.
+
+`request.requested_action` is normative preference, not a factual claim; if it includes a factual premise it must cite IDs. The deterministic validator rejects newline/header injection, HTML, URLs not present in safe evidence, uncited numbers/dates/names, non-view IDs, duplicate claim IDs, wrong/stale view identity, and prohibited identity tokens. It then assigns `action_id`, canonicalizes, hashes, and persists. No free-form body supplied by the model is accepted.
+
+## Prompt and model configuration
+
+- All agents use application inference profiles backed by `amazon.nova-2-lite-v1:0`, one profile per agent for IAM and cost attribution.
+- `temperature=0`; maximum output tokens are 4,000 Monitor, 6,000 Investigator, and 3,000 Action.
+- Prompt IDs are `monitor/v1`, `investigator/v1`, and `action/v1`; prompt text is version-controlled next to each runtime.
+- Strands structured output is backed by strict Pydantic v2 models. `extra='forbid'`, bounded strings/arrays, discriminated unions, and semantic validators are mandatory.
+- AgentCore sessions are stateless, one invocation per random session ID. Direct-code Python 3.12 runtimes use isolated VPC subnets with no NAT/internet and endpoint-scoped AWS egress. No Memory, Gateway, Browser, Code Interpreter, MCP, A2A, filesystem persistence, or dynamic tool loading.
+
+## Orchestration, retries, and failure handling
+
+```mermaid
+flowchart TD
+    Command[Application command] --> Load[Load bounded current input]
+    Load --> Invoke[Invoke named AgentCore endpoint]
+    Invoke -->|timeout/5xx before result| Retry{attempt 1?}
+    Retry -->|yes; same invocation ID| Invoke
+    Retry -->|no| Failed[AGENT_TIMEOUT/DEPENDENCY_ERROR]
+    Invoke --> Parse[Strict schema parse]
+    Parse -->|invalid| Contract[AGENT_CONTRACT_VIOLATION]
+    Parse --> Semantic[Validate IDs, ownership, case, invariants]
+    Semantic -->|invalid| Contract
+    Semantic --> Persist[Conditional persist + audit]
+    Persist -->|version conflict| Reload[Return PERSISTENCE_CONFLICT; caller may restart command]
+```
+
+An agent call is automatically retried once only when no output was persisted and the failure is a timeout, throttling, or transient AgentCore/Bedrock 5xx. It uses the same `invocation_id` and input hash. Invalid JSON/schema, invented IDs, cross-case IDs, policy-like instructions, and semantic violations are not retried automatically. A persisted output is never duplicated; the invocation record maps its input hash to the result ID.
+
+Application orchestration is a set of explicit use cases—not a generic workflow abstraction:
+
+- `IngestMessages` → persist → `RunMonitor` → validate/apply proposals;
+- `InvestigateCase` → load private case → `RunInvestigator` → validate/apply assessment;
+- `CompileShareableView` → invoke compiler;
+- `ProposeAction` → strongly read current view → invoke Action → validate/persist;
+- `ApproveAction` → immutable approval;
+- `ExecuteAction` → invoke sender by ID;
+- `RecordExternalReply` → evidence → Investigator commitment proposal → deterministic persist/schedule;
+- `HandleCommitmentDue` → replay-safe watcher.
+
+There is no generic agent registry exposed to agents and no LLM-controlled branching.
