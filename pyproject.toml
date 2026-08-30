@@ -1,0 +1,106 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ambient-chorus"
+version = "0.1.0"
+description = "Deterministic privacy foundation for Ambient CHORUS"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "pydantic>=2.12,<3",
+  "pydantic-settings>=2.10,<3",
+  "rfc8785>=0.1.4,<0.2",
+]
+
+[dependency-groups]
+dev = [
+  "import-linter>=2.5,<3",
+  "mypy>=1.18,<2",
+  "pip-licenses>=5,<6",
+  "ruff>=0.14,<1",
+]
+test = [
+  "hypothesis>=6.140,<7",
+  "pytest>=8.4,<9",
+  "pytest-cov>=7,<8",
+]
+infra = [
+  "aws-cdk-lib>=2.220,<3",
+  "constructs>=10.4,<11",
+]
+
+[tool.uv]
+default-groups = ["dev", "test", "infra"]
+cache-dir = ".tools/uv-cache"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chorus"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers --showlocals"
+cache_dir = "build/pytest-cache"
+testpaths = ["tests"]
+pythonpath = ["."]
+xfail_strict = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "infra", "tools"]
+
+[tool.ruff.lint]
+select = ["B", "C4", "E", "F", "I", "RUF", "S", "SIM", "UP"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = ["src"]
+plugins = ["pydantic.mypy"]
+exclude = ["^cdk.out/", "^node_modules/"]
+
+[[tool.mypy.overrides]]
+module = ["rfc8785"]
+ignore_missing_imports = true
+
+[tool.importlinter]
+root_packages = ["chorus"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Domain depends only on the standard library"
+type = "forbidden"
+source_modules = ["chorus.domain"]
+forbidden_modules = [
+  "pydantic",
+  "pydantic_settings",
+  "fastapi",
+  "boto3",
+  "botocore",
+  "strands",
+  "aws_cdk",
+  "chorus.privacy",
+  "chorus.infrastructure",
+]
+
+[[tool.importlinter.contracts]]
+name = "Privacy stays deterministic and infrastructure free"
+type = "forbidden"
+source_modules = ["chorus.privacy"]
+forbidden_modules = [
+  "pydantic",
+  "pydantic_settings",
+  "fastapi",
+  "boto3",
+  "botocore",
+  "strands",
+  "aws_cdk",
+  "chorus.infrastructure",
+]

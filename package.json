@@ -1,0 +1,19 @@
+{
+  "name": "ambient-chorus",
+  "private": true,
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "lint": "npm run lint --workspace @ambient-chorus/web",
+    "typecheck": "npm run typecheck --workspace @ambient-chorus/web",
+    "test": "npm run test --workspace @ambient-chorus/web",
+    "build": "npm run build --workspace @ambient-chorus/web",
+    "e2e:list": "npm run e2e:list --workspace @ambient-chorus/web",
+    "cdk:synth": "cdk --app \"uv run python -m infra.cdk.app\" synth"
+  },
+  "devDependencies": {
+    "aws-cdk": "^2.1030.0"
+  }
+}
+
