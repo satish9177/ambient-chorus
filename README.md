@@ -2,7 +2,8 @@
 
 > One complaint is easy to ignore. Chorus finds the pattern.
 
-**STATUS: Architecture / Design phase. No application functionality is implemented yet.**
+**STATUS: Phase 0–1 deterministic foundation implemented; later phases are intentionally
+deferred.**
 
 Ambient CHORUS is a background community investigator for the AWS Agents for Humans Hackathon, Good Neighbor Agents track. It watches a channel a community already uses, recognizes when independent fragments point to the same unresolved problem, asks affected people privately what may be shared, and turns only authorized facts into one evidence-backed action.
 
@@ -28,7 +29,37 @@ The planned AWS stack is Python 3.12, FastAPI, Pydantic v2, Strands Agents, Amaz
 
 Start with [docs/README.md](docs/README.md). It defines the document precedence, frozen decisions, reading order, ADR index, and implementation-plan entry point. [AGENTS.md](AGENTS.md) contains mandatory instructions for coding agents.
 
-Implementation begins only after explicit approval. The build sequence is in [docs/plans/implementation-plan.md](docs/plans/implementation-plan.md); local setup commands will be added in Phase 0 and are intentionally not fabricated here.
+The build sequence is in
+[docs/plans/implementation-plan.md](docs/plans/implementation-plan.md). Phase 0 and Phase 1
+were explicitly approved; implementation must stop before Phase 2 until separately approved.
+
+## Developer commands
+
+Prerequisites are Python 3.12, `uv`, Node.js, npm, and Docker only when DynamoDB Local is
+needed. Install and validate the current foundation from the repository root:
+
+```text
+uv sync --frozen
+npm ci
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy src tests infra tools
+uv run pytest
+uv run lint-imports
+uv run python tools/check_architecture_links.py
+uv run python tools/check_secrets.py
+uv run pip-licenses --from=mixed --format=plain
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npm run e2e:list
+npm exec cdk -- --app "uv run python -m infra.cdk.app" synth
+```
+
+The pure compiler uses the small `rfc8785` package for RFC 8785/JCS bytes; it does not
+approximate canonical JSON with `json.dumps`. The Python and npm locks are the authoritative
+resolved-version and transitive-license inputs.
 
 ## Hackathon scope
 

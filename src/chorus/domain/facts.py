@@ -1,0 +1,355 @@
+"""Closed fact union, reports, and evidence-independence calculation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
+
+from chorus.domain.entities import (
+    EvidenceItem,
+    EvidenceRoot,
+    EvidenceStatus,
+    FactType,
+    SensitivityCategory,
+)
+from chorus.domain.ids import (
+    CaseId,
+    CommunityId,
+    ContributorId,
+    EvidenceItemId,
+    EvidenceRootId,
+    FactId,
+    MessageId,
+    Namespace,
+    ReportId,
+    SensitiveStr,
+)
+from chorus.domain.time import require_utc
+
+
+class FailureMode(StrEnum):
+    STUCK = "STUCK"
+    OUT_OF_SERVICE = "OUT_OF_SERVICE"
+    ERRATIC = "ERRATIC"
+    UNKNOWN = "UNKNOWN"
+
+
+class ImpactCode(StrEnum):
+    DELAY = "DELAY"
+    TRAPPED = "TRAPPED"
+    ACCESS_BLOCKED = "ACCESS_BLOCKED"
+    OTHER = "OTHER"
+
+
+class LocationAreaCode(StrEnum):
+    LOBBY = "LOBBY"
+    ELEVATOR_CAB = "ELEVATOR_CAB"
+    COMMON_AREA = "COMMON_AREA"
+    BUILDING = "BUILDING"
+
+
+class SubjectRelation(StrEnum):
+    SELF = "SELF"
+    FAMILY = "FAMILY"
+    OTHER = "OTHER"
+
+
+class EvidenceMediaKind(StrEnum):
+    IMAGE = "IMAGE"
+    EMAIL = "EMAIL"
+    TEXT = "TEXT"
+
+
+class ReportStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    DUPLICATE = "DUPLICATE"
+    RETRACTED = "RETRACTED"
+
+
+class FactStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    WITHDRAWN = "WITHDRAWN"
+
+
+def _bounded(value: str, maximum: int, field_name: str) -> None:
+    if not 1 <= len(value) <= maximum:
+        raise ValueError(f"{field_name} length is invalid")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class IncidentOccurrence:
+    occurred_at: datetime
+    failure_mode: FailureMode
+    equipment: str = "ELEVATOR"
+
+    def __post_init__(self) -> None:
+        require_utc(self.occurred_at)
+        if self.equipment != "ELEVATOR":
+            raise ValueError("V1 supports elevator incidents only")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ServiceImpact:
+    impact_code: ImpactCode
+    summary: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        _bounded(self.summary, 500, "summary")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LocationArea:
+    area: LocationAreaCode
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class IdentityAttribute:
+    display_name: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        _bounded(self.display_name, 120, "display_name")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class UnitLocation:
+    unit_label: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        _bounded(self.unit_label, 40, "unit_label")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class HealthDetail:
+    subject_relation: SubjectRelation
+    detail: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        _bounded(self.detail, 500, "detail")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ManagementStatement:
+    statement: str = field(repr=False)
+    speaker_org: str
+    stated_at: datetime
+
+    def __post_init__(self) -> None:
+        _bounded(self.statement, 1_000, "statement")
+        _bounded(self.speaker_org, 120, "speaker_org")
+        require_utc(self.stated_at)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Contradiction:
+    statement_fact_ids: tuple[FactId, ...]
+    summary: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not 2 <= len(self.statement_fact_ids) <= 10:
+            raise ValueError("contradiction requires 2 to 10 cited facts")
+        if len(set(self.statement_fact_ids)) != len(self.statement_fact_ids):
+            raise ValueError("contradiction fact IDs must be unique")
+        _bounded(self.summary, 500, "summary")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CommitmentTerm:
+    obligor: str
+    action_text: str = field(repr=False)
+    due_at: datetime
+    verification_method: str
+
+    def __post_init__(self) -> None:
+        _bounded(self.obligor, 120, "obligor")
+        _bounded(self.action_text, 500, "action_text")
+        _bounded(self.verification_method, 300, "verification_method")
+        require_utc(self.due_at)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EvidenceDescription:
+    description: str = field(repr=False)
+    media_kind: EvidenceMediaKind
+
+    def __post_init__(self) -> None:
+        _bounded(self.description, 500, "description")
+
+
+type FactValue = (
+    IncidentOccurrence
+    | ServiceImpact
+    | LocationArea
+    | IdentityAttribute
+    | UnitLocation
+    | HealthDetail
+    | ManagementStatement
+    | Contradiction
+    | CommitmentTerm
+    | EvidenceDescription
+)
+
+FACT_VALUE_TYPES: dict[type[object], FactType] = {
+    IncidentOccurrence: FactType.INCIDENT_OCCURRENCE,
+    ServiceImpact: FactType.SERVICE_IMPACT,
+    LocationArea: FactType.LOCATION_AREA,
+    IdentityAttribute: FactType.IDENTITY_ATTRIBUTE,
+    UnitLocation: FactType.UNIT_LOCATION,
+    HealthDetail: FactType.HEALTH_DETAIL,
+    ManagementStatement: FactType.MANAGEMENT_STATEMENT,
+    Contradiction: FactType.CONTRADICTION,
+    CommitmentTerm: FactType.COMMITMENT_TERM,
+    EvidenceDescription: FactType.EVIDENCE_DESCRIPTION,
+}
+
+REQUIRED_SENSITIVITY: dict[FactType, SensitivityCategory] = {
+    FactType.IDENTITY_ATTRIBUTE: SensitivityCategory.IDENTITY,
+    FactType.UNIT_LOCATION: SensitivityCategory.UNIT_LOCATION,
+    FactType.HEALTH_DETAIL: SensitivityCategory.HEALTH,
+}
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Report:
+    report_id: ReportId
+    case_id: CaseId | None
+    community_id: CommunityId
+    contributor_id: ContributorId
+    namespace: Namespace
+    source_message_ids: tuple[MessageId, ...]
+    issue_type: str
+    private_summary: SensitiveStr = field(repr=False)
+    occurred_at: datetime | None
+    location_area: LocationAreaCode | None
+    evidence_ids: tuple[EvidenceItemId, ...]
+    status: ReportStatus
+    duplicate_of_report_id: ReportId | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    schema_version: str = "report/v1"
+
+    def __post_init__(self) -> None:
+        if not self.source_message_ids:
+            raise ValueError("report requires source messages")
+        if len(set(self.source_message_ids)) != len(self.source_message_ids):
+            raise ValueError("source_message_ids must be unique")
+        _bounded(self.issue_type, 80, "issue_type")
+        _bounded(self.private_summary.reveal(), 1_000, "private_summary")
+        if self.occurred_at is not None:
+            require_utc(self.occurred_at)
+        if len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise ValueError("evidence_ids must be unique")
+        if self.status is ReportStatus.DUPLICATE and self.duplicate_of_report_id is None:
+            raise ValueError("duplicate reports require duplicate_of_report_id")
+        if self.status is not ReportStatus.DUPLICATE and self.duplicate_of_report_id is not None:
+            raise ValueError("only duplicate reports may point at an original")
+        if self.version < 1:
+            raise ValueError("version must be positive")
+        require_utc(self.created_at)
+        require_utc(self.updated_at)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Fact:
+    fact_id: FactId
+    case_id: CaseId
+    report_id: ReportId
+    community_id: CommunityId
+    contributor_id: ContributorId
+    namespace: Namespace
+    fact_type: FactType
+    value: FactValue = field(repr=False)
+    sensitivity: SensitivityCategory
+    evidence_ids: tuple[EvidenceItemId, ...]
+    evidence_status: EvidenceStatus
+    source_message_ids: tuple[MessageId, ...]
+    supersedes_fact_id: FactId | None
+    status: FactStatus
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    schema_version: str = "fact/v1"
+
+    def __post_init__(self) -> None:
+        expected_type = FACT_VALUE_TYPES.get(type(self.value))
+        if expected_type is not self.fact_type:
+            raise ValueError("fact discriminator does not match value type")
+        required_sensitivity = REQUIRED_SENSITIVITY.get(self.fact_type)
+        if required_sensitivity is not None and self.sensitivity is not required_sensitivity:
+            raise ValueError("fact sensitivity does not match protected fact type")
+        if not self.source_message_ids:
+            raise ValueError("fact requires source message lineage")
+        if len(set(self.source_message_ids)) != len(self.source_message_ids):
+            raise ValueError("source message IDs must be unique")
+        if len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise ValueError("evidence IDs must be unique")
+        if self.version < 1:
+            raise ValueError("version must be positive")
+        require_utc(self.created_at)
+        require_utc(self.updated_at)
+
+
+def collapse_evidence_root(
+    root_id: EvidenceRootId, roots: tuple[EvidenceRoot, ...]
+) -> EvidenceRootId:
+    """Collapse a forwarded/transformed chain and reject missing roots or cycles."""
+
+    by_id = {root.root_id: root for root in roots}
+    current = root_id
+    visited: set[EvidenceRootId] = set()
+    while True:
+        if current in visited:
+            raise ValueError("evidence root cycle")
+        visited.add(current)
+        root = by_id.get(current)
+        if root is None:
+            raise ValueError("evidence root is missing")
+        if root.parent_root_id is None:
+            return current
+        current = root.parent_root_id
+
+
+def independent_source_count(
+    facts: tuple[Fact, ...],
+    evidence_items: tuple[EvidenceItem, ...],
+    roots: tuple[EvidenceRoot, ...],
+) -> int:
+    """Count a maximum set with distinct contributors and collapsed evidence origins."""
+
+    evidence_by_id = {item.evidence_id: item for item in evidence_items}
+    sources: dict[ContributorId, set[str]] = {}
+    for fact in facts:
+        if fact.status is not FactStatus.ACTIVE:
+            continue
+        contributor_sources = sources.setdefault(fact.contributor_id, set())
+        if not fact.evidence_ids:
+            contributor_sources.add(f"reporter:{fact.contributor_id}")
+            continue
+        for evidence_id in fact.evidence_ids:
+            item = evidence_by_id.get(evidence_id)
+            if item is None:
+                raise ValueError("fact evidence item is missing")
+            if item.case_id != fact.case_id or item.community_id != fact.community_id:
+                raise ValueError("fact evidence crosses case or community")
+            collapsed = collapse_evidence_root(item.root_id, roots)
+            contributor_sources.add(f"root:{collapsed}")
+
+    matched_source_to_contributor: dict[str, ContributorId] = {}
+
+    def assign(contributor: ContributorId, seen: set[str]) -> bool:
+        for source in sorted(sources[contributor]):
+            if source in seen:
+                continue
+            seen.add(source)
+            current = matched_source_to_contributor.get(source)
+            if current is None or assign(current, seen):
+                matched_source_to_contributor[source] = contributor
+                return True
+        return False
+
+    matched = 0
+    for contributor in sorted(sources, key=str):
+        if assign(contributor, set()):
+            matched += 1
+    return matched
