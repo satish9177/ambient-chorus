@@ -51,7 +51,10 @@ def to_canonical_primitive(value: object, *, omit_fields: frozenset[str] = froze
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TypeError("canonical maps require string keys")
-            result[_normalize_string(key)] = to_canonical_primitive(item)
+            normalized_key = _normalize_string(key)
+            if normalized_key in result:
+                raise TypeError("canonical maps cannot contain duplicate NFC-normalized keys")
+            result[normalized_key] = to_canonical_primitive(item)
         return result
     if is_dataclass(value) and not isinstance(value, type):
         return {

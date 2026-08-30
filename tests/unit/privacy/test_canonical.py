@@ -41,6 +41,11 @@ def test_canonicalization_rejects_floats() -> None:
         canonical_bytes({"unsafe": 1.5})
 
 
+def test_mapping_keys_that_collide_after_nfc_normalization_are_rejected() -> None:
+    with pytest.raises(TypeError, match="duplicate NFC-normalized keys"):
+        canonical_bytes({"é": 1, "e\u0301": 2})
+
+
 def test_hash_round_trip_and_constant_time_verification() -> None:
     value = {"b": 2, "a": 1}
     digest = hash_value(value)

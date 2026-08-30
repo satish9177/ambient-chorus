@@ -296,6 +296,13 @@ def collapse_evidence_root(
     """Collapse a forwarded/transformed chain and reject missing roots or cycles."""
 
     by_id = {root.root_id: root for root in roots}
+    if len(by_id) != len(roots):
+        raise ValueError("evidence root IDs must be unique")
+    starting_root = by_id.get(root_id)
+    if starting_root is None:
+        raise ValueError("evidence root is missing")
+    expected_community = starting_root.community_id
+    expected_namespace = starting_root.namespace
     current = root_id
     visited: set[EvidenceRootId] = set()
     while True:
@@ -305,26 +312,88 @@ def collapse_evidence_root(
         root = by_id.get(current)
         if root is None:
             raise ValueError("evidence root is missing")
+        if root.community_id != expected_community or root.namespace != expected_namespace:
+            raise ValueError("evidence root ancestry crosses community or namespace")
         if root.parent_root_id is None:
             return current
         current = root.parent_root_id
 
 
+@dataclass(frozen=True, slots=True)
+class ReporterSource:
+    """One active reporter-origin source without attached evidence."""
+
+    contributor_id: ContributorId
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceRootSource:
+    """One earliest-known evidence origin shared across copies and forwards."""
+
+    root_id: EvidenceRootId
+
+
+type IndependentSource = ReporterSource | EvidenceRootSource
+
+
+def _source_sort_key(source: IndependentSource) -> tuple[str, str]:
+    if isinstance(source, ReporterSource):
+        return ("reporter", str(source.contributor_id))
+    return ("evidence-root", str(source.root_id))
+
+
 def independent_source_count(
     facts: tuple[Fact, ...],
+    reports: tuple[Report, ...],
     evidence_items: tuple[EvidenceItem, ...],
     roots: tuple[EvidenceRoot, ...],
 ) -> int:
-    """Count a maximum set with distinct contributors and collapsed evidence origins."""
+    """Count active, non-duplicate reports with distinct contributors and origins."""
 
+    reports_by_id = {report.report_id: report for report in reports}
     evidence_by_id = {item.evidence_id: item for item in evidence_items}
-    sources: dict[ContributorId, set[str]] = {}
+    roots_by_id = {root.root_id: root for root in roots}
+    if len(reports_by_id) != len(reports):
+        raise ValueError("report IDs must be unique")
+    if len(evidence_by_id) != len(evidence_items):
+        raise ValueError("evidence item IDs must be unique")
+    if len(roots_by_id) != len(roots):
+        raise ValueError("evidence root IDs must be unique")
+    root_content_keys = {(root.community_id, root.root_sha256) for root in roots}
+    if len(root_content_keys) != len(roots):
+        raise ValueError("evidence roots must be content-address unique within a community")
+
+    sources: dict[ContributorId, set[IndependentSource]] = {}
     for fact in facts:
         if fact.status is not FactStatus.ACTIVE:
             continue
+        report = reports_by_id.get(fact.report_id)
+        if (
+            report is None
+            or report.case_id != fact.case_id
+            or report.community_id != fact.community_id
+            or report.contributor_id != fact.contributor_id
+            or report.namespace != fact.namespace
+        ):
+            raise ValueError("fact report lineage is invalid")
+        if report.status is ReportStatus.DUPLICATE:
+            duplicate_of_report_id = report.duplicate_of_report_id
+            if duplicate_of_report_id is None:
+                raise ValueError("duplicate report origin is missing")
+            original = reports_by_id.get(duplicate_of_report_id)
+            if (
+                original is None
+                or original.case_id != report.case_id
+                or original.community_id != report.community_id
+                or original.namespace != report.namespace
+            ):
+                raise ValueError("duplicate report origin is invalid")
+            continue
+        if report.status is ReportStatus.RETRACTED:
+            continue
         contributor_sources = sources.setdefault(fact.contributor_id, set())
         if not fact.evidence_ids:
-            contributor_sources.add(f"reporter:{fact.contributor_id}")
+            contributor_sources.add(ReporterSource(fact.contributor_id))
             continue
         for evidence_id in fact.evidence_ids:
             item = evidence_by_id.get(evidence_id)
@@ -332,13 +401,20 @@ def independent_source_count(
                 raise ValueError("fact evidence item is missing")
             if item.case_id != fact.case_id or item.community_id != fact.community_id:
                 raise ValueError("fact evidence crosses case or community")
+            root = roots_by_id.get(item.root_id)
+            if (
+                root is None
+                or root.community_id != fact.community_id
+                or root.namespace != fact.namespace
+            ):
+                raise ValueError("fact evidence root crosses community or namespace")
             collapsed = collapse_evidence_root(item.root_id, roots)
-            contributor_sources.add(f"root:{collapsed}")
+            contributor_sources.add(EvidenceRootSource(collapsed))
 
-    matched_source_to_contributor: dict[str, ContributorId] = {}
+    matched_source_to_contributor: dict[IndependentSource, ContributorId] = {}
 
-    def assign(contributor: ContributorId, seen: set[str]) -> bool:
-        for source in sorted(sources[contributor]):
+    def assign(contributor: ContributorId, seen: set[IndependentSource]) -> bool:
+        for source in sorted(sources[contributor], key=_source_sort_key):
             if source in seen:
                 continue
             seen.add(source)

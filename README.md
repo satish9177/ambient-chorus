@@ -47,6 +47,7 @@ uv run mypy src tests infra tools
 uv run pytest
 uv run lint-imports
 uv run python tools/check_architecture_links.py
+uv run python tools/check_license.py
 uv run python tools/check_secrets.py
 uv run pip-licenses --from=mixed --format=plain
 npm run lint

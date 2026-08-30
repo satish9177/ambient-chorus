@@ -26,6 +26,7 @@ jobs:
       - run: uv run lint-imports
       - run: uv run pytest
       - run: uv run python tools/check_architecture_links.py
+      - run: uv run python tools/check_license.py
       - run: uv run python tools/check_secrets.py
       - run: npm run lint
       - run: npm run typecheck
@@ -33,4 +34,3 @@ jobs:
       - run: npm run build
       - run: npm run e2e:list
       - run: npm run cdk:synth
-

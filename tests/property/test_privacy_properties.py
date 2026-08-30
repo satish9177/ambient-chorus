@@ -5,12 +5,11 @@ from dataclasses import replace
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from tests.fixtures.elevator import FIXTURE_NAMESPACE_UUID, build_elevator_fixture
+from tests.fixtures.elevator import build_elevator_fixture
 from tests.unit.privacy.test_compiler import _command
 
 from chorus.domain.entities import FactType
 from chorus.domain.facts import HealthDetail, SubjectRelation
-from chorus.domain.ids import Uuid5Generator
 from chorus.privacy.canonical import to_canonical_primitive
 from chorus.privacy.compiler import CompileAllow, PrivacyCompiler
 
@@ -36,9 +35,7 @@ def test_generated_internal_health_value_never_appears_in_view(secret_suffix: st
         optional_ids=frozenset({fixture.health_fact_id}),
     )
 
-    result = PrivacyCompiler(
-        Uuid5Generator(FIXTURE_NAMESPACE_UUID, prefix="property-health")
-    ).compile(command, context)
+    result = PrivacyCompiler().compile(command, context)
 
     assert isinstance(result, CompileAllow)
     assert sentinel not in str(to_canonical_primitive(result.view))
@@ -48,13 +45,11 @@ def test_generated_internal_health_value_never_appears_in_view(secret_suffix: st
 @settings(max_examples=20)
 def test_requested_fact_permutation_preserves_canonical_view_hash(order: list[int]) -> None:
     fixture = build_elevator_fixture()
-    baseline = PrivacyCompiler(
-        Uuid5Generator(FIXTURE_NAMESPACE_UUID, prefix="property-order")
-    ).compile(_command(fixture, fixture.incident_fact_ids), fixture.context)
+    baseline = PrivacyCompiler().compile(
+        _command(fixture, fixture.incident_fact_ids), fixture.context
+    )
     permuted_ids = tuple(fixture.incident_fact_ids[index] for index in order)
-    permuted = PrivacyCompiler(
-        Uuid5Generator(FIXTURE_NAMESPACE_UUID, prefix="property-order")
-    ).compile(_command(fixture, permuted_ids), fixture.context)
+    permuted = PrivacyCompiler().compile(_command(fixture, permuted_ids), fixture.context)
 
     assert isinstance(baseline, CompileAllow)
     assert isinstance(permuted, CompileAllow)

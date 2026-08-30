@@ -8,7 +8,6 @@ from uuid import UUID
 
 from chorus.domain.entities import DisclosureScope, EvidenceStatus, FactType
 from chorus.domain.facts import (
-    CommitmentTerm,
     Contradiction,
     EvidenceDescription,
     Fact,
@@ -203,19 +202,6 @@ def transform_facts(
             effective_scope=effective_scope,
             transformation=TransformationKind.GENERALIZED,
             rule_id="p1.contradiction.safe.v1",
-        )
-    if fact_type is FactType.COMMITMENT_TERM and isinstance(fact.value, CommitmentTerm):
-        return build_shareable_fact(
-            export_fact_id=export_fact_id,
-            facts=ordered,
-            safe_text=(
-                f"{fact.value.obligor} committed to {fact.value.action_text} by "
-                f"{fact.value.due_at.date().isoformat()}; verification: "
-                f"{fact.value.verification_method}."
-            ),
-            effective_scope=effective_scope,
-            transformation=TransformationKind.DIRECT,
-            rule_id="p1.commitment.safe.v1",
         )
     raise ValueError("no policy/v1 transformation exists for the requested fact type")
 

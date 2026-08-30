@@ -21,7 +21,7 @@ from chorus.domain.time import require_utc
 
 POLICY_VERSION = "policy/v1"
 COMPILER_CONTRACT_VERSION = "compiler/v1"
-COMPILER_VERSION = "compiler/1.0.0"
+COMPILER_VERSION = "compiler/1.1.0"
 AGGREGATE_PRIVACY_MIN = 3
 CORROBORATION_MIN = 2
 VIEW_LIFETIME_SECONDS = 15 * 60

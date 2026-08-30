@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from chorus.domain.entities import (
     CaseState,
@@ -21,12 +21,19 @@ from chorus.domain.entities import (
     Purpose,
     SensitivityCategory,
 )
-from chorus.domain.facts import Fact, FactStatus, Report, independent_source_count
+from chorus.domain.facts import (
+    Fact,
+    FactStatus,
+    IncidentOccurrence,
+    LocationArea,
+    Report,
+    ServiceImpact,
+    independent_source_count,
+)
 from chorus.domain.ids import (
     EvidenceItemId,
     ExportFactId,
     FactId,
-    IdGenerator,
     OperationId,
     SafeEvidenceRefId,
     Sha256Digest,
@@ -88,10 +95,8 @@ _MINIMUM_NECESSARY_TYPES = {
     FactType.LOCATION_AREA,
     FactType.IDENTITY_ATTRIBUTE,
     FactType.CONTRADICTION,
-    FactType.COMMITMENT_TERM,
     FactType.EVIDENCE_DESCRIPTION,
 }
-_VIEW_AUTHORITY = object()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -103,7 +108,11 @@ class MandateVersionRef:
 
 @dataclass(frozen=True, slots=True, init=False)
 class ShareableCaseView:
-    """Immutable sole Action input; construction is capability-gated to this module."""
+    """Immutable compiler-produced DTO and sole Action input.
+
+    The private factory prevents accidental construction through the normal API. Python object
+    construction is not a security boundary; runtime isolation, IAM, and storage policy are.
+    """
 
     schema_version: str
     view_id: ViewId
@@ -123,15 +132,13 @@ class ShareableCaseView:
     audit_refs: tuple[UUID, ...]
     view_hash: Sha256Digest
 
-    def __new__(cls, *, authority: object) -> ShareableCaseView:
-        if authority is not _VIEW_AUTHORITY:
-            raise PermissionError("only the privacy compiler may construct a shareable view")
-        return super().__new__(cls)
+    def __init__(self) -> None:
+        raise TypeError("ShareableCaseView is compiler-produced; use PrivacyCompiler.compile")
 
 
-def _construct_view(*, authority: object, values: dict[str, object]) -> ShareableCaseView:
-    if authority is not _VIEW_AUTHORITY:
-        raise PermissionError("only the privacy compiler may construct a shareable view")
+def _construct_view(*, values: dict[str, object]) -> ShareableCaseView:
+    """Populate the closed DTO after the compiler has completed policy evaluation."""
+
     expected = {item.name for item in fields(ShareableCaseView)}
     if set(values) != expected:
         raise ValueError("shareable view fields are incomplete")
@@ -201,11 +208,32 @@ class _Candidate:
         return not self.excluded_reasons
 
 
+@dataclass(frozen=True, slots=True)
+class _CompileArtifactIds:
+    """UUIDv5 identities derived only from one compile id and stable typed labels."""
+
+    compile_id: UUID
+
+    def audit_id(self) -> OperationId:
+        return OperationId(uuid5(self.compile_id, "compiler/v1:audit"))
+
+    def view_id(self) -> ViewId:
+        return ViewId(uuid5(self.compile_id, "compiler/v1:view"))
+
+    def export_fact_id(self, label: str, facts: tuple[Fact, ...]) -> ExportFactId:
+        source_key = ",".join(sorted(str(fact.fact_id) for fact in facts))
+        return ExportFactId(uuid5(self.compile_id, f"compiler/v1:export-fact:{label}:{source_key}"))
+
+    def safe_evidence_ref_id(self, source_evidence_id: EvidenceItemId) -> SafeEvidenceRefId:
+        return SafeEvidenceRefId(
+            uuid5(self.compile_id, f"compiler/v1:safe-evidence:{source_evidence_id}")
+        )
+
+
 class PrivacyCompiler:
     """Run the frozen 22 gates without persistence, AWS, an LLM, or ambient authority."""
 
-    def __init__(self, id_generator: IdGenerator) -> None:
-        self._ids = id_generator
+    def __init__(self) -> None:
         self._policy_build_hash = hash_value(
             {
                 "policy_version": POLICY_VERSION,
@@ -224,7 +252,8 @@ class PrivacyCompiler:
     def compile(self, command: CompileCommand, context: CompileContext) -> CompileResult:
         """Evaluate policy in its normative order and return an auditable typed result."""
 
-        audit_id = self._ids.new(OperationId).value
+        artifact_ids = _CompileArtifactIds(command.compile_id)
+        audit_id = artifact_ids.audit_id().value
         audit: list[CompilerAuditDecision] = []
 
         # 1. Request/schema.
@@ -271,9 +300,6 @@ class PrivacyCompiler:
             )
         self._passed(audit, CompilerGate.CASE_IDENTITY_VERSION)
 
-        facts_by_id = {fact.fact_id: fact for fact in context.facts}
-        evidence_by_id = {item.evidence_id: item for item in context.evidence_items}
-
         # 4. Cross-case references. Foreign optional input still denies the entire compile.
         for requested in command.requested_facts:
             fact_matches = tuple(
@@ -319,7 +345,7 @@ class PrivacyCompiler:
 
         # 5. Existence.
         for requested in command.requested_facts:
-            if requested.fact_id not in facts_by_id:
+            if not any(fact.fact_id == requested.fact_id for fact in context.facts):
                 return self._deny(
                     command,
                     context,
@@ -330,7 +356,7 @@ class PrivacyCompiler:
                     subject_ref=str(requested.fact_id),
                 )
         for evidence_id in command.requested_evidence_ids:
-            if evidence_id not in evidence_by_id:
+            if not any(item.evidence_id == evidence_id for item in context.evidence_items):
                 return self._deny(
                     command,
                     context,
@@ -342,14 +368,32 @@ class PrivacyCompiler:
                 )
         self._passed(audit, CompilerGate.EXISTENCE)
 
+        # 6. Ownership/contributor lineage.
+        if (
+            len({fact.fact_id for fact in context.facts}) != len(context.facts)
+            or len({report.report_id for report in context.reports}) != len(context.reports)
+            or len({item.evidence_id for item in context.evidence_items})
+            != len(context.evidence_items)
+            or len({root.root_id for root in context.evidence_roots}) != len(context.evidence_roots)
+            or len({(root.community_id, root.root_sha256) for root in context.evidence_roots})
+            != len(context.evidence_roots)
+        ):
+            return self._deny(
+                command,
+                context,
+                audit_id,
+                audit,
+                CompilerGate.OWNERSHIP,
+                CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR,
+            )
+        facts_by_id = {fact.fact_id: fact for fact in context.facts}
+        evidence_by_id = {item.evidence_id: item for item in context.evidence_items}
+        reports_by_id = {report.report_id: report for report in context.reports}
+        roots_by_id = {root.root_id: root for root in context.evidence_roots}
         candidates = [
             _Candidate(request=requested, fact=facts_by_id[requested.fact_id])
             for requested in sorted(command.requested_facts, key=lambda item: str(item.fact_id))
         ]
-
-        # 6. Ownership/contributor lineage.
-        reports_by_id = {report.report_id: report for report in context.reports}
-        roots_by_id = {root.root_id: root for root in context.evidence_roots}
         requested_fact_evidence = {
             evidence_id for candidate in candidates for evidence_id in candidate.fact.evidence_ids
         }
@@ -368,13 +412,7 @@ class PrivacyCompiler:
         for candidate in candidates:
             report = reports_by_id.get(candidate.fact.report_id)
             if (
-                sum(fact.fact_id == candidate.fact.fact_id for fact in context.facts) != 1
-                or sum(
-                    report_item.report_id == candidate.fact.report_id
-                    for report_item in context.reports
-                )
-                != 1
-                or candidate.fact.fact_id not in context.case.fact_ids
+                candidate.fact.fact_id not in context.case.fact_ids
                 or candidate.fact.report_id not in context.case.report_ids
                 or report is None
                 or report.case_id != candidate.fact.case_id
@@ -401,8 +439,7 @@ class PrivacyCompiler:
                 if evidence_id in candidate.fact.evidence_ids
             }
             if (
-                sum(item.evidence_id == evidence_id for item in context.evidence_items) != 1
-                or root is None
+                root is None
                 or root.community_id != context.case.community_id
                 or root.namespace != context.case.namespace
                 or evidence.submitted_by_contributor_id not in linked_owners
@@ -418,14 +455,23 @@ class PrivacyCompiler:
                 )
         self._passed(audit, CompilerGate.OWNERSHIP)
 
+        # 7. Current mandate selection.
+        if len({pointer.contributor_id for pointer in context.mandate_pointers}) != len(
+            context.mandate_pointers
+        ) or len(
+            {(pointer.mandate_id, pointer.version) for pointer in context.mandate_pointers}
+        ) != len(context.mandate_pointers):
+            return self._deny(
+                command,
+                context,
+                audit_id,
+                audit,
+                CompilerGate.CURRENT_MANDATE_SELECTION,
+                CompileReasonCode.MANDATE_INTEGRITY_ERROR,
+            )
         pointers_by_contributor = {
             pointer.contributor_id: pointer for pointer in context.mandate_pointers
         }
-        mandates_by_version = {
-            (mandate.mandate_id, mandate.version): mandate for mandate in context.mandates
-        }
-
-        # 7. Current mandate selection.
         gate_reasons: list[CompileReasonCode] = []
         for candidate in candidates:
             pointer = pointers_by_contributor.get(candidate.fact.contributor_id)
@@ -444,13 +490,30 @@ class PrivacyCompiler:
                 gate_reasons.append(CompileReasonCode.MANDATE_NOT_FOUND)
             else:
                 candidate.pointer = pointer
-                candidate.mandate = mandates_by_version.get((pointer.mandate_id, pointer.version))
         self._gate_complete(audit, CompilerGate.CURRENT_MANDATE_SELECTION, gate_reasons)
 
         # 8. Mandate version integrity. Any mismatch is structural and always denies.
+        mandate_keys = tuple((mandate.mandate_id, mandate.version) for mandate in context.mandates)
+        if len(set(mandate_keys)) != len(mandate_keys):
+            return self._deny(
+                command,
+                context,
+                audit_id,
+                audit,
+                CompilerGate.MANDATE_VERSION_INTEGRITY,
+                CompileReasonCode.MANDATE_INTEGRITY_ERROR,
+            )
+        mandates_by_version = {
+            (mandate.mandate_id, mandate.version): mandate for mandate in context.mandates
+        }
         for candidate in self._eligible(candidates):
             pointer = candidate.pointer
-            mandate = candidate.mandate
+            mandate = (
+                mandates_by_version.get((pointer.mandate_id, pointer.version))
+                if pointer is not None
+                else None
+            )
+            candidate.mandate = mandate
             if (
                 pointer is None
                 or mandate is None
@@ -638,7 +701,10 @@ class PrivacyCompiler:
                 and fact.namespace == context.case.namespace
             )
             computed_sources = independent_source_count(
-                case_facts, context.evidence_items, context.evidence_roots
+                case_facts,
+                context.reports,
+                context.evidence_items,
+                context.evidence_roots,
             )
         except ValueError:
             return self._deny(
@@ -660,20 +726,14 @@ class PrivacyCompiler:
             )
         self._passed(audit, CompilerGate.INDEPENDENCE)
 
-        # 18. Re-identification risk is a hard rule table, never an LLM judgment.
-        denied = self._apply_item_gate(
+        # 18. Typed re-identification rules complement earlier scope/identity exclusions.
+        denied = self._apply_reidentification_gate(
             candidates,
+            aggregate_groups,
             command,
             context,
             audit_id,
             audit,
-            CompilerGate.REIDENTIFICATION,
-            lambda item: (
-                CompileReasonCode.REIDENTIFICATION_RISK
-                if item.fact.fact_type in _HARD_INTERNAL_TYPES
-                or item.fact.sensitivity in _HARD_INTERNAL_SENSITIVITIES
-                else None
-            ),
         )
         if denied is not None:
             return denied
@@ -686,16 +746,25 @@ class PrivacyCompiler:
             audit_id,
             audit,
             CompilerGate.MINIMUM_NECESSITY,
-            lambda item: (
-                None
-                if item.fact.fact_type in _MINIMUM_NECESSARY_TYPES
-                else CompileReasonCode.NOT_MINIMUM_NECESSARY
-            ),
+            lambda item: self._minimum_necessity_reason(item, command),
         )
         if denied is not None:
             return denied
 
         # 20. Safe evidence metadata is accepted only after a reviewed derivative exists.
+        if len(
+            {candidate.source_evidence_id for candidate in context.safe_evidence_candidates}
+        ) != len(context.safe_evidence_candidates) or len(
+            {candidate.export_handle_id for candidate in context.safe_evidence_candidates}
+        ) != len(context.safe_evidence_candidates):
+            return self._deny(
+                command,
+                context,
+                audit_id,
+                audit,
+                CompilerGate.EVIDENCE_SAFETY,
+                CompileReasonCode.UNSAFE_EVIDENCE,
+            )
         safe_candidates = {
             candidate.source_evidence_id: candidate
             for candidate in context.safe_evidence_candidates
@@ -723,7 +792,11 @@ class PrivacyCompiler:
         # 21. Execute only versioned transformations, construct strict safe types, scan recursively.
         try:
             shareable_facts, safe_refs = self._transform(
-                candidates, command, evidence_by_id, safe_candidates
+                candidates,
+                command,
+                evidence_by_id,
+                safe_candidates,
+                artifact_ids,
             )
         except (TypeError, ValueError):
             return self._deny(
@@ -779,10 +852,21 @@ class PrivacyCompiler:
                 key=lambda pointer: (str(pointer.mandate_id), pointer.version),
             )
         )
+        case_report_ids = {fact.report_id for fact in case_facts}
+        corroboration_reports = tuple(
+            sorted(
+                (report for report in context.reports if report.report_id in case_report_ids),
+                key=lambda report: str(report.report_id),
+            )
+        )
+        corroboration_evidence_ids = {
+            evidence_id for fact in case_facts for evidence_id in fact.evidence_ids
+        }
         authorization_snapshot_hash = hash_value(
             {
                 "case_id": context.case.case_id,
                 "case_version": context.case.version,
+                "corroboration_source_count": context.case.corroboration_source_count,
                 "policy_build_hash": self._policy_build_hash,
                 "compiler_version": COMPILER_VERSION,
                 "destination": command.destination,
@@ -797,20 +881,83 @@ class PrivacyCompiler:
                     }
                     for candidate in candidates
                 ),
+                "corroboration_facts": tuple(
+                    {
+                        "fact_id": fact.fact_id,
+                        "case_id": fact.case_id,
+                        "community_id": fact.community_id,
+                        "namespace": fact.namespace,
+                        "report_id": fact.report_id,
+                        "contributor_id": fact.contributor_id,
+                        "version": fact.version,
+                        "status": fact.status,
+                        "evidence_ids": tuple(sorted(fact.evidence_ids, key=str)),
+                    }
+                    for fact in sorted(case_facts, key=lambda item: str(item.fact_id))
+                ),
+                "corroboration_reports": tuple(
+                    {
+                        "report_id": report.report_id,
+                        "case_id": report.case_id,
+                        "community_id": report.community_id,
+                        "namespace": report.namespace,
+                        "contributor_id": report.contributor_id,
+                        "version": report.version,
+                        "status": report.status,
+                        "duplicate_of_report_id": report.duplicate_of_report_id,
+                    }
+                    for report in corroboration_reports
+                ),
+                "corroboration_evidence": tuple(
+                    {
+                        "evidence_id": evidence_by_id[evidence_id].evidence_id,
+                        "case_id": evidence_by_id[evidence_id].case_id,
+                        "community_id": evidence_by_id[evidence_id].community_id,
+                        "namespace": evidence_by_id[evidence_id].namespace,
+                        "root_id": evidence_by_id[evidence_id].root_id,
+                        "version": evidence_by_id[evidence_id].version,
+                        "sha256": evidence_by_id[evidence_id].sha256,
+                    }
+                    for evidence_id in sorted(corroboration_evidence_ids, key=str)
+                ),
+                "evidence_roots": tuple(
+                    {
+                        "root_id": root.root_id,
+                        "community_id": root.community_id,
+                        "namespace": root.namespace,
+                        "version": root.version,
+                        "root_sha256": root.root_sha256,
+                        "derivation_kind": root.derivation_kind,
+                        "parent_root_id": root.parent_root_id,
+                    }
+                    for root in sorted(context.evidence_roots, key=lambda item: str(item.root_id))
+                ),
                 "evaluated_evidence": tuple(
                     {
                         "evidence_id": evidence_by_id[evidence_id].evidence_id,
+                        "case_id": evidence_by_id[evidence_id].case_id,
+                        "community_id": evidence_by_id[evidence_id].community_id,
+                        "namespace": evidence_by_id[evidence_id].namespace,
+                        "root_id": evidence_by_id[evidence_id].root_id,
+                        "submitted_by_contributor_id": evidence_by_id[
+                            evidence_id
+                        ].submitted_by_contributor_id,
                         "version": evidence_by_id[evidence_id].version,
                         "sha256": evidence_by_id[evidence_id].sha256,
+                        "media_type": evidence_by_id[evidence_id].media_type,
+                        "byte_length": evidence_by_id[evidence_id].byte_length,
                         "malware_scan_status": evidence_by_id[evidence_id].malware_scan_status,
                         "extraction_status": evidence_by_id[evidence_id].extraction_status,
+                        "has_extracted_text": (
+                            evidence_by_id[evidence_id].extracted_text is not None
+                        ),
                         "safe_derivative": safe_candidates.get(evidence_id),
                     }
                     for evidence_id in sorted(command.requested_evidence_ids, key=str)
                 ),
             }
         )
-        view_id = self._ids.new(ViewId)
+        view_id = artifact_ids.view_id()
         values: dict[str, object] = {
             "schema_version": "shareable-case-view/v1",
             "view_id": view_id,
@@ -834,7 +981,7 @@ class PrivacyCompiler:
             "audit_refs": (audit_id,),
             "view_hash": _EMPTY_DIGEST,
         }
-        draft_view = _construct_view(authority=_VIEW_AUTHORITY, values=values)
+        draft_view = _construct_view(values=values)
         if self._unsafe_output(draft_view):
             return self._deny(
                 command,
@@ -845,7 +992,7 @@ class PrivacyCompiler:
                 CompileReasonCode.UNSAFE_OUTPUT,
             )
         values["view_hash"] = hash_value(draft_view, omit_fields=frozenset({"view_hash"}))
-        view = _construct_view(authority=_VIEW_AUTHORITY, values=values)
+        view = _construct_view(values=values)
         self._passed(audit, CompilerGate.TRANSFORMATION)
 
         # 22. Phase 1 produces the canonical audit/hash artifact; Phase 6 persists atomically.
@@ -1021,6 +1168,122 @@ class PrivacyCompiler:
             DisclosureScope.EXTERNAL_ACTION,
         }:
             return CompileReasonCode.IDENTITY_NOT_ALLOWED
+        if (
+            grant.max_scope is DisclosureScope.EXTERNAL_ACTION
+            and identity.max_scope is not DisclosureScope.EXTERNAL_ACTION
+        ):
+            return CompileReasonCode.IDENTITY_NOT_ALLOWED
+        return None
+
+    def _apply_reidentification_gate(
+        self,
+        candidates: list[_Candidate],
+        aggregate_groups: dict[FactType, list[_Candidate]],
+        command: CompileCommand,
+        context: CompileContext,
+        audit_id: UUID,
+        audit: list[CompilerAuditDecision],
+    ) -> CompileDeny | None:
+        """Apply the exact typed policy/v1 checks that remain after gates 14 and 15."""
+
+        reasons: list[CompileReasonCode] = []
+        for candidate in self._eligible(candidates):
+            if self._reidentification_reason(candidate) is None:
+                continue
+            denied = self._ineligible(
+                candidate,
+                CompileReasonCode.REIDENTIFICATION_RISK,
+                command,
+                context,
+                audit_id,
+                audit,
+                CompilerGate.REIDENTIFICATION,
+            )
+            if denied is not None:
+                return denied
+            reasons.append(CompileReasonCode.REIDENTIFICATION_RISK)
+
+        for fact_type in sorted(aggregate_groups, key=str):
+            group = [candidate for candidate in aggregate_groups[fact_type] if candidate.eligible]
+            if not group:
+                continue
+            bucket_count = self._aggregate_category_bucket_count(fact_type, group)
+            if bucket_count > 1:
+                continue
+            for candidate in group:
+                denied = self._ineligible(
+                    candidate,
+                    CompileReasonCode.REIDENTIFICATION_RISK,
+                    command,
+                    context,
+                    audit_id,
+                    audit,
+                    CompilerGate.REIDENTIFICATION,
+                )
+                if denied is not None:
+                    return denied
+                reasons.append(CompileReasonCode.REIDENTIFICATION_RISK)
+
+        self._gate_complete(audit, CompilerGate.REIDENTIFICATION, reasons)
+        return None
+
+    @staticmethod
+    def _reidentification_reason(candidate: _Candidate) -> CompileReasonCode | None:
+        fact = candidate.fact
+        if (
+            fact.fact_type in _HARD_INTERNAL_TYPES
+            or fact.sensitivity in _HARD_INTERNAL_SENSITIVITIES
+        ):
+            return CompileReasonCode.REIDENTIFICATION_RISK
+        if fact.fact_type is FactType.MANAGEMENT_STATEMENT:
+            # A structured management statement still contains a direct private quote. Only a
+            # separately typed CONTRADICTION can produce the neutral policy/v1 transformation.
+            return CompileReasonCode.REIDENTIFICATION_RISK
+        if fact.fact_type is FactType.INCIDENT_OCCURRENCE:
+            # The closed incident transformer always reduces UTC instants to calendar-day spans.
+            return (
+                None
+                if isinstance(fact.value, IncidentOccurrence)
+                else CompileReasonCode.REIDENTIFICATION_RISK
+            )
+        if fact.fact_type is FactType.LOCATION_AREA:
+            # LocationArea contains only the four frozen common-area enum values, never unit data.
+            return (
+                None
+                if isinstance(fact.value, LocationArea)
+                else CompileReasonCode.REIDENTIFICATION_RISK
+            )
+        if fact.fact_type is FactType.SERVICE_IMPACT:
+            # The transformer emits ImpactCode only; relationship/health narrative is discarded.
+            return (
+                None
+                if isinstance(fact.value, ServiceImpact)
+                else CompileReasonCode.REIDENTIFICATION_RISK
+            )
+        # Identity facts reaching this point already passed the independent identity grant gate.
+        return None
+
+    @staticmethod
+    def _aggregate_category_bucket_count(fact_type: FactType, group: list[_Candidate]) -> int:
+        if fact_type is not FactType.SERVICE_IMPACT:
+            return 0
+        impacts = tuple(candidate.fact.value for candidate in group)
+        if not all(isinstance(impact, ServiceImpact) for impact in impacts):
+            return 0
+        return len({impact.impact_code for impact in impacts if isinstance(impact, ServiceImpact)})
+
+    @staticmethod
+    def _minimum_necessity_reason(
+        candidate: _Candidate, command: CompileCommand
+    ) -> CompileReasonCode | None:
+        if candidate.fact.fact_type not in _MINIMUM_NECESSARY_TYPES:
+            return CompileReasonCode.NOT_MINIMUM_NECESSARY
+        if candidate.fact.fact_type is FactType.EVIDENCE_DESCRIPTION:
+            requested = set(command.requested_evidence_ids).intersection(
+                candidate.fact.evidence_ids
+            )
+            if candidate.request.intended_usage is not IntendedUsage.EVIDENCE or not requested:
+                return CompileReasonCode.NOT_MINIMUM_NECESSARY
         return None
 
     @staticmethod
@@ -1038,6 +1301,11 @@ class PrivacyCompiler:
             if (
                 candidate.request.intended_usage is IntendedUsage.EVIDENCE
                 and not requested_for_fact
+            ):
+                return candidate, CompileReasonCode.UNSAFE_EVIDENCE
+            if (
+                candidate.fact.fact_type is FactType.EVIDENCE_DESCRIPTION
+                and len(requested_for_fact) != 1
             ):
                 return candidate, CompileReasonCode.UNSAFE_EVIDENCE
             for evidence_id in requested_for_fact:
@@ -1063,16 +1331,19 @@ class PrivacyCompiler:
         command: CompileCommand,
         evidence_by_id: dict[EvidenceItemId, EvidenceItem],
         safe_candidates: dict[EvidenceItemId, SafeEvidenceCandidate],
+        artifact_ids: _CompileArtifactIds,
     ) -> tuple[list[ShareableFact], list[ShareableEvidenceRef]]:
         facts: list[ShareableFact] = []
         safe_refs: list[ShareableEvidenceRef] = []
+        safe_refs_by_source: dict[EvidenceItemId, ShareableEvidenceRef] = {}
         grouped_ids: set[FactId] = set()
 
-        def add_group(group: list[_Candidate], scope: DisclosureScope) -> None:
-            export_id = self._ids.new(ExportFactId)
+        def add_group(group: list[_Candidate], scope: DisclosureScope, stable_label: str) -> None:
+            source_facts = tuple(item.fact for item in group)
+            export_id = artifact_ids.export_fact_id(stable_label, source_facts)
             output = transform_facts(
                 export_fact_id=export_id,
-                facts=tuple(item.fact for item in group),
+                facts=source_facts,
                 effective_scope=scope,
             )
             facts.append(output)
@@ -1091,9 +1362,17 @@ class PrivacyCompiler:
             elif candidate.fact.fact_type is FactType.INCIDENT_OCCURRENCE:
                 incident_groups.setdefault(candidate.grant.max_scope, []).append(candidate)
         for fact_type in sorted(aggregate_groups, key=str):
-            add_group(aggregate_groups[fact_type], DisclosureScope.AGGREGATE_ONLY)
+            add_group(
+                aggregate_groups[fact_type],
+                DisclosureScope.AGGREGATE_ONLY,
+                f"aggregate:{fact_type.value}",
+            )
         for scope in sorted(incident_groups, key=str):
-            add_group(incident_groups[scope], scope)
+            add_group(
+                incident_groups[scope],
+                scope,
+                f"incident:{scope.value}",
+            )
 
         for candidate in eligible:
             if candidate.fact.fact_id in grouped_ids or candidate.grant is None:
@@ -1107,13 +1386,16 @@ class PrivacyCompiler:
                 evidence_id = requested_evidence[0]
                 item = evidence_by_id[evidence_id]
                 safe_candidate = safe_candidates[evidence_id]
-                safe_ref = build_safe_evidence_ref(
-                    candidate=safe_candidate,
-                    safe_evidence_ref_id=self._ids.new(SafeEvidenceRefId),
-                    media_type=item.media_type,
-                )
-                safe_refs.append(safe_ref)
-                export_id = self._ids.new(ExportFactId)
+                safe_ref = safe_refs_by_source.get(evidence_id)
+                if safe_ref is None:
+                    safe_ref = build_safe_evidence_ref(
+                        candidate=safe_candidate,
+                        safe_evidence_ref_id=artifact_ids.safe_evidence_ref_id(evidence_id),
+                        media_type=item.media_type,
+                    )
+                    safe_refs_by_source[evidence_id] = safe_ref
+                    safe_refs.append(safe_ref)
+                export_id = artifact_ids.export_fact_id("evidence-description", (candidate.fact,))
                 output = transform_evidence_description(
                     export_fact_id=export_id,
                     fact=candidate.fact,
@@ -1121,7 +1403,7 @@ class PrivacyCompiler:
                     safe_ref=safe_ref,
                 )
             else:
-                export_id = self._ids.new(ExportFactId)
+                export_id = artifact_ids.export_fact_id("single", (candidate.fact,))
                 output = transform_facts(
                     export_fact_id=export_id,
                     facts=(candidate.fact,),

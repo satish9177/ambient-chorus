@@ -6,7 +6,6 @@ from typing import cast
 
 import pytest
 from tests.fixtures.elevator import (
-    FIXTURE_NAMESPACE_UUID,
     NOW,
     ElevatorFixture,
     _uuid,
@@ -20,12 +19,20 @@ from chorus.domain.entities import (
     Purpose,
     SensitivityCategory,
 )
-from chorus.domain.facts import ImpactCode, ServiceImpact
-from chorus.domain.ids import CaseId, EvidenceItemId, FactId, Sha256Digest, Uuid5Generator
+from chorus.domain.facts import (
+    Fact,
+    FactStatus,
+    ImpactCode,
+    IncidentOccurrence,
+    ReportStatus,
+    ServiceImpact,
+)
+from chorus.domain.ids import CaseId, EvidenceItemId, FactId, MessageId, ReportId, Sha256Digest
 from chorus.domain.mandates import CurrentMandatePointer, FactGrant, IdentityGrant
 from chorus.privacy.canonical import hash_mandate_terms, to_canonical_primitive, verify_hash
 from chorus.privacy.compiler import (
     CompileAllow,
+    CompileContext,
     CompileDeny,
     PrivacyCompiler,
     ShareableCaseView,
@@ -44,7 +51,7 @@ ZERO_DIGEST = Sha256Digest("sha256:" + "0" * 64)
 
 
 def _compiler() -> PrivacyCompiler:
-    return PrivacyCompiler(Uuid5Generator(FIXTURE_NAMESPACE_UUID, prefix="compile-test"))
+    return PrivacyCompiler()
 
 
 def _command(
@@ -172,10 +179,10 @@ def test_compile_safe_example_runs_all_22_gates_and_hashes_view() -> None:
     assert tuple(item.gate for item in result.audit_decisions) == tuple(CompilerGate)
     assert result.view.shareable_facts
     assert result.view.authorization_snapshot_hash == Sha256Digest(
-        "sha256:21c30df22f8b545bda103f0645b93898f5fccbf6b4aefac21066e92c56160120"
+        "sha256:9b854cbf8ad4fc5464d3283adeb520bca48750c103d36c5235a6390a6d5d6e9e"
     )
     assert result.view.view_hash == Sha256Digest(
-        "sha256:cf1dac40eec5cc4fb6193a41a9b27a5ab12a4f2c2a60d081d6047c074512a34d"
+        "sha256:8f95e6a8a80c399e0178655d7da6c959cdfd60ad6fd89adad26ae5da4368b344"
     )
     assert verify_hash(result.view, result.view.view_hash, omit_fields=frozenset({"view_hash"}))
 
@@ -330,26 +337,77 @@ def test_identity_requires_content_and_identity_grants() -> None:
     assert "Resident B" in str(to_canonical_primitive(named.view))
 
 
+def test_external_action_identity_requires_external_action_identity_scope() -> None:
+    fixture = build_elevator_fixture()
+    fixture = _grant_scope(
+        fixture,
+        (fixture.identity_fact_id,),
+        DisclosureScope.EXTERNAL_ACTION,
+    )
+    fixture = _replace_current_mandate(
+        fixture,
+        1,
+        identity_grant=IdentityGrant(
+            externally_shareable=True,
+            max_scope=DisclosureScope.NAMED_CASE,
+        ),
+    )
+    ids = (fixture.incident_fact_ids[1], fixture.identity_fact_id)
+    command = _command(fixture, ids, optional_ids=frozenset({fixture.identity_fact_id}))
+
+    named_only = _compiler().compile(command, fixture.context)
+
+    assert isinstance(named_only, CompileAllow)
+    excluded = next(
+        item for item in named_only.excluded if item.fact_id == fixture.identity_fact_id
+    )
+    assert excluded.reason_codes == (CompileReasonCode.IDENTITY_NOT_ALLOWED,)
+
+    fixture = _replace_current_mandate(
+        fixture,
+        1,
+        identity_grant=IdentityGrant(
+            externally_shareable=True,
+            max_scope=DisclosureScope.EXTERNAL_ACTION,
+        ),
+    )
+    externally_named = _compiler().compile(
+        _command(fixture, ids, optional_ids=frozenset({fixture.identity_fact_id})),
+        fixture.context,
+    )
+
+    assert isinstance(externally_named, CompileAllow)
+    assert "Resident B" in str(to_canonical_primitive(externally_named.view))
+
+
 def _aggregate_fixture(count: int) -> tuple[ElevatorFixture, tuple[FactId, ...]]:
     fixture = build_elevator_fixture()
     selected = fixture.incident_fact_ids[:count]
-    changed_facts = tuple(
-        replace(
-            fact,
-            fact_type=FactType.SERVICE_IMPACT,
-            value=ServiceImpact(impact_code=ImpactCode.ACCESS_BLOCKED, summary="private"),
-            version=fact.version + 1,
-            updated_at=NOW,
+    changed_facts: list[Fact] = []
+    for fact in fixture.context.facts:
+        if fact.fact_id not in selected:
+            changed_facts.append(fact)
+            continue
+        selected_index = selected.index(fact.fact_id)
+        changed_facts.append(
+            replace(
+                fact,
+                fact_type=FactType.SERVICE_IMPACT,
+                value=ServiceImpact(
+                    impact_code=(
+                        ImpactCode.DELAY if selected_index % 2 else ImpactCode.ACCESS_BLOCKED
+                    ),
+                    summary="private relationship and health narrative",
+                ),
+                version=fact.version + 1,
+                updated_at=NOW,
+            )
         )
-        if fact.fact_id in selected
-        else fact
-        for fact in fixture.context.facts
-    )
     fixture = replace(
         fixture,
         context=replace(
             fixture.context,
-            facts=changed_facts,
+            facts=tuple(changed_facts),
             case=replace(
                 fixture.context.case,
                 version=fixture.context.case.version + 1,
@@ -377,6 +435,89 @@ def test_aggregate_three_contributors_is_not_corroboration_two() -> None:
 
     assert isinstance(valid_result, CompileAllow)
     assert valid_result.view.shareable_facts[0].contributor_count == 3
+
+
+def test_gate18_rejects_aggregate_with_one_category_bucket() -> None:
+    fixture, selected = _aggregate_fixture(3)
+    facts = tuple(
+        replace(
+            fact,
+            value=ServiceImpact(
+                impact_code=ImpactCode.ACCESS_BLOCKED,
+                summary="private relationship and health narrative",
+            ),
+        )
+        if fact.fact_id in selected
+        else fact
+        for fact in fixture.context.facts
+    )
+    fixture = replace(fixture, context=replace(fixture.context, facts=facts))
+
+    result = _compiler().compile(
+        _command(fixture, selected, usage=IntendedUsage.AGGREGATION_INPUT), fixture.context
+    )
+
+    assert isinstance(result, CompileDeny)
+    assert _reason_codes(result) == {CompileReasonCode.REIDENTIFICATION_RISK}
+    assert result.audit_decisions[-1].gate is CompilerGate.REIDENTIFICATION
+
+
+def test_gate18_incident_transform_generalizes_precise_time_to_day() -> None:
+    fixture = build_elevator_fixture()
+    source = next(
+        fact for fact in fixture.context.facts if fact.fact_id == fixture.incident_fact_ids[0]
+    )
+    assert isinstance(source.value, IncidentOccurrence)
+
+    result = _compiler().compile(_command(fixture, (source.fact_id,)), fixture.context)
+
+    assert isinstance(result, CompileAllow)
+    output = result.view.shareable_facts[0]
+    assert source.value.occurred_at.date().isoformat() in output.safe_text
+    assert source.value.occurred_at.time().isoformat() not in output.safe_text
+    assert output.transformation_rule_id == "p1.incident.anonymous.v1"
+
+
+def test_gate18_typed_impact_transform_drops_relationship_and_health_narrative() -> None:
+    fixture, selected = _aggregate_fixture(3)
+
+    result = _compiler().compile(
+        _command(fixture, selected, usage=IntendedUsage.AGGREGATION_INPUT), fixture.context
+    )
+
+    assert isinstance(result, CompileAllow)
+    rendered = str(to_canonical_primitive(result.view))
+    assert "relationship" not in rendered
+    assert "health narrative" not in rendered
+
+
+def test_gate18_rejects_direct_management_quote_even_if_mislabeled_general() -> None:
+    fixture = build_elevator_fixture()
+    facts = tuple(
+        replace(fact, sensitivity=SensitivityCategory.GENERAL, version=fact.version + 1)
+        if fact.fact_id == fixture.management_fact_id
+        else fact
+        for fact in fixture.context.facts
+    )
+    fixture = replace(
+        fixture,
+        context=replace(
+            fixture.context,
+            facts=facts,
+            case=replace(fixture.context.case, version=2, updated_at=NOW),
+        ),
+    )
+    command = _command(
+        fixture,
+        (fixture.incident_fact_ids[0], fixture.management_fact_id),
+        optional_ids=frozenset({fixture.management_fact_id}),
+    )
+
+    result = _compiler().compile(command, fixture.context)
+
+    assert isinstance(result, CompileAllow)
+    excluded = next(item for item in result.excluded if item.fact_id == fixture.management_fact_id)
+    assert excluded.reason_codes == (CompileReasonCode.REIDENTIFICATION_RISK,)
 
 
 def test_prompt_injection_evidence_is_data_and_has_no_policy_authority() -> None:
@@ -426,32 +567,103 @@ def test_reviewed_photo_exports_only_opaque_safe_reference() -> None:
     assert "private/" not in rendered
 
 
-def test_minimum_necessary_excludes_permitted_but_unnecessary_fact() -> None:
+def test_reviewed_photo_replay_has_identical_safe_artifact_ids() -> None:
     fixture = build_elevator_fixture()
-    facts = tuple(
-        replace(fact, sensitivity=SensitivityCategory.GENERAL, version=fact.version + 1)
-        if fact.fact_id == fixture.management_fact_id
-        else fact
-        for fact in fixture.context.facts
+    command = _command(
+        fixture,
+        (fixture.photo_fact_id,),
+        usage=IntendedUsage.EVIDENCE,
+        evidence_ids=(fixture.photo_evidence_id,),
+    )
+
+    first = _compiler().compile(command, fixture.context)
+    replay = _compiler().compile(command, fixture.context)
+
+    assert isinstance(first, CompileAllow)
+    assert isinstance(replay, CompileAllow)
+    assert first == replay
+
+
+def test_one_safe_evidence_source_produces_one_ref_when_shared_by_two_facts() -> None:
+    fixture = build_elevator_fixture()
+    source_fact = next(
+        fact for fact in fixture.context.facts if fact.fact_id == fixture.photo_fact_id
+    )
+    source_report = next(
+        report for report in fixture.context.reports if report.report_id == source_fact.report_id
+    )
+    second_fact_id = FactId(_uuid("fact:photo-description-two"))
+    second_report_id = ReportId(_uuid("report:photo-description-two"))
+    second_message_id = MessageId(_uuid("message:photo-description-two"))
+    second_report = replace(
+        source_report,
+        report_id=second_report_id,
+        source_message_ids=(second_message_id,),
+    )
+    second_fact = replace(
+        source_fact,
+        fact_id=second_fact_id,
+        report_id=second_report_id,
+        source_message_ids=(second_message_id,),
     )
     fixture = replace(
         fixture,
         context=replace(
             fixture.context,
-            facts=facts,
-            case=replace(fixture.context.case, version=2, updated_at=NOW),
+            facts=(*fixture.context.facts, second_fact),
+            reports=(*fixture.context.reports, second_report),
+            case=replace(
+                fixture.context.case,
+                fact_ids=(*fixture.context.case.fact_ids, second_fact_id),
+                report_ids=(*fixture.context.case.report_ids, second_report_id),
+                version=fixture.context.case.version + 1,
+                updated_at=NOW,
+            ),
+        ),
+    )
+    mandate = next(
+        item
+        for item in fixture.context.mandates
+        if item.contributor_id == source_fact.contributor_id
+    )
+    source_grant = next(
+        grant for grant in mandate.fact_grants if grant.fact_id == source_fact.fact_id
+    )
+    fixture = _replace_current_mandate(
+        fixture,
+        2,
+        fact_grants=(
+            *mandate.fact_grants,
+            replace(source_grant, fact_id=second_fact_id),
         ),
     )
     command = _command(
         fixture,
-        (fixture.incident_fact_ids[0], fixture.management_fact_id),
-        optional_ids=frozenset({fixture.management_fact_id}),
+        (source_fact.fact_id, second_fact_id),
+        usage=IntendedUsage.EVIDENCE,
+        evidence_ids=(fixture.photo_evidence_id,),
     )
 
     result = _compiler().compile(command, fixture.context)
 
     assert isinstance(result, CompileAllow)
-    excluded = next(item for item in result.excluded if item.fact_id == fixture.management_fact_id)
+    assert len(result.view.safe_evidence_refs) == 1
+    safe_ref_id = result.view.safe_evidence_refs[0].safe_evidence_ref_id
+    assert all(fact.safe_evidence_ref_ids == (safe_ref_id,) for fact in result.view.shareable_facts)
+
+
+def test_minimum_necessary_excludes_permitted_but_unnecessary_evidence_fact() -> None:
+    fixture = build_elevator_fixture()
+    command = _command(
+        fixture,
+        (fixture.incident_fact_ids[0], fixture.photo_fact_id),
+        optional_ids=frozenset({fixture.photo_fact_id}),
+    )
+
+    result = _compiler().compile(command, fixture.context)
+
+    assert isinstance(result, CompileAllow)
+    excluded = next(item for item in result.excluded if item.fact_id == fixture.photo_fact_id)
     assert excluded.reason_codes == (CompileReasonCode.NOT_MINIMUM_NECESSARY,)
 
 
@@ -483,15 +695,85 @@ def test_authorization_change_alters_snapshot_and_immutable_view_hash() -> None:
     assert first.view.view_hash != second.view.view_hash
 
 
-def test_permuted_unordered_inputs_produce_identical_view_hash() -> None:
+def test_report_status_change_alters_authorization_snapshot_without_case_bump() -> None:
+    fixture = build_elevator_fixture()
+    command = _command(fixture, fixture.incident_fact_ids)
+    first = _compiler().compile(command, fixture.context)
+    changed_report_id = next(
+        fact.report_id
+        for fact in fixture.context.facts
+        if fact.fact_id == fixture.incident_fact_ids[0]
+    )
+    changed_reports = tuple(
+        replace(report, status=ReportStatus.RETRACTED, version=report.version + 1)
+        if report.report_id == changed_report_id
+        else report
+        for report in fixture.context.reports
+    )
+    changed_context = replace(fixture.context, reports=changed_reports)
+
+    second = _compiler().compile(command, changed_context)
+
+    assert isinstance(first, CompileAllow)
+    assert isinstance(second, CompileAllow)
+    assert first.view.authorization_snapshot_hash != second.view.authorization_snapshot_hash
+    assert first.view.view_hash != second.view.view_hash
+
+
+def test_duplicate_reports_cannot_satisfy_compiler_corroboration_gate() -> None:
+    fixture = build_elevator_fixture()
+    original_report = next(
+        report
+        for report in fixture.context.reports
+        if report.contributor_id == fixture.contributor_ids[0]
+    )
+    reports = tuple(
+        replace(
+            report,
+            status=ReportStatus.DUPLICATE,
+            duplicate_of_report_id=original_report.report_id,
+        )
+        if report.contributor_id != fixture.contributor_ids[0]
+        else report
+        for report in fixture.context.reports
+    )
+    context = replace(fixture.context, reports=reports)
+
+    result = _compiler().compile(
+        _command(fixture, fixture.incident_fact_ids),
+        context,
+    )
+
+    assert isinstance(result, CompileDeny)
+    assert _reason_codes(result) == {CompileReasonCode.CORROBORATION_MIN_NOT_MET}
+    assert result.audit_decisions[-1].gate is CompilerGate.INDEPENDENCE
+
+
+def test_same_compile_replay_produces_identical_complete_result() -> None:
+    fixture = build_elevator_fixture()
+    compiler = _compiler()
+    command = _command(fixture, fixture.incident_fact_ids)
+
+    first = compiler.compile(command, fixture.context)
+    replay = compiler.compile(command, fixture.context)
+
+    assert isinstance(first, CompileAllow)
+    assert isinstance(replay, CompileAllow)
+    assert first == replay
+
+
+def test_permuted_unordered_inputs_produce_identical_complete_view() -> None:
     fixture = build_elevator_fixture()
     forward = _compiler().compile(_command(fixture, fixture.incident_fact_ids), fixture.context)
     reversed_context = replace(
         fixture.context,
         facts=tuple(reversed(fixture.context.facts)),
         reports=tuple(reversed(fixture.context.reports)),
+        evidence_items=tuple(reversed(fixture.context.evidence_items)),
+        evidence_roots=tuple(reversed(fixture.context.evidence_roots)),
         mandates=tuple(reversed(fixture.context.mandates)),
         mandate_pointers=tuple(reversed(fixture.context.mandate_pointers)),
+        safe_evidence_candidates=tuple(reversed(fixture.context.safe_evidence_candidates)),
     )
     reverse = _compiler().compile(
         _command(fixture, tuple(reversed(fixture.incident_fact_ids))), reversed_context
@@ -499,9 +781,166 @@ def test_permuted_unordered_inputs_produce_identical_view_hash() -> None:
 
     assert isinstance(forward, CompileAllow)
     assert isinstance(reverse, CompileAllow)
-    assert forward.view.view_hash == reverse.view.view_hash
+    assert forward.view == reverse.view
 
 
-def test_shareable_view_has_no_public_constructor() -> None:
+def test_new_compile_id_produces_new_artifact_identities_and_hash() -> None:
+    fixture = build_elevator_fixture()
+    command = _command(fixture, fixture.incident_fact_ids)
+
+    first = _compiler().compile(command, fixture.context)
+    second = _compiler().compile(
+        replace(command, compile_id=_uuid("compile:new-command")), fixture.context
+    )
+
+    assert isinstance(first, CompileAllow)
+    assert isinstance(second, CompileAllow)
+    assert first.view.authorization_snapshot_hash == second.view.authorization_snapshot_hash
+    assert first.view.view_id != second.view.view_id
+    assert first.view.view_hash != second.view.view_hash
+
+
+def _context_with_conflicting_duplicate(
+    fixture: ElevatorFixture, collection: str, *, reverse_order: bool
+) -> CompileContext:
+    context = fixture.context
+    if collection == "facts":
+        source_fact = context.facts[0]
+        fact_records = (*context.facts, replace(source_fact, status=FactStatus.WITHDRAWN))
+        return replace(
+            context,
+            facts=tuple(reversed(fact_records)) if reverse_order else fact_records,
+        )
+    if collection == "reports":
+        source_report = context.reports[0]
+        report_records = (
+            *context.reports,
+            replace(source_report, status=ReportStatus.RETRACTED),
+        )
+        return replace(
+            context,
+            reports=tuple(reversed(report_records)) if reverse_order else report_records,
+        )
+    if collection == "evidence_items":
+        source_evidence = context.evidence_items[0]
+        evidence_records = (
+            *context.evidence_items,
+            replace(source_evidence, byte_length=source_evidence.byte_length + 1),
+        )
+        return replace(
+            context,
+            evidence_items=(
+                tuple(reversed(evidence_records)) if reverse_order else evidence_records
+            ),
+        )
+    if collection == "evidence_roots":
+        source_root = context.evidence_roots[0]
+        root_records = (*context.evidence_roots, replace(source_root, media_type="image/png"))
+        return replace(
+            context,
+            evidence_roots=tuple(reversed(root_records)) if reverse_order else root_records,
+        )
+    if collection == "mandate_pointers":
+        source_pointer = context.mandate_pointers[0]
+        pointer_records = (
+            *context.mandate_pointers,
+            replace(source_pointer, terms_hash=ZERO_DIGEST),
+        )
+        return replace(
+            context,
+            mandate_pointers=(
+                tuple(reversed(pointer_records)) if reverse_order else pointer_records
+            ),
+        )
+    if collection == "mandates":
+        source_mandate = context.mandates[0]
+        mandate_records = (
+            *context.mandates,
+            replace(source_mandate, terms_hash=ZERO_DIGEST),
+        )
+        return replace(
+            context,
+            mandates=tuple(reversed(mandate_records)) if reverse_order else mandate_records,
+        )
+    if collection == "safe_evidence_candidates":
+        source_safe_evidence = context.safe_evidence_candidates[0]
+        safe_evidence_records = (
+            *context.safe_evidence_candidates,
+            replace(source_safe_evidence, caption="Conflicting review"),
+        )
+        return replace(
+            context,
+            safe_evidence_candidates=(
+                tuple(reversed(safe_evidence_records)) if reverse_order else safe_evidence_records
+            ),
+        )
+    raise AssertionError("unsupported duplicate collection")
+
+
+@pytest.mark.parametrize(
+    ("collection", "expected_gate", "expected_reason"),
+    [
+        (
+            "facts",
+            CompilerGate.OWNERSHIP,
+            CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR,
+        ),
+        (
+            "reports",
+            CompilerGate.OWNERSHIP,
+            CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR,
+        ),
+        (
+            "evidence_items",
+            CompilerGate.OWNERSHIP,
+            CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR,
+        ),
+        (
+            "evidence_roots",
+            CompilerGate.OWNERSHIP,
+            CompileReasonCode.OWNERSHIP_INTEGRITY_ERROR,
+        ),
+        (
+            "mandate_pointers",
+            CompilerGate.CURRENT_MANDATE_SELECTION,
+            CompileReasonCode.MANDATE_INTEGRITY_ERROR,
+        ),
+        (
+            "mandates",
+            CompilerGate.MANDATE_VERSION_INTEGRITY,
+            CompileReasonCode.MANDATE_INTEGRITY_ERROR,
+        ),
+        (
+            "safe_evidence_candidates",
+            CompilerGate.EVIDENCE_SAFETY,
+            CompileReasonCode.UNSAFE_EVIDENCE,
+        ),
+    ],
+)
+def test_duplicate_structural_records_deny_independent_of_input_order(
+    collection: str,
+    expected_gate: CompilerGate,
+    expected_reason: CompileReasonCode,
+) -> None:
+    fixture = build_elevator_fixture()
+    command = _command(fixture, fixture.incident_fact_ids)
+
+    forward = _compiler().compile(
+        command,
+        _context_with_conflicting_duplicate(fixture, collection, reverse_order=False),
+    )
+    reverse = _compiler().compile(
+        command,
+        _context_with_conflicting_duplicate(fixture, collection, reverse_order=True),
+    )
+
+    assert isinstance(forward, CompileDeny)
+    assert isinstance(reverse, CompileDeny)
+    assert forward == reverse
+    assert _reason_codes(forward) == {expected_reason}
+    assert forward.audit_decisions[-1].gate is expected_gate
+
+
+def test_shareable_view_prevents_accidental_direct_construction() -> None:
     with pytest.raises(TypeError):
-        ShareableCaseView()  # type: ignore[call-arg]
+        ShareableCaseView()
