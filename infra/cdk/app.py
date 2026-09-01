@@ -5,17 +5,28 @@ from __future__ import annotations
 from aws_cdk import App
 
 from infra.cdk.config import CdkBuildConfig
-from infra.cdk.stacks import ChorusFoundationStack
+from infra.cdk.stacks import ChorusDataStack, ChorusFoundationStack
 
 
 def build_app() -> App:
-    """Construct the Phase 0 CDK application without deploying resources."""
+    """Construct the CDK application without deploying resources."""
 
     app = App()
+    environment = app.node.try_get_context("environment")
+    config = (
+        CdkBuildConfig(environment=environment)
+        if isinstance(environment, str) and environment
+        else CdkBuildConfig()
+    )
     ChorusFoundationStack(
         app,
         "AmbientChorusFoundation",
-        config=CdkBuildConfig(),
+        config=config,
+    )
+    ChorusDataStack(
+        app,
+        "AmbientChorusData",
+        config=config,
     )
     return app
 

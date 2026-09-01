@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import StrEnum
 
 
@@ -13,17 +12,30 @@ class DomainErrorCode(StrEnum):
     STALE_VERSION = "STALE_VERSION"
 
 
-@dataclass(frozen=True, slots=True)
 class DomainError(Exception):
-    """Base exception containing only safe code and opaque references."""
+    """Base exception containing only safe code and opaque references.
+
+    This is a plain exception rather than a dataclass on purpose. An ordinary ``raise`` of a
+    frozen dataclass exception does work: CPython sets ``__traceback__`` and ``__cause__``
+    through the C API, which never consults ``__setattr__``. The part of the exception
+    protocol written in Python does not. ``contextlib._GeneratorContextManager`` re-raises by
+    assigning ``exc.__traceback__``, which a frozen dataclass refuses, so an error crossing
+    any ``@contextmanager`` boundary would be replaced by an unrelated failure at exactly the
+    point it was meant to be reported.
+    """
+
+    __slots__ = ("code", "entity_ref")
 
     code: DomainErrorCode
-    entity_ref: str | None = None
+    entity_ref: str | None
 
-    def __str__(self) -> str:
-        if self.entity_ref is None:
-            return self.code.value
-        return f"{self.code.value}: {self.entity_ref}"
+    def __init__(self, code: DomainErrorCode, entity_ref: str | None = None) -> None:
+        super().__init__(code.value if entity_ref is None else f"{code.value}: {entity_ref}")
+        self.code = code
+        self.entity_ref = entity_ref
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(code={self.code.value!r}, entity_ref={self.entity_ref!r})"
 
 
 class StateTransitionError(DomainError):

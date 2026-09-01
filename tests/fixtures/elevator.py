@@ -74,7 +74,7 @@ from chorus.privacy.policy import SafeDestination, SafeEvidenceCandidate
 
 FIXTURE_NAMESPACE_UUID = UUID("ed85a430-dbb6-5cca-9c86-6f036dff4d36")
 NOW = datetime(2026, 8, 30, 10, 0, 0, tzinfo=UTC)
-NAMESPACE = Namespace("TEST_elevator_v1")
+NAMESPACE = Namespace("TEST_ELEVATOR_V1")
 
 
 def _uuid(name: str) -> UUID:

@@ -174,7 +174,7 @@ def test_evidence_item_namespace_must_match_fact_namespace() -> None:
         report for report in fixture.context.reports if report.report_id == photo_fact.report_id
     )
     evidence_items = tuple(
-        replace(item, namespace=Namespace("TEST_foreign"))
+        replace(item, namespace=Namespace("TEST_FOREIGN"))
         if item.evidence_id == fixture.photo_evidence_id
         else item
         for item in fixture.context.evidence_items
