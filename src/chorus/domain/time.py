@@ -35,6 +35,36 @@ def parse_utc(value: str) -> datetime:
     return parsed
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def epoch_micros(value: datetime) -> int:
+    """Return exact whole microseconds since the epoch.
+
+    This is a storage-condition helper, not a serialization format: canonical persisted
+    instants remain the RFC 3339 strings produced by :func:`format_utc`. It exists so an
+    authorization deadline can be compared by a numeric storage condition without the
+    second-truncation that ``int(datetime.timestamp())`` performs, which would otherwise let
+    a comparison treat an instant as reached up to a second before it actually is. Integer
+    arithmetic is used throughout so no float rounding can move the boundary.
+    """
+
+    delta = require_utc(value) - _EPOCH
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def epoch_seconds_ceiling(value: datetime) -> int:
+    """Return epoch seconds rounded up, for TTL cleanup fields only.
+
+    Rounding up keeps a DynamoDB TTL from ever naming an instant earlier than the value it
+    represents. TTL is cleanup and never authorization, so this is a tidiness guarantee
+    rather than a security one.
+    """
+
+    micros = epoch_micros(value)
+    return -(-micros // 1_000_000)
+
+
 class Clock(Protocol):
     """Command-scoped time source."""
 

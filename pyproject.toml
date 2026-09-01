@@ -11,6 +11,9 @@ requires-python = ">=3.12,<3.13"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
+  "anyio>=4.11,<5",
+  "boto3>=1.40,<2",
+  "botocore>=1.40,<2",
   "pydantic>=2.12,<3",
   "pydantic-settings>=2.10,<3",
   "rfc8785>=0.1.4,<0.2",
@@ -67,7 +70,7 @@ plugins = ["pydantic.mypy"]
 exclude = ["^cdk.out/", "^node_modules/"]
 
 [[tool.mypy.overrides]]
-module = ["rfc8785"]
+module = ["rfc8785", "boto3", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.importlinter]
@@ -87,7 +90,35 @@ forbidden_modules = [
   "strands",
   "aws_cdk",
   "chorus.privacy",
+  "chorus.ports",
   "chorus.infrastructure",
+]
+
+[[tool.importlinter.contracts]]
+name = "Ports expose protocols without SDK or framework dependencies"
+type = "forbidden"
+source_modules = ["chorus.ports"]
+forbidden_modules = [
+  "pydantic",
+  "pydantic_settings",
+  "fastapi",
+  "boto3",
+  "botocore",
+  "strands",
+  "aws_cdk",
+  "chorus.privacy",
+  "chorus.infrastructure",
+]
+
+[[tool.importlinter.contracts]]
+name = "Infrastructure implements ports without reaching into the privacy compiler"
+type = "forbidden"
+source_modules = ["chorus.infrastructure"]
+forbidden_modules = [
+  "fastapi",
+  "strands",
+  "aws_cdk",
+  "chorus.privacy",
 ]
 
 [[tool.importlinter.contracts]]
@@ -102,5 +133,6 @@ forbidden_modules = [
   "botocore",
   "strands",
   "aws_cdk",
+  "chorus.ports",
   "chorus.infrastructure",
 ]

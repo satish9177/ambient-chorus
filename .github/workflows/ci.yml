@@ -8,6 +8,18 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    services:
+      dynamodb-local:
+        # The persistence contract suite runs against a real DynamoDB endpoint; without
+        # this service the integration half of every contract test would silently skip.
+        image: amazon/dynamodb-local:2.6.1
+        ports:
+          - 8000:8000
+    env:
+      CHORUS_REQUIRE_DYNAMODB_LOCAL: "1"
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

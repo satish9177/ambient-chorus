@@ -195,10 +195,10 @@ def test_compile_safe_example_runs_all_22_gates_and_hashes_view() -> None:
     assert tuple(item.gate for item in result.audit_decisions) == tuple(CompilerGate)
     assert result.view.shareable_facts
     assert result.view.authorization_snapshot_hash == Sha256Digest(
-        "sha256:9b854cbf8ad4fc5464d3283adeb520bca48750c103d36c5235a6390a6d5d6e9e"
+        "sha256:7310233202afdbdf7ad8a94acf825e2c8956413fd32936127226e5b0f50b2ef7"
     )
     assert result.view.view_hash == Sha256Digest(
-        "sha256:48aa0934a21d00b4baef1ce0a94b04559dcb9120e4e85abea84dcd985a2dcd8e"
+        "sha256:3e6db66c924482c300670489aba1dc688d8f072f1b569710af9a3a7377f63b8c"
     )
     assert verify_hash(result.view, result.view.view_hash, omit_fields=frozenset({"view_hash"}))
 
@@ -812,7 +812,7 @@ def test_foreign_corroboration_evidence_namespace_denies_as_integrity_failure() 
     context = replace(
         fixture.context,
         evidence_items=tuple(
-            replace(item, namespace=Namespace("TEST_foreign"))
+            replace(item, namespace=Namespace("TEST_FOREIGN"))
             if item.evidence_id == fixture.photo_evidence_id
             else item
             for item in fixture.context.evidence_items
@@ -834,7 +834,7 @@ def test_foreign_corroboration_evidence_namespace_denial_is_order_independent() 
     context = replace(
         fixture.context,
         evidence_items=tuple(
-            replace(item, namespace=Namespace("TEST_foreign"))
+            replace(item, namespace=Namespace("TEST_FOREIGN"))
             if item.evidence_id == fixture.photo_evidence_id
             else item
             for item in fixture.context.evidence_items
@@ -881,7 +881,7 @@ def test_requested_evidence_root_ancestry_namespace_mismatch_denies_ownership() 
                 parent_root_id=parent_root.root_id,
             )
             if root.root_id == photo_item.root_id
-            else replace(root, namespace=Namespace("TEST_foreign"))
+            else replace(root, namespace=Namespace("TEST_FOREIGN"))
             if root.root_id == parent_root.root_id
             else root
             for root in fixture.context.evidence_roots

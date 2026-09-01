@@ -129,7 +129,7 @@ Configuration is loaded once into a strict Pydantic Settings model. Unknown `CHO
 ```dotenv
 # non-secret identity
 CHORUS_ENVIRONMENT=development             # test|development|demo; production rejected in V1
-CHORUS_NAMESPACE=LOCAL_alice                # test/development; deployed demo is exactly DEMO
+CHORUS_NAMESPACE=LOCAL_ALICE                # test/development; deployed demo is exactly DEMO
 CHORUS_AWS_REGION=us-east-1
 CHORUS_LOG_LEVEL=INFO
 CHORUS_POLICY_VERSION=policy/v1

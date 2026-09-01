@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Protocol, TypeVar
+from typing import Final, Protocol, TypeVar
 from uuid import UUID, uuid4, uuid5
 
 
@@ -99,6 +99,15 @@ class OperationId(UUIDIdentifier):
     __slots__ = ()
 
 
+NAMESPACE_PATTERN: Final = re.compile(r"[A-Z][A-Z0-9_]{1,31}")
+"""The frozen isolation-namespace grammar (docs/architecture/06, "Key grammar").
+
+The namespace is the leading segment of every partition key, and key segments are uppercase
+ASCII. The grammar is deliberately generic: which namespaces a given environment may use is
+configuration, not a property of the identity type.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class Namespace:
     """Validated isolation namespace."""
@@ -106,7 +115,9 @@ class Namespace:
     value: str
 
     def __post_init__(self) -> None:
-        if re.fullmatch(r"(?:LOCAL_[A-Za-z0-9_-]+|DEMO|TEST_[A-Za-z0-9_-]+)", self.value) is None:
+        # Validated, never transformed. Case-folding here would alias two distinct namespaces
+        # onto one partition, which would silently merge an isolation boundary.
+        if NAMESPACE_PATTERN.fullmatch(self.value) is None:
             raise ValueError("invalid namespace")
 
     def __str__(self) -> str:

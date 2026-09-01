@@ -11,6 +11,8 @@ from uuid import UUID
 from pydantic import AnyHttpUrl, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from chorus.ports.retention import AuditRetention
+
 
 class Environment(StrEnum):
     """Supported V1 environments."""
@@ -42,7 +44,7 @@ class Settings(BaseSettings):
     _PREFIX: ClassVar[str] = "CHORUS_"
 
     environment: Environment = Environment.DEVELOPMENT
-    namespace: str = Field(default="LOCAL_developer", pattern=r"^(LOCAL_[A-Za-z0-9_-]+|DEMO)$")
+    namespace: str = Field(default="LOCAL_DEVELOPER", pattern=r"^[A-Z][A-Z0-9_]{1,31}$")
     aws_region: str = Field(default="us-east-1", min_length=1, max_length=32)
     log_level: str = Field(default="INFO", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     policy_version: str = Field(default="policy/v1", pattern=r"^policy/v1$")
@@ -114,3 +116,22 @@ class Settings(BaseSettings):
         if unknown:
             raise ValueError(f"unknown CHORUS configuration variable(s): {', '.join(unknown)}")
         return cls()
+
+
+def audit_retention_for(environment: Environment) -> AuditRetention:
+    """Map a deployment environment onto its frozen audit retention.
+
+    This mapping lives with configuration rather than with the repository because how long a
+    *deployment* keeps its audit trail is a property of the deployment, not of the storage
+    adapter. ``AuditRepository`` is handed the resulting policy and never learns which
+    environment produced it.
+
+    Only the demo deployment expires audit events, after 90 days. Everywhere else the trail is
+    kept until an operator removes it, because an expiring audit row in a durable environment
+    would quietly erase the record of a security decision. The table keeps its TTL attribute
+    configured in every environment regardless; what changes is whether an item carries one.
+    """
+
+    if environment is Environment.DEMO:
+        return AuditRetention.demo()
+    return AuditRetention.durable()
