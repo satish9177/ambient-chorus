@@ -35,6 +35,7 @@ from chorus.contracts.common import (
     require_utc_datetime,
 )
 from chorus.domain.entities import (
+    UNNAMED_ISSUE_TYPE,
     DisclosureScope,
     FactType,
     Purpose,
@@ -59,10 +60,19 @@ MAX_MESSAGE_TEXT = 10_000
 
 
 class IssueType(StrEnum):
-    """The frozen V1 issue vocabulary the Monitor may choose from."""
+    """The frozen V1 issue vocabulary the Monitor may choose from.
+
+    Every member except ``OTHER`` *names a subject*: the word itself says what went wrong, so
+    two reports carrying it are describing the same named thing. ``OTHER`` is the opposite --
+    it records that the vocabulary had no word, which is a statement about the vocabulary and
+    not about the incident, and it is the wire spelling of
+    :data:`~chorus.domain.entities.UNNAMED_ISSUE_TYPE`. What follows from that is
+    :func:`~chorus.domain.entities.issue_type_names_a_subject` and ADR-012: only a member that
+    names a subject may put two reports into one case.
+    """
 
     ELEVATOR_FAILURE = "ELEVATOR_FAILURE"
-    OTHER = "OTHER"
+    OTHER = UNNAMED_ISSUE_TYPE
 
 
 class MessageClassification(StrEnum):

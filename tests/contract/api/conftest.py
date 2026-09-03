@@ -29,6 +29,7 @@ from chorus.infrastructure.local.dispatch import (
     RecordingOperationDispatcher,
 )
 from chorus.infrastructure.local.monitor_agent import LexicalFakeMonitorAgent
+from chorus.ports.agents import MonitorAgentPort
 from chorus.ports.storage import StorageDriver
 
 
@@ -47,11 +48,15 @@ class ApiHarness:
         return headers
 
 
-def build_harness(driver: StorageDriver, dispatcher_kind: str) -> ApiHarness:
+def build_harness(
+    driver: StorageDriver, dispatcher_kind: str, *, agent: MonitorAgentPort | None = None
+) -> ApiHarness:
     """Wire one application over an explicit driver.
 
     Exposed so a test can put a fault-injecting driver underneath the *real* route and see what
-    an interrupted request actually leaves behind, rather than reasoning about it.
+    an interrupted request actually leaves behind, rather than reasoning about it. ``agent``
+    substitutes the Monitor the in-process dispatcher runs, for a scenario the keyword stand-in
+    cannot express -- everything from the route down is still the production path.
     """
 
     harness = MonitorHarness(driver=driver)
@@ -59,7 +64,9 @@ def build_harness(driver: StorageDriver, dispatcher_kind: str) -> ApiHarness:
     if dispatcher_kind == "recording":
         dispatcher = RecordingOperationDispatcher()
     else:
-        dispatcher = InProcessOperationDispatcher(worker=harness.worker(LexicalFakeMonitorAgent()))
+        dispatcher = InProcessOperationDispatcher(
+            worker=harness.worker(agent or LexicalFakeMonitorAgent())
+        )
     container = ApiContainer(
         namespace=harness.namespace,
         ingest_messages=harness.ingest,

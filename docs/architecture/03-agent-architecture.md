@@ -37,7 +37,7 @@ Runtime-level validation checks schema, 1 MiB application payload limit, UTF-8, 
 - `messages: tuple[MonitorMessage, ...]`, 1–50 items, each `{message_id, channel_message_id, contributor_pseudonym_id, sent_at, text, attachment_descriptors[]}`;
 - `candidate_case_summaries: tuple[CandidateSummary, ...]`, at most 20, each `{case_id, case_version, title, issue_type, location_area, fact_summaries[]}`;
 - `known_sensitive_categories: tuple[SensitivityCategory, ...]`;
-- `allowed_issue_types: literal tuple('ELEVATOR_FAILURE', 'OTHER')` for the V1 demo.
+- `allowed_issue_types: literal tuple('ELEVATOR_FAILURE', 'OTHER')` for the V1 demo. Only `ELEVATOR_FAILURE` names a subject, so it is the only type intake can currently group under; widening that is a reviewed vocabulary change, not a per-answer judgement ([ADR-012](../adr/ADR-012-candidate-grouping-invariant.md)).
 
 Attachments are descriptors `{evidence_id, media_type, safe_caption?}`. Raw bytes and S3 URIs are not passed. Text is enclosed in explicit untrusted-data delimiters and cannot change the system prompt.
 
@@ -65,9 +65,14 @@ Rules, all enforced by deterministic validation over the whole output:
 - it never becomes a `case_id` and never survives validation;
 - exactly one of `existing_case_id` and `candidate_group_ref` is present on any link. An existing-case link carrying a group ref is refused, and a new-case link without one is refused;
 - every link sharing a `candidate_group_ref` must agree on `issue_type` and on the proposed case title. Disagreement refuses the whole output rather than picking a winner;
-- two different `candidate_group_ref` values stay two different candidate groups even when their issue types are identical.
+- two different `candidate_group_ref` values stay two different candidate groups even when their issue types are identical;
+- **two reports reach one case only under an issue type that names a subject.** A shared label is the model asserting relatedness, and an assertion is not a proof. `OTHER` records that the vocabulary had no word for this problem, so nothing in the input can confirm or contradict two `OTHER` reports being the same incident, and grouping them is refused with `CANDIDATE_GROUP_UNPROVABLE`. See [ADR-012](../adr/ADR-012-candidate-grouping-invariant.md) for why `location_area`, the proposed title, and time proximity are each insufficient.
 
-Durable `case_id` for a new candidate is still assigned by application code from the validated authoritative reports, never from `candidate_group_ref`, exactly as [ADR-011](../adr/ADR-011-monitor-deterministic-identities.md) requires. A group that does not satisfy the candidate-creation guard produces no durable state; see [04-domain-state-and-events.md](04-domain-state-and-events.md).
+The same rule governs an existing-case link: a `candidate_link` naming a case whose `issue_type` names no subject is refused with `CANDIDATE_GROUP_UNPROVABLE`, because extending a case that already holds a report *is* a merge. Creation and extension are one invariant, enforced in one place, so an answer cannot escape the rule by waiting a batch.
+
+Durable `case_id` for a new candidate is still assigned by application code from the validated authoritative reports, never from `candidate_group_ref`, exactly as [ADR-011](../adr/ADR-011-monitor-deterministic-identities.md) requires. A group that does not satisfy the candidate-creation guard produces no durable state; see [04-domain-state-and-events.md](04-domain-state-and-events.md). Because that guard requires two reports, and `OTHER` may never reach two, **intake creates no `OTHER` case at all**: a lone `OTHER` report is provisional, its messages stay ordinary community messages, and a later run sees them again.
+
+The apply gate re-decides the same rule against the *stored* case rather than the answer, denying `CASE_SUBJECT_UNNAMED`, so a case whose issue type names no subject cannot take a further report however it came to exist.
 
 #### Bounded Monitor context
 
@@ -133,7 +138,7 @@ The system prompt says every factual assertion must be represented as a claim ci
 
 - All agents use application inference profiles backed by `amazon.nova-2-lite-v1:0`, one profile per agent for IAM and cost attribution.
 - `temperature=0`; maximum output tokens are 4,000 Monitor, 6,000 Investigator, and 3,000 Action.
-- Prompt IDs are `monitor/v1`, `investigator/v1`, and `action/v1`; prompt text is version-controlled next to each runtime.
+- Prompt IDs are `monitor/v2`, `investigator/v1`, and `action/v1`; prompt text is version-controlled next to each runtime. The Monitor prompt moved to `v2` with [ADR-012](../adr/ADR-012-candidate-grouping-invariant.md), which put the candidate-grouping invariant into the instructions rather than leaving it as a validator rule the model was never told about.
 - Strands structured output is backed by strict Pydantic v2 models. `extra='forbid'`, bounded strings/arrays, discriminated unions, and semantic validators are mandatory.
 - AgentCore sessions are stateless, one invocation per random session ID. Direct-code Python 3.12 runtimes use isolated VPC subnets with no NAT/internet and endpoint-scoped AWS egress. No Memory, Gateway, Browser, Code Interpreter, MCP, A2A, filesystem persistence, or dynamic tool loading.
 

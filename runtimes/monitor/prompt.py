@@ -39,7 +39,7 @@ from uuid import UUID
 
 from chorus.contracts.monitor import MonitorInput, MonitorMessage
 
-MONITOR_PROMPT_VERSION = "monitor/v1"
+MONITOR_PROMPT_VERSION = "monitor/v2"
 
 FENCE_PREFIX: Final = "CHORUS_DATA_"
 FENCE_HEX_LENGTH: Final = 24
@@ -125,6 +125,20 @@ Exactly one structured object matching the schema you were given.
   same new problem share one label; reports about unrelated new problems get different labels,
   even when their issue type is the same. Every link with a candidate_group_ref must give the
   same proposed_case_title and the same issue type as the other links sharing that label.
+- GROUPING AND THE ISSUE TYPE OTHER. Two reports may be put together -- under one
+  candidate_group_ref, or onto one existing case -- only when their issue type is a word that
+  names what went wrong. OTHER is not such a word: it records that the vocabulary had no name
+  for this problem, so two OTHER reports being alike cannot be checked by anything downstream.
+  So when a report's issue type is OTHER:
+    - give it a candidate_group_ref no other report shares, and
+    - do not link it to an existing case.
+  This holds even when the two reports are in the same place, arrived minutes apart, or would
+  read well under one title. If you believe two OTHER reports really are the same incident, say
+  so in similarity_reasons and still keep them apart; something else decides. Choosing OTHER
+  for a report that a listed issue type does describe, in order to group it or to avoid
+  grouping it, is the one thing this rule cannot tolerate -- pick the type that fits.
+  An answer that puts two OTHER reports together is rejected in full, along with every other
+  report, fact, and classification in it.
 - Say what is unclear. UNCERTAIN and a missing-information request are better answers than a
   confident guess.
 

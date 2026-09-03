@@ -53,7 +53,7 @@ INVOCATION = UUID("6f39d0e2-6b57-4a86-9d0b-0a5f39c2b111")
 
 
 def test_the_prompt_version_is_pinned() -> None:
-    assert MONITOR_PROMPT_VERSION == "monitor/v1"
+    assert MONITOR_PROMPT_VERSION == "monitor/v2"
 
 
 def _prompt_text() -> str:

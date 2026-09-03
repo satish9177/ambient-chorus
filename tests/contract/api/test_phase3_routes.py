@@ -8,10 +8,15 @@ cases, not here.
 
 from __future__ import annotations
 
+from typing import Any
+from uuid import UUID
+
 import pytest
 from tests.contract.api.conftest import ApiHarness
 
 from chorus.domain.entities import ApplicationOperationStatus
+from chorus.domain.ids import CaseId
+from chorus.ports.scopes import CaseScope
 
 pytestmark = pytest.mark.anyio
 
@@ -307,3 +312,97 @@ async def test_the_full_discovery_path_is_visible_through_the_api(
     )
     assert all(item["chorus_signal"]["status"] == "CANDIDATE" for item in signalled)
     assert all(item["chorus_signal"]["related_count"] >= 2 for item in signalled)
+
+
+async def test_a_later_request_discovers_and_extends_an_earlier_requests_case(
+    live_api: ApiHarness,
+) -> None:
+    """H-5: existing-case discovery must be reachable through the real HTTP -> Monitor path.
+
+    Neither request names a case -- the second batch is new messages only, and the request
+    contract has no field for one -- so the only way the second operation can settle on the
+    *same* case is if the worker's own context assembly finds the first case's feed signal and
+    hands it to the Monitor as a candidate summary, exactly as a Lambda-dispatched job would in
+    production. An internal helper that hands the Monitor a summary directly would not exercise
+    this at all.
+    """
+
+    await live_api.harness.seed()
+    community_id = str(live_api.harness.community_id)
+
+    def _message(pseudonym: str, channel_id: str, sent_at: str, text: str) -> dict[str, object]:
+        return {
+            "adapter": "SYNTHETIC",
+            "channel_message_id": channel_id,
+            "contributor_id": str(live_api.harness.contributor_id(pseudonym)),
+            "sent_at": sent_at,
+            "text": text,
+            "attachments": [],
+        }
+
+    def _poll(operation_id: str) -> Any:
+        return live_api.client.get(
+            f"/v1/operations/{operation_id}",
+            headers=live_api.presenter_headers(),
+        ).json()
+
+    first_body = live_api.client.post(
+        "/v1/ingest/messages",
+        json={
+            "community_id": community_id,
+            "messages": [
+                _message(
+                    "resident-a",
+                    "h5-first-001",
+                    "2030-02-01T08:00:00Z",
+                    "The elevator is stuck between floors again this morning.",
+                ),
+                _message(
+                    "resident-b",
+                    "h5-first-002",
+                    "2030-02-01T08:01:00Z",
+                    "Same elevator problem, stuck for ten minutes now.",
+                ),
+            ],
+        },
+        headers=live_api.presenter_headers(**{"Idempotency-Key": "h5-first-key"}),
+    ).json()
+    await live_api.dispatcher.drain()  # type: ignore[union-attr]
+
+    first_operation = _poll(first_body["operation"]["operation_id"])
+    assert first_operation["status"] == "SUCCEEDED"
+    assert len(first_operation["result_refs"]) == 1
+    case_id = first_operation["result_refs"][0]
+
+    second_body = live_api.client.post(
+        "/v1/ingest/messages",
+        json={
+            "community_id": community_id,
+            "messages": [
+                _message(
+                    "resident-c",
+                    "h5-second-001",
+                    "2030-02-01T08:02:00Z",
+                    "The lift is stuck again, third floor this time.",
+                ),
+            ],
+        },
+        headers=live_api.presenter_headers(**{"Idempotency-Key": "h5-second-key"}),
+    ).json()
+    await live_api.dispatcher.drain()  # type: ignore[union-attr]
+
+    second_operation = _poll(second_body["operation"]["operation_id"])
+    assert second_operation["status"] == "SUCCEEDED"
+    assert second_operation["result_refs"] == [case_id], (
+        "the second request's own worker must discover the first request's case through the "
+        "real HTTP -> dispatch -> worker path, not create a duplicate"
+    )
+
+    case = await live_api.harness.core.load_case(
+        CaseScope(
+            namespace=live_api.harness.namespace,
+            community_id=live_api.harness.community_id,
+            case_id=CaseId(UUID(str(case_id))),
+        )
+    )
+    assert len(case.report_ids) == 3, "the third report must extend the case, not duplicate it"

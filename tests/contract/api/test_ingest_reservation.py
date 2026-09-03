@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from tests.contract.api.conftest import ApiHarness, build_harness
@@ -42,11 +42,14 @@ from chorus.application.commands.ingest_messages import (
     IngestMessagesCommand,
     monitor_operation_identity,
 )
-from chorus.application.operations import StartReservation
-from chorus.domain.entities import ApplicationOperationStatus
+from chorus.application.operations import StartReservation, monitor_locator_hash
+from chorus.domain.entities import ApplicationOperationKind, ApplicationOperationStatus
 from chorus.infrastructure.local.dispatch import RecordingOperationDispatcher
+from chorus.infrastructure.local.monitor_agent import LexicalFakeMonitorAgent
 from chorus.ports.idempotency import IdempotencyStatus, IdempotentCommand
+from chorus.ports.operations import MonitorOperationJob
 from chorus.ports.pagination import PageRequest
+from chorus.ports.records import MessageFeedEntry
 from chorus.ports.scopes import CommunityScope
 from chorus.ports.storage import StorageDriver
 
@@ -400,6 +403,117 @@ async def test_two_equivalent_requests_under_one_reservation_create_one_operatio
         "reservation-b",
         "reservation-c",
     }
+
+
+async def test_two_reservations_racing_to_complete_converge_on_one_operation(
+    api: ApiHarness,
+) -> None:
+    """H-9: a genuinely concurrent pair of completions, not merely two sequential posts.
+
+    ``test_two_equivalent_requests_under_one_reservation_create_one_operation`` always lets the
+    first ``_post`` finish -- reservation, ingest, *and* ``complete_start`` -- before the second
+    one begins, so the completing transaction never actually has a live rival. Here both callers
+    hold their own ``StartReservation`` for the same key before either one calls
+    ``complete_start``, which is the exact window two truly concurrent HTTP requests would race
+    in. Convergence has to come from the guarded transaction and the read-back after a
+    conditional failure, not from one request happening to finish first.
+    """
+
+    await api.harness.seed()
+    # Real contributors and lift-shaped text: unlike the reservation-only tests above, this
+    # one has to reach an actual model dispatch, so an unattributable no-op batch would prove
+    # nothing about the race it exists to close.
+    command = IngestMessagesCommand(
+        namespace=api.harness.namespace,
+        community_id=api.harness.community_id,
+        actor_id_hash=PRESENTER_ACTOR_HASH,
+        idempotency_key=KEY,
+        messages=(
+            IngestMessage(
+                channel_message_id="reservation-race-a",
+                contributor_id=api.harness.contributor_id("resident-a"),
+                sent_at=SENT_AT,
+                text="The elevator is stuck between floors again this morning.",
+            ),
+            IngestMessage(
+                channel_message_id="reservation-race-b",
+                contributor_id=api.harness.contributor_id("resident-b"),
+                sent_at=SENT_AT + timedelta(minutes=1),
+                text="Same elevator problem, stuck for ten minutes now.",
+            ),
+        ),
+    )
+    key_hash, request_hash = monitor_operation_identity(command)
+
+    reserved_first = await api.harness.operations.reserve_start(
+        namespace=api.harness.namespace,
+        command=IdempotentCommand.START_MONITOR_OPERATION,
+        actor_id_hash=PRESENTER_ACTOR_HASH,
+        key_hash=key_hash,
+        request_hash=request_hash,
+    )
+    reserved_second = await api.harness.operations.reserve_start(
+        namespace=api.harness.namespace,
+        command=IdempotentCommand.START_MONITOR_OPERATION,
+        actor_id_hash=PRESENTER_ACTOR_HASH,
+        key_hash=key_hash,
+        request_hash=request_hash,
+    )
+    assert isinstance(reserved_first, StartReservation)
+    assert isinstance(reserved_second, StartReservation)
+
+    ingested = await api.harness.ingest.execute(command)
+    sent_at_by_channel = {
+        message.channel_message_id: message.sent_at for message in command.messages
+    }
+    locators = tuple(
+        MessageFeedEntry(
+            message_id=item.message_id, sent_at=sent_at_by_channel[item.channel_message_id]
+        )
+        for item in ingested.messages
+    )
+    locator_hash = monitor_locator_hash(locators)
+
+    started_first = await api.harness.operations.complete_start(
+        reserved_first,
+        namespace=api.harness.namespace,
+        kind=ApplicationOperationKind.MONITOR,
+        actor_id_hash=PRESENTER_ACTOR_HASH,
+        monitor_locator_hash=locator_hash,
+    )
+    started_second = await api.harness.operations.complete_start(
+        reserved_second,
+        namespace=api.harness.namespace,
+        kind=ApplicationOperationKind.MONITOR,
+        actor_id_hash=PRESENTER_ACTOR_HASH,
+        monitor_locator_hash=locator_hash,
+    )
+
+    assert started_first.operation.operation_id == started_second.operation.operation_id
+    assert started_first.invocation_id == started_second.invocation_id
+    assert {started_first.replayed, started_second.replayed} == {True, False}, (
+        "exactly one caller's transaction commits; the other reads back what it committed"
+    )
+
+    agent = LexicalFakeMonitorAgent()
+    worker = api.harness.worker(agent)
+    job = MonitorOperationJob(
+        operation_id=started_first.operation.operation_id,
+        namespace=api.harness.namespace,
+        community_id=api.harness.community_id,
+        invocation_id=started_first.invocation_id,
+        correlation_id=uuid4(),
+        actor_id_hash=PRESENTER_ACTOR_HASH,
+        request_hash=request_hash,
+        message_locators=locators,
+    )
+
+    # Both racing callers' dispatchers hand the same job identity to the worker, exactly as
+    # the API route's duplicate-dispatch design intends -- see ``operations.py``.
+    await worker.execute(job)
+    await worker.execute(job)
+
+    assert len(agent.invocations) == 1, "two concurrent completions, one pass over private text"
 
 
 async def test_the_operation_a_completed_key_names_carries_its_monitor_handover(

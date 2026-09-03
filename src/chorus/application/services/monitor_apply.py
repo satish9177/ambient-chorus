@@ -36,6 +36,10 @@ The gates, and why each one fails closed
   actually shown. Refreshing the expected version at apply time and proceeding would compare
   the case against itself and call that agreement, while the reasoning that produced the link
   had in fact read a case that no longer exists.
+* **named subject.** A case is a merge -- the threshold above needs two reports -- and two
+  reports may only be merged under an issue type that names what went wrong. ``OTHER`` names
+  nothing, so no ``OTHER`` case is derived an address here and no stored case whose issue type
+  names no subject may take a further report, whatever the answer proposes (ADR-012).
 * **existing linkage.** A message already bound to one case may not be proposed for another.
   Phase-3 Monitor cannot relink; that is a correction, and corrections have their own
   authority. The refusal happens here, before any write is staged, so it is a domain rule and
@@ -71,6 +75,7 @@ from chorus.domain.entities import (
     CaseState,
     CommunityCase,
     EvidenceStatus,
+    issue_type_names_a_subject,
 )
 from chorus.domain.errors import DomainError, DomainErrorCode
 from chorus.domain.facts import Fact, FactStatus, Report, ReportStatus
@@ -151,6 +156,7 @@ class MonitorApplyDenial(StrEnum):
     CASE_STATE_INELIGIBLE = "CASE_STATE_INELIGIBLE"
     CASE_VERSION_STALE = "CASE_VERSION_STALE"
     REPORT_ALREADY_LINKED = "REPORT_ALREADY_LINKED"
+    CASE_SUBJECT_UNNAMED = "CASE_SUBJECT_UNNAMED"
 
 
 class MonitorApplyDeniedError(DomainError):
@@ -520,7 +526,15 @@ def derive_identities(
             for member in members
         }
         case_id = group.existing_case_id
-        if case_id is None and len(set(report_ids.values())) >= MIN_REPORTS_FOR_NEW_CANDIDATE:
+        if (
+            case_id is None
+            and len(set(report_ids.values())) >= MIN_REPORTS_FOR_NEW_CANDIDATE
+            # ADR-012: a case is a merge, and a merge needs a subject the vocabulary names.
+            # The validator has already refused a multi-member group under ``OTHER``, so
+            # reaching here with one would mean the two disagreed; deriving no address is the
+            # fail-closed half of that disagreement rather than the permissive half.
+            and issue_type_names_a_subject(group.issue_type)
+        ):
             case_id = derive_candidate_case_id(
                 namespace=namespace,
                 community_id=community_id,
@@ -698,6 +712,13 @@ def _check_case_eligibility(
         raise MonitorApplyDeniedError(MonitorApplyDenial.CASE_VERSION_STALE)
     if existing.state not in MONITOR_LINKABLE_CASE_STATES:
         raise MonitorApplyDeniedError(MonitorApplyDenial.CASE_STATE_INELIGIBLE)
+    if not issue_type_names_a_subject(existing.issue_type):
+        # ADR-012, decided against the *stored* case rather than against the answer. The
+        # validator already refuses this link, and it refuses it from the candidate summary
+        # the agent was shown. This gate asks the case itself, so a case whose issue type
+        # names no subject cannot take a second report however it came to exist -- an earlier
+        # release, a seed, a fixture, or a summary that no longer matches the row.
+        raise MonitorApplyDeniedError(MonitorApplyDenial.CASE_SUBJECT_UNNAMED)
     if existing.version != group.expected_case_version:
         raise MonitorApplyDeniedError(MonitorApplyDenial.CASE_VERSION_STALE)
 

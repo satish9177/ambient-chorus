@@ -14,7 +14,7 @@
 [runtime]
 name = "chorus-monitor"
 agent_name = "MONITOR"
-prompt_version = "monitor/v1"
+prompt_version = "monitor/v2"
 python_version = "3.12"
 network_mode = "VPC"
 

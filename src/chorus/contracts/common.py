@@ -21,12 +21,17 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 AGENT_INPUT_SCHEMA_VERSION: Final = "agent-input/v1"
 AGENT_OUTPUT_SCHEMA_VERSION: Final = "agent-output/v1"
 
-MONITOR_PROMPT_VERSION: Final = "monitor/v1"
+MONITOR_PROMPT_VERSION: Final = "monitor/v2"
 """The only Monitor prompt identity this contract version accepts.
 
 The prompt is pinned rather than negotiated. A runtime that answers with a different prompt
 version is running text this application did not review, so the application refuses the
 result instead of trusting it.
+
+``v2`` states the candidate-grouping invariant of ADR-012 in the prompt itself. The version
+moved because the model's instructions changed, not because the schema did: a validator rule
+the prompt never asks the model to satisfy is a hidden requirement, and a hidden requirement
+fails an honest answer's whole batch.
 """
 
 

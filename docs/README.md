@@ -63,6 +63,8 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-008](adr/ADR-008-aws-cdk.md) | AWS CDK v2 in Python |
 | [ADR-009](adr/ADR-009-uv-and-npm.md) | `uv` and `npm` package management |
 | [ADR-010](adr/ADR-010-agentcore-runtime.md) | AgentCore Runtime for all three agents |
+| [ADR-011](adr/ADR-011-monitor-deterministic-identities.md) | Replay-safe deterministic identities for Monitor-derived entities |
+| [ADR-012](adr/ADR-012-candidate-grouping-invariant.md) | Candidate grouping only under an issue type that names a subject |
 
 ## Implementation control
 

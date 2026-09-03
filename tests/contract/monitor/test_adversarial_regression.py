@@ -16,6 +16,7 @@ only part of the path that cannot be made to answer on demand.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from uuid import UUID, uuid4, uuid5
 
 import pytest
@@ -27,6 +28,7 @@ from tests.fixtures.faults import (
 from tests.fixtures.monitor import FIXTURE_ID_NAMESPACE, MonitorHarness
 from tests.fixtures.monitor_answers import (
     THREE_GROUPS,
+    UNPROVABLE_OTHER_GROUP,
     GroupSpec,
     classify_all,
     fact_for,
@@ -43,8 +45,14 @@ from chorus.application.services.monitor_apply import (
     MonitorApplyDeniedError,
 )
 from chorus.contracts.monitor import (
+    MAX_PROPOSED_FACTS,
+    MAX_PROPOSED_REPORTS,
     CandidateLink,
+    IncidentOccurrenceValue,
     IssueType,
+    LocationAreaValue,
+    ManagementStatementValue,
+    MonitorFactValue,
     MonitorInput,
     MonitorMessage,
     MonitorMessageResult,
@@ -52,9 +60,10 @@ from chorus.contracts.monitor import (
     MonitorSourceSpan,
     ProposedFact,
     ProposedReport,
+    ServiceImpactValue,
 )
-from chorus.domain.entities import CaseState, CommunityCase
-from chorus.domain.facts import FailureMode
+from chorus.domain.entities import CaseState, CommunityCase, FactType, SensitivityCategory
+from chorus.domain.facts import FailureMode, ImpactCode, LocationAreaCode
 from chorus.domain.ids import CaseId
 from chorus.infrastructure.local.monitor_agent import LexicalFakeMonitorAgent, ScriptedMonitorAgent
 from chorus.ports.agents import (
@@ -63,6 +72,7 @@ from chorus.ports.agents import (
     AgentOutputDriftError,
     MonitorInvocation,
 )
+from chorus.ports.ambient import AmbientMessage
 from chorus.ports.limits import TRANSACTION_MAX_OPERATIONS
 from chorus.ports.pagination import PageRequest
 from chorus.ports.records import AgentInvocationOutcome, MessageFeedEntry
@@ -138,18 +148,20 @@ async def test_three_unrelated_problems_become_three_cases(harness: MonitorHarne
         titles.add(case.title)
         issue_types.append(case.issue_type)
     assert titles == {group[2] for group in THREE_GROUPS}
-    assert issue_types.count("OTHER") == 2, "two OTHER problems stay two cases"
+    assert issue_types == ["ELEVATOR_FAILURE"] * 3, (
+        "every group shares one issue type, so three cases proves the group ref separated them"
+    )
 
 
-async def test_two_other_problems_never_collapse_into_one_case(
+async def test_two_problems_sharing_an_issue_type_never_collapse_into_one_case(
     harness: MonitorHarness,
 ) -> None:
     """The precise regression: same issue type, different group, must stay separate."""
 
     locators = await _seeded(harness)
-    other_only = THREE_GROUPS[1:]
+    two_groups = THREE_GROUPS[1:]
     agent = ScriptedMonitorAgent(
-        responder=lambda invocation: _grouped_answer(invocation.payload, other_only)
+        responder=lambda invocation: _grouped_answer(invocation.payload, two_groups)
     )
 
     result = await harness.run_monitor(agent).execute(harness.monitor_command(locators))
@@ -160,6 +172,242 @@ async def test_two_other_problems_never_collapse_into_one_case(
         case = await harness.core.load_case(_scope(harness, case_id))
         reports_per_case.append(len(case.report_ids))
     assert reports_per_case == [2, 2]
+
+
+async def test_two_other_reports_under_one_group_ref_are_refused(
+    harness: MonitorHarness,
+) -> None:
+    """The other half of the same regression, after ADR-012.
+
+    Two unrelated problems the vocabulary can only call ``OTHER`` no longer become two cases
+    -- they become none, and the answer proposing the merge is refused whole. A distinct group
+    ref is what keeps two *named* problems apart; it is not a licence to merge two unnamed
+    ones.
+    """
+
+    locators = await _seeded(harness)
+    agent = ScriptedMonitorAgent(
+        responder=lambda invocation: _grouped_answer(invocation.payload, UNPROVABLE_OTHER_GROUP)
+    )
+
+    with pytest.raises(AgentContractViolationError) as raised:
+        await harness.run_monitor(agent).execute(harness.monitor_command(locators))
+    assert "CANDIDATE_GROUP_UNPROVABLE" in raised.value.reason_codes
+
+
+async def _ingest_pair(
+    harness: MonitorHarness, *, first: tuple[str, str, str], second: tuple[str, str, str]
+) -> tuple[MessageFeedEntry, ...]:
+    """Ingest two custom messages, each ``(channel_id, pseudonym, text)``, for a grouping probe."""
+
+    await harness.seed()
+    anchor = harness.adapter.messages()[-1].sent_at
+    batch = (
+        AmbientMessage(
+            adapter="SYNTHETIC",
+            channel_message_id=first[0],
+            contributor_pseudonym=first[1],
+            sent_at=anchor + timedelta(minutes=100),
+            text=first[2],
+        ),
+        AmbientMessage(
+            adapter="SYNTHETIC",
+            channel_message_id=second[0],
+            contributor_pseudonym=second[1],
+            sent_at=anchor + timedelta(minutes=101),
+            text=second[2],
+        ),
+    )
+    result = await harness.ingest_messages(batch, idempotency_key=f"{first[0]}-{second[0]}-key")
+    return tuple(
+        MessageFeedEntry(message_id=item.message_id, sent_at=message.sent_at)
+        for item, message in zip(result.messages, batch, strict=True)
+    )
+
+
+async def test_two_unrelated_other_incidents_with_a_shared_vague_title_are_refused(
+    harness: MonitorHarness,
+) -> None:
+    """H-3, at the exact shape the reviewer reproduced.
+
+    A plumbing leak and a low-pressure complaint are unrelated problems that a careless or
+    adversarial model can file under one ``candidate_group_ref`` and one title. Both checks
+    the validator enforced before ADR-012 pass -- issue type agrees, title agrees -- because
+    the model chose both. The location the earlier repair compared is supplied here, and
+    supplied *identically*, so this also proves the refusal no longer depends on it.
+    """
+
+    locators = await _ingest_pair(
+        harness,
+        first=(
+            "h3-plumbing",
+            "resident-a",
+            "The kitchen sink in the shared laundry room has been leaking badly for two days.",
+        ),
+        second=(
+            "h3-pressure",
+            "resident-b",
+            "Water pressure in my unit has been extremely low all week, barely a trickle.",
+        ),
+    )
+
+    def responder(invocation: MonitorInvocation) -> MonitorOutput:
+        payload = invocation.payload
+        first, second = payload.messages[0], payload.messages[1]
+        reports = tuple(
+            _report_for(message, ref, IssueType.OTHER).model_copy(
+                update={"location_area": LocationAreaCode.BUILDING}
+            )
+            for message, ref in ((first, "report-000"), (second, "report-001"))
+        )
+        links = tuple(
+            CandidateLink(
+                report_client_ref=ref,
+                candidate_group_ref="misc-group",
+                proposed_case_title="General building issue",
+                similarity_reasons=("adversarial merge",),
+                confidence="0.9",
+            )
+            for ref in ("report-000", "report-001")
+        )
+        return MonitorOutput(
+            message_results=_classify_all(payload, {first.message_id, second.message_id}),
+            proposed_reports=reports,
+            proposed_facts=(
+                _fact_for(first, "fact-000", "report-000"),
+                _fact_for(second, "fact-001", "report-001"),
+            ),
+            candidate_links=links,
+        )
+
+    agent = ScriptedMonitorAgent(responder=responder)
+
+    with pytest.raises(AgentContractViolationError) as raised:
+        await harness.run_monitor(agent).execute(harness.monitor_command(locators))
+
+    assert "CANDIDATE_GROUP_UNPROVABLE" in raised.value.reason_codes
+    assert "CANDIDATE_GROUP_LOCATION_REQUIRED" not in raised.value.reason_codes, (
+        "the withdrawn interim rule must not still be deciding anything"
+    )
+
+
+async def test_two_related_reports_under_a_named_issue_type_still_group(
+    harness: MonitorHarness,
+) -> None:
+    """The fix must not over-restrict. Grouping still works -- under a word that names it.
+
+    The counterpart is deliberate: two reports just as alike, filed as ``OTHER``, are refused
+    by :func:`test_two_genuinely_related_other_reports_are_still_separated`. What decides is
+    the vocabulary, not the model's prose about how alike the reports are.
+    """
+
+    locators = await _ingest_pair(
+        harness,
+        first=(
+            "h3-lift-1",
+            "resident-a",
+            "The lift stopped between floors again this morning and the doors would not open.",
+        ),
+        second=(
+            "h3-lift-2",
+            "resident-b",
+            "Confirming the lift is stuck again, same fault my neighbour reported earlier.",
+        ),
+    )
+
+    def responder(invocation: MonitorInvocation) -> MonitorOutput:
+        payload = invocation.payload
+        first, second = payload.messages[0], payload.messages[1]
+        links = tuple(
+            CandidateLink(
+                report_client_ref=ref,
+                candidate_group_ref="lift-group",
+                proposed_case_title="Lift stopping between floors",
+                similarity_reasons=("same equipment, same fault",),
+                confidence="0.9",
+            )
+            for ref in ("report-000", "report-001")
+        )
+        return MonitorOutput(
+            message_results=_classify_all(payload, {first.message_id, second.message_id}),
+            proposed_reports=(
+                _report_for(first, "report-000", IssueType.ELEVATOR_FAILURE),
+                _report_for(second, "report-001", IssueType.ELEVATOR_FAILURE),
+            ),
+            proposed_facts=(
+                _fact_for(first, "fact-000", "report-000"),
+                _fact_for(second, "fact-001", "report-001"),
+            ),
+            candidate_links=links,
+        )
+
+    agent = ScriptedMonitorAgent(responder=responder)
+    result = await harness.run_monitor(agent).execute(harness.monitor_command(locators))
+
+    assert len(result.created_case_ids) == 1
+    case = await harness.core.load_case(_scope(harness, result.created_case_ids[0]))
+    assert len(case.report_ids) == 2
+
+
+async def test_two_genuinely_related_other_reports_are_still_separated(
+    harness: MonitorHarness,
+) -> None:
+    """The cost of the invariant, asserted rather than left implicit.
+
+    These two residents really are describing one broken intercom. Deterministic code cannot
+    tell that from an answer that would read identically if they were not, so the merge is
+    refused: false separation, deliberately preferred to false merging (ADR-012). The remedy
+    is a vocabulary that can name the problem, not a validator that guesses.
+    """
+
+    locators = await _ingest_pair(
+        harness,
+        first=(
+            "h3-lobby-1",
+            "resident-a",
+            "The lobby intercom has been broken for a week, nobody can buzz visitors in.",
+        ),
+        second=(
+            "h3-lobby-2",
+            "resident-b",
+            "Confirming the lobby intercom is still dead, same problem my neighbour reported.",
+        ),
+    )
+
+    def responder(invocation: MonitorInvocation) -> MonitorOutput:
+        payload = invocation.payload
+        first, second = payload.messages[0], payload.messages[1]
+        reports = tuple(
+            _report_for(message, ref, IssueType.OTHER).model_copy(
+                update={"location_area": LocationAreaCode.LOBBY}
+            )
+            for message, ref in ((first, "report-000"), (second, "report-001"))
+        )
+        links = tuple(
+            CandidateLink(
+                report_client_ref=ref,
+                candidate_group_ref="lobby-group",
+                proposed_case_title="Broken lobby intercom",
+                similarity_reasons=("same equipment, same area",),
+                confidence="0.9",
+            )
+            for ref in ("report-000", "report-001")
+        )
+        return MonitorOutput(
+            message_results=_classify_all(payload, {first.message_id, second.message_id}),
+            proposed_reports=reports,
+            proposed_facts=(
+                _fact_for(first, "fact-000", "report-000"),
+                _fact_for(second, "fact-001", "report-001"),
+            ),
+            candidate_links=links,
+        )
+
+    with pytest.raises(AgentContractViolationError) as raised:
+        await harness.run_monitor(ScriptedMonitorAgent(responder=responder)).execute(
+            harness.monitor_command(locators)
+        )
+    assert "CANDIDATE_GROUP_UNPROVABLE" in raised.value.reason_codes
 
 
 async def test_one_group_disagreeing_with_itself_denies_the_whole_answer(
@@ -482,9 +730,12 @@ async def test_a_message_bound_to_one_case_cannot_be_moved_to_another(
     ).execute(harness.monitor_command(locators))
     original_case = first.created_case_ids[0]
 
-    # A second answer files the very same messages under a different new group, which derives
-    # a different candidate case identity.
-    regrouped = (("different-group", IssueType.OTHER, "A different reading entirely", (1, 4)),)
+    # A second answer files one of those already-bound messages into a different new group.
+    # Case identity is derived from the report set, so pairing message 1 with an unbound
+    # message names a *different* candidate case and asks for message 1 to be moved into it.
+    regrouped = (
+        ("different-group", IssueType.ELEVATOR_FAILURE, "A different reading entirely", (1, 0)),
+    )
 
     with pytest.raises(MonitorApplyDeniedError) as raised:
         await harness.run_monitor(
@@ -798,6 +1049,120 @@ async def test_the_apply_item_budget_leaves_room_for_its_own_overhead() -> None:
     """A step is items plus case row, progress, proof, and -- once per case -- record and audit."""
 
     assert MONITOR_APPLY_ITEM_BUDGET + 5 < TRANSACTION_MAX_OPERATIONS
+
+
+async def test_a_contract_maximum_answer_never_attempts_one_oversized_transaction(
+    harness: MonitorHarness,
+) -> None:
+    """H-1's exact adversarial scenario: one answer at the frozen Monitor maxima.
+
+    Twenty-five reports and a hundred facts, every one of them one new candidate case. A
+    single transaction for that group would need roughly the reports, the signals, and the
+    facts, plus the case row, progress advance, commit proof, and -- once -- the invocation
+    record and audit event: comfortably past DynamoDB's hundred-operation limit. This drives
+    the real planner and the real storage driver at that size and asserts every transaction it
+    actually issues, not just the arithmetic that predicts them.
+    """
+
+    await harness.seed()
+    anchor = harness.adapter.messages()[-1].sent_at
+
+    batch = tuple(
+        AmbientMessage(
+            adapter="SYNTHETIC",
+            channel_message_id=f"h1-max-{index:03d}",
+            contributor_pseudonym="resident-a",
+            sent_at=anchor + timedelta(minutes=200 + index),
+            text=f"The elevator is stuck again, report number {index}.",
+        )
+        for index in range(MAX_PROPOSED_REPORTS)
+    )
+    ingested = await harness.ingest_messages(batch, idempotency_key="h1-max-key")
+    locators = tuple(
+        MessageFeedEntry(message_id=item.message_id, sent_at=message.sent_at)
+        for item, message in zip(ingested.messages, batch, strict=True)
+    )
+    facts_per_report = MAX_PROPOSED_FACTS // MAX_PROPOSED_REPORTS
+    assert facts_per_report * MAX_PROPOSED_REPORTS == MAX_PROPOSED_FACTS, "the probe must be exact"
+
+    def responder(invocation: MonitorInvocation) -> MonitorOutput:
+        payload = invocation.payload
+        reports: list[ProposedReport] = []
+        facts: list[ProposedFact] = []
+        links: list[CandidateLink] = []
+        signals: set[UUID] = set()
+
+        def _typed_values(message: MonitorMessage) -> tuple[MonitorFactValue, ...]:
+            return (
+                IncidentOccurrenceValue(
+                    fact_type=FactType.INCIDENT_OCCURRENCE,
+                    occurred_at=message.sent_at,
+                    failure_mode=FailureMode.STUCK,
+                ),
+                ServiceImpactValue(
+                    fact_type=FactType.SERVICE_IMPACT,
+                    impact_code=ImpactCode.DELAY,
+                    summary="Residents delayed getting to work.",
+                ),
+                LocationAreaValue(
+                    fact_type=FactType.LOCATION_AREA, area=LocationAreaCode.ELEVATOR_CAB
+                ),
+                ManagementStatementValue(
+                    fact_type=FactType.MANAGEMENT_STATEMENT,
+                    statement="Management is aware and dispatched a technician.",
+                    speaker_org="Building management",
+                    stated_at=message.sent_at,
+                ),
+            )
+
+        for index, message in enumerate(payload.messages):
+            signals.add(message.message_id)
+            report_ref = f"report-{index:03d}"
+            reports.append(_report_for(message, report_ref, IssueType.ELEVATOR_FAILURE))
+            span = _whole_span(message)
+            for slot, typed_value in enumerate(_typed_values(message)[:facts_per_report]):
+                facts.append(
+                    ProposedFact(
+                        client_ref=f"fact-{index:03d}-{slot}",
+                        report_client_ref=report_ref,
+                        fact_type=typed_value.fact_type,
+                        typed_value=typed_value,
+                        sensitivity=SensitivityCategory.GENERAL,
+                        source_spans=(span,),
+                    )
+                )
+            links.append(
+                CandidateLink(
+                    report_client_ref=report_ref,
+                    candidate_group_ref="max-group",
+                    proposed_case_title="Recurring lift failures at contract maximum",
+                    similarity_reasons=("same equipment",),
+                    confidence="0.9",
+                )
+            )
+        return MonitorOutput(
+            message_results=_classify_all(payload, signals),
+            proposed_reports=tuple(reports),
+            proposed_facts=tuple(facts),
+            candidate_links=tuple(links),
+        )
+
+    faulty = FaultInjectingDriver(inner=harness.driver, script=[])
+    instrumented = MonitorHarness(driver=faulty, namespace=harness.namespace)
+    agent = ScriptedMonitorAgent(responder=responder)
+
+    result = await instrumented.run_monitor(agent).execute(instrumented.monitor_command(locators))
+
+    assert len(result.created_case_ids) == 1
+    case = await harness.core.load_case(_scope(harness, result.created_case_ids[0]))
+    assert len(case.report_ids) == MAX_PROPOSED_REPORTS
+    assert len(case.fact_ids) == MAX_PROPOSED_FACTS
+
+    assert len(faulty.transact_sizes) > 1, "the contract maximum must span more than one step"
+    assert max(faulty.transact_sizes) <= TRANSACTION_MAX_OPERATIONS, (
+        f"a single transaction of {max(faulty.transact_sizes)} operations exceeds the frozen "
+        f"{TRANSACTION_MAX_OPERATIONS}-operation limit -- this is the exact defect H-1 reported"
+    )
 
 
 # ---------------------------------------------------------------------------------------

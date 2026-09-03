@@ -142,6 +142,14 @@ class FaultInjectingDriver:
     write_calls: int = field(default=0, init=False)
     scripted_writes: int = field(default=0, init=False)
     transact_tokens: list[str] = field(default_factory=list, init=False)
+    transact_sizes: list[int] = field(default_factory=list, init=False)
+    """How many operations each ``transact_write`` call carried, in call order.
+
+    Exists so a test can assert a bound on transaction *size* -- not merely on how many
+    transactions happened -- without needing its own driver wrapper. Recorded for every call
+    regardless of scripting, because the size of what was attempted is the fact under test,
+    not the outcome the script gave it.
+    """
 
     async def get_item(self, key: ItemKey, *, consistent: bool) -> StoredItem | None:
         index = self.read_calls
@@ -206,6 +214,7 @@ class FaultInjectingDriver:
     ) -> None:
         self.transact_calls += 1
         self.transact_tokens.append(client_request_token)
+        self.transact_sizes.append(len(operations))
         if self.scripted is not None and not self.scripted(operations):
             await self.inner.transact_write(operations, client_request_token=client_request_token)
             return

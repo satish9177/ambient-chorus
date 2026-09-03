@@ -95,7 +95,7 @@ def test_an_answer_from_an_unreviewed_prompt_version_is_refused() -> None:
     """
 
     case = valid_case()
-    stale = build_result(case.invocation, case.output, prompt_version="monitor/v2")
+    stale = build_result(case.invocation, case.output, prompt_version="monitor/v1")
 
     with pytest.raises(AgentContractViolationError) as raised:
         validate_monitor_result(
@@ -106,7 +106,7 @@ def test_an_answer_from_an_unreviewed_prompt_version_is_refused() -> None:
         )
     assert AgentRejection.PROMPT_VERSION_MISMATCH.value in raised.value.reason_codes
     assert "prompt_version" not in type(case.invocation).model_fields
-    assert MONITOR_PROMPT_VERSION == "monitor/v1"
+    assert MONITOR_PROMPT_VERSION == "monitor/v2"
 
 
 def test_a_missing_message_classification_is_refused() -> None:

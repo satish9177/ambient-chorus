@@ -292,12 +292,12 @@ async def test_a_denied_linkage_emits_report_link_denied_with_the_gate_that_refu
     await runner.execute(harness.monitor_command(locators))
     captured.clear()
 
-    # Re-file the same messages as a different *problem*. Durable case identity comes from the
-    # validated reports, so changing only the group label would resolve to the same case;
-    # changing the issue type changes the report identities and therefore the case, which is
-    # the relink Phase-3 Monitor may not perform.
+    # Re-file some of the same messages as a different *case*. Durable case identity comes from
+    # the validated reports, so changing only the group label would resolve to the same case;
+    # covering a different subset of the messages changes the report set and therefore the
+    # case, which is the relink Phase-3 Monitor may not perform.
     def regroup(invocation: MonitorInvocation) -> MonitorOutput:
-        return _new_group_answer(invocation.payload, "a-different-group", issue=IssueType.OTHER)
+        return _new_group_answer(invocation.payload, "a-different-group", only=3)
 
     from chorus.application.services.monitor_apply import MonitorApplyDeniedError
 
@@ -474,13 +474,34 @@ async def test_a_redelivered_operation_emits_a_lambda_replay(
 
 
 def _new_group_answer(
-    payload: MonitorInput, group_ref: str, *, issue: IssueType = IssueType.ELEVATOR_FAILURE
+    payload: MonitorInput,
+    group_ref: str,
+    *,
+    issue: IssueType = IssueType.ELEVATOR_FAILURE,
+    only: int | None = None,
 ) -> MonitorOutput:
+    """One new group over the payload, or over its first ``only`` messages.
+
+    ``only`` exists so a second answer can name a *different* report set. Case identity is
+    derived from the validated reports, so an answer covering the same messages under the same
+    issue type resolves to the same case and is a replay rather than a relink.
+    """
+
     reports: list[ProposedReport] = []
     facts: list[ProposedFact] = []
     links: list[CandidateLink] = []
     results: list[MonitorMessageResult] = []
+    covered = payload.messages if only is None else payload.messages[:only]
     for index, message in enumerate(payload.messages):
+        if message not in covered:
+            results.append(
+                MonitorMessageResult(
+                    message_id=message.message_id,
+                    classification=MessageClassification.NOISE,
+                    reason="scripted",
+                )
+            )
+            continue
         results.append(
             MonitorMessageResult(
                 message_id=message.message_id,

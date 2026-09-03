@@ -46,6 +46,42 @@ class EvidenceStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+UNNAMED_ISSUE_TYPE = "OTHER"
+"""The issue type that records the absence of a name rather than a problem.
+
+Spelled here, in the domain, because a stored ``CommunityCase.issue_type`` is a plain string
+and the rule below has to read a case row exactly as it reads a fresh proposal. The agent
+contract's ``IssueType.OTHER`` is the wire spelling of this same value.
+"""
+
+
+def issue_type_names_a_subject(issue_type: str) -> bool:
+    """Whether this vocabulary word identifies *what* went wrong, and may therefore group.
+
+    This is the whole of the candidate-grouping discriminator, and it is deliberately the only
+    one (ADR-012). A candidate case is a merge -- the creation guard needs two reports before a
+    case exists at all -- so filing two reports under one case is a claim that they describe
+    one incident. Deterministic code can only prove that claim from a closed signal the input
+    already carries, and the issue type is the only closed signal that says anything about the
+    problem. ``LocationAreaCode`` is a four-member *area kind*
+    (``LOBBY``/``ELEVATOR_CAB``/``COMMON_AREA``/``BUILDING``), not a place identity, so it
+    cannot separate an elevator fault from a water-pressure complaint that share a building;
+    the proposed title and the similarity reasons are free text the model wrote itself, so
+    agreeing with them proves only that the model was consistent.
+
+    ``OTHER`` therefore does not group. Widening what intake may group is a *vocabulary*
+    change -- add a named member to the issue vocabulary -- reviewed once, in the open, rather
+    than inferred per answer from prose.
+
+    The comparison is case- and whitespace-insensitive so that no spelling of the unnamed type
+    can be the thing that grants grouping. The contract enum admits only the canonical form, so
+    this cannot matter for an answer; it matters for a stored ``issue_type``, which is an
+    ordinary string, and there the fail-closed reading is the one to take.
+    """
+
+    return issue_type.strip().upper() != UNNAMED_ISSUE_TYPE
+
+
 class CaseState(StrEnum):
     CANDIDATE = "CANDIDATE"
     AWAITING_MANDATES = "AWAITING_MANDATES"

@@ -138,13 +138,29 @@ def grouped_answer(
 
 THREE_GROUPS: tuple[GroupSpec, ...] = (
     ("lift-group", IssueType.ELEVATOR_FAILURE, "Recurring lift failures", (1, 4)),
-    ("plumbing-group", IssueType.OTHER, "Water in the basement corridor", (0, 2)),
-    ("garage-group", IssueType.OTHER, "Garage gate will not close", (6, 8)),
+    ("north-lift-group", IssueType.ELEVATOR_FAILURE, "North tower lift out of service", (0, 2)),
+    ("service-lift-group", IssueType.ELEVATOR_FAILURE, "Service lift door faults", (6, 8)),
 )
-"""Three unrelated problems, two of which the closed vocabulary can only call ``OTHER``.
+"""Three separate problems that share one issue type, kept apart only by their group refs.
 
-Grouping by issue type filed the plumbing complaint and the garage gate into one case with one
-title describing one of them. The group reference is what keeps them apart.
+Every member is ``ELEVATOR_FAILURE`` on purpose. Grouping by issue type would collapse all
+three into one case, so an answer that still yields three cases is proving that the group
+reference -- and nothing else -- is what separates them (B-1).
+
+They are not ``OTHER``, also on purpose. Under ADR-012 two reports reach one case only under an
+issue type that names a subject, so an ``OTHER`` group can never have a second member and can
+never become a case. A fixture that produced three cases from ``OTHER`` groups would be
+asserting the defect this suite exists to prevent; :data:`UNPROVABLE_OTHER_GROUP` is the
+fixture for the refusal itself.
+"""
+
+UNPROVABLE_OTHER_GROUP: tuple[GroupSpec, ...] = (
+    ("vague-group", IssueType.OTHER, "General building issue", (0, 2)),
+)
+"""Two unrelated reports the vocabulary can only call ``OTHER``, filed under one vague title.
+
+Exactly the merge ADR-012 refuses: issue type agrees, title agrees, and neither agreement is
+evidence of anything, because the model chose both.
 """
 
 

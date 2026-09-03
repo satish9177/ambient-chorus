@@ -23,7 +23,10 @@ What is checked, and why each check exists:
 * **anchored quotation** -- each source span must reproduce the exact substring at the exact
   offsets of the message it cites;
 * **linkage completeness** -- every proposed report carries a candidate link and every proposed
-  fact belongs to a linked report, so nothing is silently dropped on the way to persistence.
+  fact belongs to a linked report, so nothing is silently dropped on the way to persistence;
+* **provable grouping** -- two reports share a case only under an issue type that names a
+  subject, because that is the only closed signal in the input from which relatedness can be
+  proved rather than believed (ADR-012).
 """
 
 from __future__ import annotations
@@ -50,7 +53,7 @@ from chorus.contracts.monitor import (
     ServiceImpactValue,
     UnitLocationValue,
 )
-from chorus.domain.entities import FactType, SensitivityCategory
+from chorus.domain.entities import FactType, SensitivityCategory, issue_type_names_a_subject
 from chorus.domain.facts import (
     REQUIRED_SENSITIVITY,
     EvidenceDescription,
@@ -118,6 +121,13 @@ class ValidatedCandidateGroup:
     issue type was wrong in a way that only shows up on real input: two unrelated problems
     the vocabulary can only call ``OTHER``, a plumbing complaint and a garage gate, collapsed
     into a single case whose title described one of them and whose reports described both.
+
+    The label separates groups; it does not licence one. A shared label is the model asserting
+    relatedness, and an assertion is not a proof, so a group only ever reaches two members
+    under an issue type that names what went wrong (ADR-012). A group whose issue type is
+    ``OTHER`` may therefore exist here with exactly one member, and one member never reaches a
+    case: :data:`~chorus.application.services.monitor_apply.MIN_REPORTS_FOR_NEW_CANDIDATE` is
+    two.
 
     The label itself is discarded here. It survives only as far as this dataclass, which
     exists so the planner can tell one proposed group from another; durable case identity is
@@ -472,13 +482,22 @@ def _validate_candidate_links(
 ) -> tuple[ValidatedCandidateGroup, ...]:
     """Resolve every link into exactly one group, or refuse the whole answer.
 
-    Two invariants make grouping trustworthy rather than merely plausible. A link naming an
-    existing case must name one that was in this invocation's own input, so a case identifier
-    can never be invented or borrowed from another community. A link naming a new group must
-    agree with every other link in that group about what the group *is* -- same issue type,
-    same proposed title -- because a group whose members disagree describes no single case,
-    and quietly picking one member's answer would file the others under a title that does not
-    describe them.
+    Three invariants make grouping trustworthy rather than merely plausible.
+
+    A link naming an existing case must name one that was in this invocation's own input, so a
+    case identifier can never be invented or borrowed from another community.
+
+    A link naming a new group must agree with every other link in that group about what the
+    group *is* -- same issue type, same proposed title -- because a group whose members
+    disagree describes no single case, and quietly picking one member's answer would file the
+    others under a title that does not describe them.
+
+    And a case may hold two reports only under an issue type that names a subject (ADR-012).
+    Agreement is not relatedness: two links agreeing on ``OTHER`` and on one vague title are
+    two links the model wrote to agree, and nothing in the input contradicts them. The rule is
+    the same whether the second report starts a case or joins one that already exists --
+    the harm is identical, and a rule that governed only creation would be a rule an extending
+    answer could simply wait one batch to escape.
     """
 
     linked_refs: set[str] = set()
@@ -502,6 +521,13 @@ def _validate_candidate_links(
             if summary.issue_type.value != report.issue_type:
                 rejections.add(AgentRejection.UNSUPPORTED_CANDIDATE_TRANSITION)
                 continue
+            if not issue_type_names_a_subject(summary.issue_type.value):
+                # Extending is merging: the case already holds a report, so this makes two.
+                # Under an issue type that names nothing there is no way to prove the two
+                # describe one incident, and the case being offered as a candidate proves
+                # only that one of its messages was in the recent window.
+                rejections.add(AgentRejection.CANDIDATE_GROUP_UNPROVABLE)
+                continue
             existing.setdefault(link.existing_case_id, []).append(link.report_client_ref)
             continue
 
@@ -511,6 +537,8 @@ def _validate_candidate_links(
             continue
         group = fresh.get(group_ref)
         if group is None:
+            # A group of one is not a merge, so a lone ``OTHER`` report is allowed to name a
+            # group here. It simply never reaches a case: the creation guard needs two.
             fresh[group_ref] = _FreshGroup(
                 issue_type=report.issue_type,
                 title=link.proposed_case_title,
@@ -519,6 +547,12 @@ def _validate_candidate_links(
             continue
         if group.issue_type != report.issue_type or group.title != link.proposed_case_title:
             rejections.add(AgentRejection.CANDIDATE_GROUP_INCONSISTENT)
+            continue
+        if not issue_type_names_a_subject(group.issue_type):
+            # This link would make the group a merge. Refusing here, before anything is
+            # derived from it, is what keeps two genuinely different incidents from ever
+            # sharing a candidate case.
+            rejections.add(AgentRejection.CANDIDATE_GROUP_UNPROVABLE)
             continue
         group.report_client_refs.append(link.report_client_ref)
 
