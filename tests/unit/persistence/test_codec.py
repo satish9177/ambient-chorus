@@ -44,6 +44,7 @@ def _cases() -> tuple[Case, ...]:
     case_scope = world.case_scope
     community_scope = world.community_scope
     namespace_scope = world.namespace_scope
+    operation_scope = world.operation_scope
     action_scope = world.action_scope
     idempotency_key = world.idempotency_key()
     record = IdempotencyRecord(
@@ -81,6 +82,34 @@ def _cases() -> tuple[Case, ...]:
             lambda w: codec_core.encode_channel_lock(community_scope, w.channel_lock()),
             codec_core.decode_channel_lock,
             world.channel_lock(),
+        ),
+        (
+            "FEED_SIGNAL_PROJECTION",
+            lambda w: codec_core.encode_feed_signal(community_scope, w.feed_signal()),
+            codec_core.decode_feed_signal,
+            world.feed_signal(),
+        ),
+        (
+            "MONITOR_APPLY_PROGRESS",
+            lambda w: codec_core.encode_monitor_progress(operation_scope, w.monitor_progress()),
+            codec_core.decode_monitor_progress,
+            world.monitor_progress(),
+        ),
+        (
+            "MONITOR_SNAPSHOT_MANIFEST",
+            lambda w: codec_core.encode_monitor_snapshot_manifest(
+                operation_scope, w.monitor_snapshot_manifest()
+            ),
+            codec_core.decode_monitor_snapshot_manifest,
+            world.monitor_snapshot_manifest(),
+        ),
+        (
+            "MONITOR_SNAPSHOT_CHUNK",
+            lambda w: codec_core.encode_monitor_snapshot_chunk(
+                operation_scope, w.monitor_snapshot_chunk()
+            ),
+            codec_core.decode_monitor_snapshot_chunk,
+            world.monitor_snapshot_chunk(),
         ),
         (
             "APPLICATION_OPERATION",

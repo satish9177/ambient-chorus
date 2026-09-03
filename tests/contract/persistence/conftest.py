@@ -11,119 +11,37 @@ proves the integration path actually ran.
 
 from __future__ import annotations
 
-import contextlib
 import os
-import socket
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
-from uuid import uuid4
 
-import boto3
 import pytest
-from botocore.exceptions import BotoCoreError, ClientError
+from tests.fixtures.drivers import (
+    DRIVER_PARAMS,
+    DYNAMODB_LOCAL_AVAILABLE,
+    ENDPOINT,
+    REGION,
+    REQUIRED,
+    SKIP_REASON,
+    admin_client,
+    create_tables,
+    delete_tables,
+    storage_driver,
+    table_names,
+)
 
 from chorus.infrastructure.dynamodb.client import create_dynamodb_client
 from chorus.infrastructure.dynamodb.driver import DynamoDbStorageDriver
 from chorus.infrastructure.local.memory import InMemoryStorageDriver
-from chorus.ports.storage import StorageDriver, TableName
-
-ENDPOINT = os.environ.get("CHORUS_DYNAMODB_LOCAL_ENDPOINT", "http://127.0.0.1:8000")
-REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-REQUIRED = os.environ.get("CHORUS_REQUIRE_DYNAMODB_LOCAL") == "1"
+from chorus.ports.storage import StorageDriver
 
 
-def _endpoint_host_port() -> tuple[str, int]:
-    remainder = ENDPOINT.split("://", 1)[-1]
-    host, _, port = remainder.partition(":")
-    return host or "127.0.0.1", int(port or "8000")
-
-
-def _reachable() -> bool:
-    host, port = _endpoint_host_port()
-    try:
-        with socket.create_connection((host, port), timeout=2):
-            return True
-    except OSError:
-        return False
-
-
-DYNAMODB_LOCAL_AVAILABLE = _reachable()
-
-SKIP_REASON = f"DynamoDB Local is not reachable at {ENDPOINT}; start it with `docker compose up -d`"
-
-
-def _admin_client() -> Any:
-    """Table administration is a test concern, so it never touches the narrow client port."""
-
-    return boto3.client(
-        "dynamodb",
-        region_name=REGION,
-        endpoint_url=ENDPOINT,
-        aws_access_key_id="local",
-        aws_secret_access_key="local",
-    )
-
-
-def _create_tables(client: Any, names: dict[TableName, str]) -> None:
-    for name in names.values():
-        client.create_table(
-            TableName=name,
-            AttributeDefinitions=[
-                {"AttributeName": "PK", "AttributeType": "S"},
-                {"AttributeName": "SK", "AttributeType": "S"},
-            ],
-            KeySchema=[
-                {"AttributeName": "PK", "KeyType": "HASH"},
-                {"AttributeName": "SK", "KeyType": "RANGE"},
-            ],
-            BillingMode="PAY_PER_REQUEST",
-        )
-
-
-def _delete_tables(client: Any, names: dict[TableName, str]) -> None:
-    for name in names.values():
-        with contextlib.suppress(ClientError, BotoCoreError):
-            client.delete_table(TableName=name)
-
-
-@pytest.fixture(
-    params=[
-        pytest.param("memory", id="memory"),
-        pytest.param(
-            "dynamodb-local",
-            id="dynamodb-local",
-            marks=pytest.mark.skipif(
-                not DYNAMODB_LOCAL_AVAILABLE and not REQUIRED, reason=SKIP_REASON
-            ),
-        ),
-    ]
-)
+@pytest.fixture(params=DRIVER_PARAMS)
 def storage(request: pytest.FixtureRequest) -> Iterator[StorageDriver]:
     """Yield one empty storage driver per test, for each adapter under contract."""
 
-    if request.param == "memory":
-        yield InMemoryStorageDriver()
-        return
-    if not DYNAMODB_LOCAL_AVAILABLE:
-        pytest.fail(SKIP_REASON)
-    suffix = uuid4().hex[:12]
-    names = {
-        TableName.CORE: f"chorus-core-test-{suffix}",
-        TableName.SHAREABLE: f"chorus-shareable-test-{suffix}",
-        TableName.AUDIT: f"chorus-audit-test-{suffix}",
-    }
-    admin = _admin_client()
-    _create_tables(admin, names)
-    # The production client factory takes no credentials, so the local endpoint gets the
-    # placeholder credentials DynamoDB Local ignores through the standard environment.
-    os.environ.setdefault("AWS_ACCESS_KEY_ID", "local")
-    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "local")
-    client = create_dynamodb_client(region_name=REGION, endpoint_url=ENDPOINT)
-    try:
-        yield DynamoDbStorageDriver(client=client, table_names=names)
-    finally:
-        _delete_tables(admin, names)
+    yield from storage_driver(str(request.param), prefix="test")
 
 
 @pytest.fixture
@@ -159,14 +77,9 @@ def wire() -> Iterator[WireHarness]:
         if REQUIRED:
             pytest.fail(SKIP_REASON)
         pytest.skip(SKIP_REASON)
-    suffix = uuid4().hex[:12]
-    names = {
-        TableName.CORE: f"chorus-core-wire-{suffix}",
-        TableName.SHAREABLE: f"chorus-shareable-wire-{suffix}",
-        TableName.AUDIT: f"chorus-audit-wire-{suffix}",
-    }
-    admin = _admin_client()
-    _create_tables(admin, names)
+    names = table_names("wire")
+    admin = admin_client()
+    create_tables(admin, names)
     os.environ.setdefault("AWS_ACCESS_KEY_ID", "local")
     os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "local")
     # The narrow ``DynamoDbClient`` protocol deliberately exposes only the six approved calls,
@@ -188,4 +101,4 @@ def wire() -> Iterator[WireHarness]:
             attempts=attempts,
         )
     finally:
-        _delete_tables(admin, names)
+        delete_tables(admin, names)

@@ -16,9 +16,26 @@ Every mutating route requires `Idempotency-Key` (8–128 printable ASCII) except
 
 ## Asynchronous operation pattern
 
-Agent and send commands must not depend on API Gateway's request timeout. The API conditionally creates an `ApplicationOperation`, invokes a dedicated application-worker Lambda asynchronously, and returns 202. Lambda async delivery may repeat; the operation/input hash and underlying command idempotency make repeats safe. A same-key retry dispatches a pending, undispatched operation but never duplicates a completed one.
+Agent and send commands must not depend on API Gateway's request timeout. The API creates an `ApplicationOperation` **and completes its command-idempotency record in one transaction**, invokes a dedicated application-worker Lambda asynchronously, and returns 202. A lost transaction response is resolved by reading the record's own commit proof before any retry.
 
-`ApplicationOperation` fields: `operation_id`, `kind`, `namespace`, `actor_id_hash`, `case_id?`, `request_hash`, `status: PENDING|RUNNING|SUCCEEDED|FAILED`, `result_refs[]`, `error_code?`, `created_at`, `started_at?`, `completed_at?`, `version`, `expires_at_epoch`. It contains no raw input. The immutable command payload is stored in the appropriate private/safe item referenced by ID. Operation TTL is seven days in demo.
+For a route that **mutates before it can create the operation** — `POST /v1/ingest/messages` persists the messages the operation is about, and the operation binds their identifiers — the key is claimed in two phases, and the first phase happens before the first mutation:
+
+1. normalize the request and compute its route request hash;
+2. **reserve** the command key: a create-only `IN_PROGRESS` record binding that hash;
+3. a record with a *different* hash → `IDEMPOTENCY_CONFLICT` (409) with **zero** mutations;
+4. ingest the messages replay-safely;
+5. create the `ApplicationOperation` — carrying its Monitor handover identity — and complete the reservation, in one transaction with a commit proof;
+6. dispatch.
+
+The reservation is `IN_PROGRESS` rather than `COMPLETED` so a crash between steps 2 and 5 stays finishable. An `IN_PROGRESS` record under the same key **and the same hash** is this request's own unfinished attempt and is *resumed*, never refused: step 4 is replay-safe by construction, and step 5 is a single transaction, so a key can never name two operations. Refusing an `IN_PROGRESS` record would strand a caller's own identical retry for having once been interrupted.
+
+Because the reservation record already exists before step 5 runs, its mere presence cannot prove that step 5 committed. The commit proof for that transaction therefore names the **version** the completing write moves the record to, and resolution reads that version: still at the reservation's version means the transaction definitely did not commit, and exactly one retry is safe. The answer returned to the caller is then read back from the record, so the durable key-to-operation binding — not a local assumption — decides which operation a racing caller is told about.
+
+Lambda async delivery may repeat; the operation/input hash and underlying command idempotency make repeats safe. A same-key retry that finds a **`PENDING`** operation dispatches the same job identity again, because dispatch itself can fail after the record was written and an undispatched operation would otherwise be stranded forever. Duplicate dispatch is explicitly acceptable: the worker's conditional `PENDING→RUNNING` claim is the duplicate-execution boundary, so however many deliveries arrive, exactly one of them invokes the model. A retry never mints a new `operation_id` or a new `invocation_id`, and a completed operation is never dispatched again.
+
+`ApplicationOperation` fields: `operation_id`, `kind`, `namespace`, `actor_id_hash`, `case_id?`, `request_hash`, `status: PENDING|RUNNING|SUCCEEDED|FAILED`, `result_refs[]`, `error_code?`, `monitor_invocation_id?`, `monitor_locator_hash?`, `created_at`, `started_at?`, `completed_at?`, `version`, `expires_at_epoch`. It contains no raw input. The immutable command payload is stored in the appropriate private/safe item referenced by ID. Operation TTL is seven days in demo.
+
+`monitor_invocation_id` and `monitor_locator_hash` are the Monitor handover identity described in [04](04-domain-state-and-events.md#the-monitor-handover-identity): required for `kind = MONITOR` before dispatch, `null` otherwise, immutable for the operation's lifetime, and identifiers and digests only. They are **not** part of the public operation status response — a poller is told status and result references, not what the worker binds against.
 
 ```json
 {
@@ -96,7 +113,7 @@ One to 25 messages, each text <=10,000 characters. Response 202 includes per-mes
 
 ### Operation
 
-`GET /v1/operations/{id}` returns the operation fields plus a typed safe `result` only when succeeded. Private agent output is not returned here; result links point to the appropriate authorized case endpoint. `Retry-After: 1` is returned for pending/running.
+A `MONITOR` operation may also move `RUNNING→PENDING` when a frozen validated plan was interrupted mid-apply; a client polling it sees `PENDING` again with `Retry-After: 1`, and the resumed worker makes no further model call. `GET /v1/operations/{id}` returns the operation fields plus a typed safe `result` only when succeeded. Private agent output is not returned here; result links point to the appropriate authorized case endpoint. `Retry-After: 1` is returned for pending/running.
 
 ### Case surfaces
 
@@ -182,11 +199,33 @@ Errors follow RFC 9457 Problem Details plus stable fields:
   "status": 409,
   "code": "STALE_AUTHORIZATION",
   "detail": "Recompile and request a new approval.",
-  "instance": "/v1/cases/.../actions/.../executions",
+  "instance": "/v1/cases/{case_id}/actions/{action_id}/executions",
   "correlation_id": "uuid",
   "retryable": false,
   "errors": []
 }
 ```
 
+`instance` is the web framework's **resolved static route template**, never the raw request URL. A URL path is caller-controlled: an unmatched segment, an operation identifier, or a case identifier written into it would be echoed straight back out of the error handler, and a caller who can choose the path can choose what a 404 body says. When no route matched — an unknown URL, or a path parameter that failed to parse — the field is **omitted entirely** rather than filled in with something the caller wrote. Query values, header values, and exception `detail` strings are never read into it either.
+
 Details are safe, do not echo input, and do not distinguish a foreign ID from an absent ID to unauthorized callers. Error/status mapping is normative in [09-observability-errors-and-failures.md](09-observability-errors-and-failures.md).
+
+### Request validation errors
+
+The web framework's default validation response is **not** used. A framework validation report quotes the rejected input, so for a body containing private community text it would turn a 422 into a disclosure channel. CHORUS installs its own handler for request-validation and malformed-body failures and answers with the same Problem Details shape.
+
+A validation problem may carry only bounded, safe items in `errors`, each of the form `{"code": <safe enum>, "path": <dotted field path>, "category": <safe category>}`. The rejected value itself is never serialized — no `input`, no request body, no message text, no attachment content, no Pydantic representation, and no exception representation. Field paths are built from an **explicit allowlist of declared transport-schema field names** plus bounded array indices. A path segment is never copied out of the validation report because it *looks* safe: the offending key of an unexpected-field error is caller-supplied, and an attacker who names a field `PRIVATE_HEALTH_DETAIL` or `motherLeelaAsthma4B` would have that name echoed back by any syntax- or regex-based test. A segment that is not a known field name is rendered as `?`, at every depth, including nested message and attachment objects. The list of items is capped and the whole response stays bounded regardless of how large the rejected request was. Malformed JSON, `NaN`, `Infinity`, `-Infinity`, an unknown field, and an oversized array all resolve to the same bounded safe response rather than a 500.
+
+The transport-level `401`/`403` responses use the same Problem Details shape and carry no caller-supplied text. An exception that maps to nothing known returns `INTERNAL_ERROR` and the correlation ID, and nothing else.
+
+### Operation idempotency
+
+`POST /v1/ingest/messages` treats its `messages` array as a **batch**, and Monitor processing canonicalizes and sorts it, so operation identity is insensitive to HTTP array order: normalized messages are sorted by `(adapter, channel_message_id)` and each message's attachment descriptors by `evidence_id` before the request hash is computed. `[A,B]` and `[B,A]` are therefore the same command under one key; genuinely different message or attachment content is still a conflict.
+
+`Idempotency-Key` binds the *operation*, not merely the rows a command wrote. Repeating `POST /v1/ingest/messages` with the same namespace, actor, command type, key, and request hash returns the same `ApplicationOperation` — the same `operation_id` and the same `invocation_id` — and mints no new agent execution. The request hash is computed from the authoritative normalized HTTP command content, never from generated identifiers or result ordering, so a replay hashes identically. The same key with a different request hash is `IDEMPOTENCY_CONFLICT` (409). A completed operation replays its recorded result and calls no model.
+
+The ownership boundary sits **above** per-message ingestion, and the ordering is part of the contract, not an implementation detail:
+
+> If `POST /v1/ingest/messages` returns `IDEMPOTENCY_CONFLICT` because the key belongs to another request, **no state derived from the conflicting request exists** — no `CommunityMessage`, no `EvidenceRoot`, no channel uniqueness lock, no feed signal, no operation, and no dispatch.
+
+Per-message idempotency records still exist underneath, and they are what make the conflicting request's *identical* retry cheap; they are not what decides whether the route accepted it.

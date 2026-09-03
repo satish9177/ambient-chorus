@@ -96,6 +96,7 @@ from chorus.domain.mandates import (
     FactGrant,
     IdentityGrant,
 )
+from chorus.domain.time import epoch_seconds_ceiling
 from chorus.infrastructure.dynamodb.audit import AuditRepository
 from chorus.infrastructure.dynamodb.core import CoreRepository
 from chorus.infrastructure.dynamodb.cursor import SignedCursorCodec
@@ -109,6 +110,7 @@ from chorus.ports.idempotency import (
     IdempotencyPartitionKind,
     IdempotentCommand,
 )
+from chorus.ports.limits import ORDINARY_IDEMPOTENCY_TTL_SECONDS
 from chorus.ports.records import (
     ActionHistoryLocator,
     AgentInvocationOutcome,
@@ -118,6 +120,11 @@ from chorus.ports.records import (
     CurrentActionPointer,
     CurrentViewPointer,
     FactMandateAssociation,
+    FeedSignalProjection,
+    MonitorApplyProgress,
+    MonitorSnapshotChunk,
+    MonitorSnapshotKind,
+    MonitorSnapshotManifest,
     SendFence,
     StoredCurrentMandatePointer,
     StoredMandateVersionRef,
@@ -129,7 +136,13 @@ from chorus.ports.records import (
     ViewHistoryLocator,
 )
 from chorus.ports.retention import AuditRetention
-from chorus.ports.scopes import ActionScope, CaseScope, CommunityScope, NamespaceScope
+from chorus.ports.scopes import (
+    ActionScope,
+    CaseScope,
+    CommunityScope,
+    NamespaceScope,
+    OperationScope,
+)
 from chorus.ports.storage import (
     ItemKey,
     KeyAbsent,
@@ -256,6 +269,10 @@ class World:
     # -- scopes ----------------------------------------------------------------------
 
     @property
+    def operation_scope(self) -> OperationScope:
+        return OperationScope(namespace=self.namespace, operation_id=self.operation_id)
+
+    @property
     def namespace_scope(self) -> NamespaceScope:
         return NamespaceScope(namespace=self.namespace)
 
@@ -341,6 +358,100 @@ class World:
             created_at=NOW - timedelta(hours=2),
         )
 
+    def feed_signal(self, *, index: int = 0) -> FeedSignalProjection:
+        message = self.message(index=index)
+        return FeedSignalProjection(
+            namespace=self.namespace,
+            community_id=self.community_id,
+            message_id=message.message_id,
+            case_id=self.case_id,
+            case_version=2,
+            label="Recurring elevator failures",
+            related_message_count=6,
+            case_state=CaseState.CANDIDATE,
+            detected_at=NOW - timedelta(hours=1),
+            version=1,
+        )
+
+    def monitor_progress(
+        self, *, completed_steps: int = 1, version: int = 1
+    ) -> MonitorApplyProgress:
+        return MonitorApplyProgress(
+            invocation_id=self.uuid("progress-invocation"),
+            operation_id=self.operation_id,
+            namespace=self.namespace,
+            community_id=self.community_id,
+            input_hash=digest(f"progress-input:{self.seed}"),
+            output_hash=digest(f"progress-output:{self.seed}"),
+            plan_hash=digest(f"progress-plan:{self.seed}"),
+            completed_steps=completed_steps,
+            total_steps=3,
+            version=version,
+            created_at=NOW - timedelta(minutes=4),
+            updated_at=NOW - timedelta(minutes=3),
+        )
+
+    def monitor_snapshot_manifest(
+        self, kind: MonitorSnapshotKind = MonitorSnapshotKind.MONITOR_PLAN
+    ) -> MonitorSnapshotManifest:
+        """The header of one immutable frozen-stage snapshot under an operation."""
+
+        is_plan = kind is MonitorSnapshotKind.MONITOR_PLAN
+        return MonitorSnapshotManifest(
+            invocation_id=self.uuid("snapshot-invocation"),
+            operation_id=self.operation_id,
+            namespace=self.namespace,
+            community_id=self.community_id,
+            kind=kind,
+            content_sha256=digest(f"snapshot-content:{self.seed}"),
+            byte_length=2_048,
+            chunk_count=1,
+            input_hash=digest(f"snapshot-input:{self.seed}"),
+            output_hash=digest(f"snapshot-output:{self.seed}") if is_plan else None,
+            plan_hash=digest(f"snapshot-plan:{self.seed}") if is_plan else None,
+            model_profile_hash=digest(f"snapshot-model:{self.seed}") if is_plan else None,
+            provenance_hash=digest(f"snapshot-provenance:{self.seed}") if is_plan else None,
+            prompt_version="monitor/v1",
+            created_at=NOW - timedelta(minutes=5),
+            expires_at_epoch=epoch_seconds_ceiling(NOW) + ORDINARY_IDEMPOTENCY_TTL_SECONDS,
+        )
+
+    def monitor_snapshot_chunk(
+        self, kind: MonitorSnapshotKind = MonitorSnapshotKind.MONITOR_PLAN
+    ) -> MonitorSnapshotChunk:
+        """One ordered slice of a snapshot's canonical bytes."""
+
+        return MonitorSnapshotChunk(
+            invocation_id=self.uuid("snapshot-invocation"),
+            operation_id=self.operation_id,
+            namespace=self.namespace,
+            community_id=self.community_id,
+            kind=kind,
+            index=0,
+            content=SensitiveStr('{"schema":"monitor-validated-plan/v1"}'),
+            expires_at_epoch=epoch_seconds_ceiling(NOW) + ORDINARY_IDEMPOTENCY_TTL_SECONDS,
+        )
+
+    def unlinked_agent_invocation(self) -> AgentInvocationResult:
+        """A Monitor run that produced no case, recorded under its operation instead."""
+
+        return AgentInvocationResult(
+            invocation_id=self.uuid("unlinked-invocation"),
+            namespace=self.namespace,
+            community_id=self.community_id,
+            case_id=None,
+            operation_id=self.operation_id,
+            agent_name=AgentName.MONITOR,
+            prompt_version="monitor/v1",
+            input_hash=digest(f"unlinked-input:{self.seed}"),
+            output_hash=None,
+            model_profile_hash=digest(f"profile:{self.seed}"),
+            outcome=AgentInvocationOutcome.FAILED,
+            failure_code="AGENT_CONTRACT_VIOLATION",
+            result_refs=(),
+            created_at=NOW - timedelta(hours=5),
+        )
+
     def operation(self, *, version: int = 1) -> ApplicationOperation:
         return ApplicationOperation(
             operation_id=self.operation_id,
@@ -356,6 +467,8 @@ class World:
             version=version,
             created_at=NOW - timedelta(minutes=10),
             updated_at=NOW - timedelta(minutes=10) + timedelta(minutes=version),
+            monitor_invocation_id=self.uuid("monitor-invocation"),
+            monitor_locator_hash=digest(f"monitor-locators:{self.seed}"),
         )
 
     def evidence_root(self) -> EvidenceRoot:

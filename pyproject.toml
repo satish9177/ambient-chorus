@@ -14,6 +14,7 @@ dependencies = [
   "anyio>=4.11,<5",
   "boto3>=1.40,<2",
   "botocore>=1.40,<2",
+  "fastapi>=0.121,<1",
   "pydantic>=2.12,<3",
   "pydantic-settings>=2.10,<3",
   "rfc8785>=0.1.4,<0.2",
@@ -27,9 +28,16 @@ dev = [
   "ruff>=0.14,<1",
 ]
 test = [
+  "httpx>=0.28,<0.29",
   "hypothesis>=6.140,<7",
   "pytest>=8.4,<9",
   "pytest-cov>=7,<8",
+]
+agents = [
+  # Only the Monitor/Investigator/Action runtime artifacts import Strands. It is a separate
+  # group so an application or Lambda artifact never ships the agent SDK, and so
+  # import-linter keeps proving that no `chorus` package imports it.
+  "strands-agents>=1.10,<2",
 ]
 infra = [
   "aws-cdk-lib>=2.220,<3",
@@ -37,17 +45,24 @@ infra = [
 ]
 
 [tool.uv]
-default-groups = ["dev", "test", "infra"]
+default-groups = ["agents", "dev", "test", "infra"]
 cache-dir = ".tools/uv-cache"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/chorus"]
+# The editable development install carries the API and the agent runtimes as well as the
+# library, so import-linter and mypy can see every package the boundary contracts name.
+# Deployment artifacts are built separately from an explicit per-runtime file allowlist, so
+# nothing here decides what ships to an agent runtime or a Lambda.
+packages = ["src/chorus", "apps/api/chorus_api", "runtimes"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers --showlocals"
 cache_dir = "build/pytest-cache"
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "apps/api"]
+markers = [
+  "live_agent: gated evaluation that invokes a real Bedrock/AgentCore Monitor runtime",
+]
 xfail_strict = true
 
 [tool.ruff]
@@ -65,16 +80,16 @@ ignore = ["S101"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-mypy_path = ["src"]
+mypy_path = ["src", "apps/api"]
 plugins = ["pydantic.mypy"]
 exclude = ["^cdk.out/", "^node_modules/"]
 
 [[tool.mypy.overrides]]
-module = ["rfc8785", "boto3", "botocore.*"]
+module = ["rfc8785", "boto3", "botocore.*", "strands", "strands.*"]
 ignore_missing_imports = true
 
 [tool.importlinter]
-root_packages = ["chorus"]
+root_packages = ["chorus", "chorus_api", "runtimes"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
@@ -95,9 +110,14 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "Ports expose protocols without SDK or framework dependencies"
+name = "Ports declare no framework or SDK type of their own"
 type = "forbidden"
 source_modules = ["chorus.ports"]
+# Direct imports only. A port may name a `chorus.contracts` boundary DTO -- the frozen
+# dependency table allows exactly that -- and those DTOs are Pydantic models, so an indirect
+# Pydantic edge is expected. What must never happen is a port module declaring its own
+# Pydantic model or reaching for an SDK, which is what a direct import would mean.
+allow_indirect_imports = true
 forbidden_modules = [
   "pydantic",
   "pydantic_settings",
@@ -106,8 +126,94 @@ forbidden_modules = [
   "botocore",
   "strands",
   "aws_cdk",
+]
+
+[[tool.importlinter.contracts]]
+name = "Ports never depend on the privacy compiler or infrastructure"
+type = "forbidden"
+source_modules = ["chorus.ports"]
+forbidden_modules = [
   "chorus.privacy",
   "chorus.infrastructure",
+  "chorus.application",
+  "chorus_api",
+]
+
+[[tool.importlinter.contracts]]
+name = "Agent contracts are boundary DTOs without persistence or application code"
+type = "forbidden"
+source_modules = ["chorus.contracts"]
+forbidden_modules = [
+  "fastapi",
+  "boto3",
+  "botocore",
+  "strands",
+  "aws_cdk",
+  "chorus.ports",
+  "chorus.privacy",
+  "chorus.application",
+  "chorus.infrastructure",
+  "chorus_api",
+]
+
+[[tool.importlinter.contracts]]
+name = "Application coordinates ports without SDKs or a web framework"
+type = "forbidden"
+source_modules = ["chorus.application"]
+allow_indirect_imports = true
+forbidden_modules = [
+  "fastapi",
+  "boto3",
+  "botocore",
+  "strands",
+  "aws_cdk",
+  "chorus.infrastructure",
+  "chorus_api",
+]
+
+[[tool.importlinter.contracts]]
+name = "API routes hold no persistence, policy, or agent SDK code"
+type = "forbidden"
+source_modules = ["chorus_api"]
+allow_indirect_imports = true
+forbidden_modules = [
+  "boto3",
+  "botocore",
+  "strands",
+  "aws_cdk",
+  "chorus.privacy",
+]
+
+[[tool.importlinter.contracts]]
+name = "The Monitor runtime imports only its own public contract"
+type = "forbidden"
+source_modules = ["runtimes.monitor"]
+# `chorus.domain` is deliberately absent. The Monitor contract reuses the frozen domain enums
+# -- fact types, sensitivity categories, failure modes -- and that module imports nothing but
+# the standard library, so reaching them through the contract adds no capability. The Action
+# runtime, whose isolation is the strict case, forbids `domain` outright when it is built.
+#
+# One exception is granted, and only one: `botocore.config`. The runtime must pin its Bedrock
+# client to a single attempt, or the SDK retries a throttle six times underneath the single
+# retry the application believes it owns. Strands accepts that setting only as a
+# `botocore.config.Config`, which constructs no client, holds no credential, and reaches no
+# service. A unit test asserts that no other `boto3` or `botocore` module appears in the
+# runtime source.
+# The lazy, function-level import is not always visible in the import graph, so the ignore is
+# declared without alerting: it must not become a CI failure either way, and the unit test is
+# the gate that actually holds.
+ignore_imports = ["runtimes.monitor.agent -> botocore"]
+unmatched_ignore_imports_alerting = "none"
+forbidden_modules = [
+  "boto3",
+  "botocore",
+  "fastapi",
+  "aws_cdk",
+  "chorus.privacy",
+  "chorus.ports",
+  "chorus.application",
+  "chorus.infrastructure",
+  "chorus_api",
 ]
 
 [[tool.importlinter.contracts]]
@@ -119,6 +225,8 @@ forbidden_modules = [
   "strands",
   "aws_cdk",
   "chorus.privacy",
+  "chorus.application",
+  "chorus_api",
 ]
 
 [[tool.importlinter.contracts]]

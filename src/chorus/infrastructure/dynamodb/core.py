@@ -23,6 +23,7 @@ from chorus.domain.entities import (
     EvidenceRoot,
     InvestigationAssessment,
 )
+from chorus.domain.errors import IntegrityError
 from chorus.domain.facts import Fact, Report
 from chorus.domain.ids import (
     CommunityId,
@@ -31,6 +32,7 @@ from chorus.domain.ids import (
     ExecutionId,
     FactId,
     MandateId,
+    MessageId,
     OperationId,
     ReportId,
     Sha256Digest,
@@ -58,18 +60,23 @@ from chorus.ports.errors import (
     NotFoundError,
     PersistenceConflictError,
 )
-from chorus.ports.limits import BATCH_GET_MAX_KEYS, MAX_ACTIVE_FACTS_PER_CASE
+from chorus.ports.limits import BATCH_GET_MAX_KEYS, MAX_ACTIVE_FACTS_PER_CASE, MAX_PAGE_SIZE
 from chorus.ports.pagination import Page, PageCursor, PageRequest, QueryBinding
 from chorus.ports.records import (
     AgentInvocationResult,
     ChannelUniquenessLock,
     FactMandateAssociation,
+    FeedSignalProjection,
     MandatePointerExpectation,
     MessageFeedEntry,
+    MonitorApplyProgress,
+    MonitorSnapshotChunk,
+    MonitorSnapshotKind,
+    MonitorSnapshotManifest,
     SendFence,
     StoredCurrentMandatePointer,
 )
-from chorus.ports.scopes import CaseScope, CommunityScope, NamespaceScope
+from chorus.ports.scopes import CaseScope, CommunityScope, NamespaceScope, OperationScope
 from chorus.ports.storage import (
     AllOf,
     AnyOf,
@@ -456,6 +463,234 @@ class CoreRepository:
         require_same(result.case_id, scope.case_id, "AGENT_INVOCATION_RESULT")
         return result
 
+    async def _signals_by_message_id(
+        self,
+        scope: CommunityScope,
+        message_ids: tuple[MessageId, ...],
+        *,
+        consistent: bool,
+    ) -> dict[MessageId, FeedSignalProjection]:
+        """Fetch exactly the signals for these messages, by direct key.
+
+        Paginating the ``MESSAGE_SIGNAL#`` prefix and hoping the page overlaps the feed page
+        was the earlier approach, and it was wrong twice over: signal sort keys are ordered by
+        message UUID rather than by time, so the first hundred signals bear no relation to the
+        current page of messages, and the discarded second cursor silently truncated the join
+        for any community with more than a page of signals. A feed page already carries at
+        most a hundred message IDs, so the exact keys are known and a bounded ``BatchGetItem``
+        answers precisely.
+        """
+
+        unique = tuple(dict.fromkeys(message_ids))
+        if not unique:
+            return {}
+        if len(unique) > BATCH_GET_MAX_KEYS:
+            raise ModelLimitExceededError("FEED_SIGNAL_BATCH")
+        keys_by_sort = {
+            codec_core.feed_signal_key(scope, message_id).sort_key: message_id
+            for message_id in unique
+        }
+        items = await self.driver.batch_get_items(
+            tuple(codec_core.feed_signal_key(scope, message_id) for message_id in unique),
+            consistent=consistent,
+        )
+        found: dict[MessageId, FeedSignalProjection] = {}
+        for item in items:
+            decoded, signal = codec_core.decode_feed_signal(item)
+            key = codec_core.feed_signal_key(scope, signal.message_id)
+            validate_scope(
+                decoded,
+                key=key,
+                entity_ref="FEED_SIGNAL_PROJECTION",
+                namespace=scope.namespace,
+                community_id=scope.community_id,
+                case_id=None,
+            )
+            require_same(signal.community_id, scope.community_id, "FEED_SIGNAL_PROJECTION")
+            if key.sort_key not in keys_by_sort:
+                raise CrossCaseViolationError("FEED_SIGNAL_PROJECTION")
+            found[signal.message_id] = signal
+        return found
+
+    async def load_feed_signals(
+        self, scope: CommunityScope, message_ids: tuple[MessageId, ...]
+    ) -> dict[MessageId, FeedSignalProjection]:
+        """Strongly read the signals for exactly these messages.
+
+        Strong because the Monitor apply gates read it: whether a message is already linked to
+        another case decides whether a whole answer is refused, and an authorization-shaped
+        decision never rests on an eventually consistent read.
+        """
+
+        return await self._signals_by_message_id(scope, message_ids, consistent=True)
+
+    async def read_feed_signals_for_messages(
+        self, scope: CommunityScope, message_ids: tuple[MessageId, ...]
+    ) -> dict[MessageId, FeedSignalProjection]:
+        """Eventually read the signals for exactly these messages, for display only."""
+
+        return await self._signals_by_message_id(scope, message_ids, consistent=False)
+
+    async def load_monitor_progress(
+        self, scope: OperationScope, invocation_id: UUID
+    ) -> MonitorApplyProgress | None:
+        key = codec_core.monitor_progress_key(scope, invocation_id)
+        loaded = await self._get(key, codec_core.decode_monitor_progress, consistent=True)
+        if loaded is None:
+            return None
+        decoded, progress = loaded
+        validate_scope(
+            decoded,
+            key=key,
+            entity_ref="MONITOR_APPLY_PROGRESS",
+            namespace=scope.namespace,
+            community_id=None,
+            case_id=None,
+        )
+        require_same(progress.invocation_id, invocation_id, "MONITOR_APPLY_PROGRESS")
+        require_same(progress.operation_id, scope.operation_id, "MONITOR_APPLY_PROGRESS")
+        return progress
+
+    async def load_monitor_snapshot_manifest(
+        self, scope: OperationScope, *, kind: MonitorSnapshotKind, invocation_id: UUID
+    ) -> MonitorSnapshotManifest | None:
+        key = codec_core.monitor_snapshot_manifest_key(scope, kind, invocation_id)
+        loaded = await self._get(key, codec_core.decode_monitor_snapshot_manifest, consistent=True)
+        if loaded is None:
+            return None
+        decoded, manifest = loaded
+        validate_scope(
+            decoded,
+            key=key,
+            entity_ref="MONITOR_SNAPSHOT_MANIFEST",
+            namespace=scope.namespace,
+            community_id=None,
+            case_id=None,
+        )
+        require_same(manifest.invocation_id, invocation_id, "MONITOR_SNAPSHOT_MANIFEST")
+        require_same(manifest.operation_id, scope.operation_id, "MONITOR_SNAPSHOT_MANIFEST")
+        require_same(manifest.kind, kind, "MONITOR_SNAPSHOT_MANIFEST")
+        return manifest
+
+    async def load_monitor_snapshot_chunks(
+        self, scope: OperationScope, manifest: MonitorSnapshotManifest
+    ) -> tuple[MonitorSnapshotChunk, ...]:
+        """Batch-get exactly the chunks the manifest names, in the order it names them.
+
+        Addressed by direct key rather than by walking the chunk prefix, so a partially
+        written or over-written snapshot cannot present itself as a complete one: the
+        manifest states the count, and a chunk it names that is not there is an integrity
+        failure rather than a shorter payload.
+        """
+
+        keys = tuple(
+            codec_core.monitor_snapshot_chunk_key(
+                scope, manifest.kind, manifest.invocation_id, index
+            )
+            for index in range(manifest.chunk_count)
+        )
+        items = await self.driver.batch_get_items(keys, consistent=True)
+        by_index: dict[int, MonitorSnapshotChunk] = {}
+        addressed = {key.sort_key for key in keys}
+        for item in items:
+            decoded, chunk = codec_core.decode_monitor_snapshot_chunk(item)
+            validate_scope(
+                decoded,
+                key=codec_core.monitor_snapshot_chunk_key(
+                    scope, chunk.kind, chunk.invocation_id, chunk.index
+                ),
+                entity_ref="MONITOR_SNAPSHOT_CHUNK",
+                namespace=scope.namespace,
+                community_id=None,
+                case_id=None,
+            )
+            require_same(chunk.invocation_id, manifest.invocation_id, "MONITOR_SNAPSHOT_CHUNK")
+            require_same(chunk.operation_id, scope.operation_id, "MONITOR_SNAPSHOT_CHUNK")
+            require_same(chunk.community_id, manifest.community_id, "MONITOR_SNAPSHOT_CHUNK")
+            require_same(chunk.kind, manifest.kind, "MONITOR_SNAPSHOT_CHUNK")
+            if decoded.sort_key not in addressed or chunk.index in by_index:
+                raise CrossCaseViolationError("MONITOR_SNAPSHOT_CHUNK")
+            by_index[chunk.index] = chunk
+        if len(by_index) != manifest.chunk_count:
+            raise IntegrityError("MONITOR_SNAPSHOT_CHUNK:missing")
+        return tuple(by_index[index] for index in range(manifest.chunk_count))
+
+    def stage_create_monitor_snapshot_manifest(
+        self, scope: OperationScope, manifest: MonitorSnapshotManifest
+    ) -> PutItem:
+        return create_operation(
+            codec_core.monitor_snapshot_manifest_key(scope, manifest.kind, manifest.invocation_id),
+            codec_core.encode_monitor_snapshot_manifest(scope, manifest),
+        )
+
+    def stage_create_monitor_snapshot_chunk(
+        self, scope: OperationScope, chunk: MonitorSnapshotChunk
+    ) -> PutItem:
+        return create_operation(
+            codec_core.monitor_snapshot_chunk_key(
+                scope, chunk.kind, chunk.invocation_id, chunk.index
+            ),
+            codec_core.encode_monitor_snapshot_chunk(scope, chunk),
+        )
+
+    async def load_operation_agent_invocation(
+        self, scope: OperationScope, invocation_id: UUID
+    ) -> AgentInvocationResult | None:
+        key = codec_fence.operation_agent_invocation_key(scope, invocation_id)
+        loaded = await self._get(
+            key, codec_fence.decode_operation_agent_invocation, consistent=True
+        )
+        if loaded is None:
+            return None
+        decoded, result = loaded
+        validate_scope(
+            decoded,
+            key=key,
+            entity_ref="AGENT_INVOCATION_RESULT",
+            namespace=scope.namespace,
+            community_id=None,
+            case_id=None,
+        )
+        require_same(result.invocation_id, invocation_id, "AGENT_INVOCATION_RESULT")
+        require_same(result.operation_id, scope.operation_id, "AGENT_INVOCATION_RESULT")
+        return result
+
+    async def load_operation_invocation_ids(self, scope: OperationScope) -> tuple[UUID, ...]:
+        """Strongly read which agent invocations this operation partition already records.
+
+        One bounded query on the partition the caller already holds the key for -- not a scan,
+        not an index, and not a walk of anything unbounded. Both the invocation result and the
+        apply-progress row live under the ``AGENT_`` prefix and both name their invocation, so
+        a single range condition covers everything that can answer "which invocation owns this
+        operation".
+
+        It exists for the worker's job binding: a job naming a different invocation than the
+        one this operation's own durable records already name is a misrouted delivery, and the
+        worker has to be able to tell before it claims anything.
+        """
+
+        result = await self.driver.query(
+            QueryRequest(
+                table=TableName.CORE,
+                partition_key=keys.operation_partition(scope.namespace, scope.operation_id),
+                sort_key=SortKeyBeginsWith(keys.OPERATION_INVOCATION_SORT_KEY_PREFIX),
+                consistent=True,
+                limit=MAX_PAGE_SIZE,
+            )
+        )
+        found: list[UUID] = []
+        for item in result.items:
+            raw = item.get("invocation_id")
+            if not isinstance(raw, str):
+                raise IntegrityError("APPLICATION_OPERATION:invocation")
+            try:
+                invocation_id = UUID(raw)
+            except ValueError as error:
+                raise IntegrityError("APPLICATION_OPERATION:invocation") from error
+            if invocation_id not in found:
+                found.append(invocation_id)
+        return tuple(found)
+
     async def load_send_fence(self, scope: CaseScope) -> SendFence | None:
         key = codec_fence.send_fence_key(scope)
         loaded = await self._get(key, codec_fence.decode_send_fence, consistent=True)
@@ -557,6 +792,77 @@ class CoreRepository:
                 scope, sent_at=message.sent_at, message_id=message.message_id
             ),
             entity_ref="COMMUNITY_MESSAGE",
+        )
+
+    async def read_recent_messages(
+        self, scope: CommunityScope, *, before: datetime, limit: int
+    ) -> tuple[CommunityMessage, ...]:
+        """Read the newest messages at or before an instant, newest first.
+
+        Deliberately not a paginated surface: this is how a bounded Monitor context window is
+        assembled, and a context window is a fixed-size look-back rather than something a
+        caller walks. It is the same time-ordered partition query the feed uses, run in
+        descending order so a limit takes the *most recent* prior messages rather than the
+        oldest ones inside the window -- which is what an ascending limit would have given.
+        """
+
+        if not 1 <= limit <= MAX_PAGE_SIZE:
+            raise ValueError("recent message limit must be between 1 and the frozen maximum")
+        result = await self.driver.query(
+            QueryRequest(
+                table=TableName.CORE,
+                partition_key=keys.community_partition(scope.namespace, scope.community_id),
+                sort_key=SortKeyBetween(
+                    low=keys.MESSAGE_SORT_KEY_PREFIX,
+                    high=keys.message_sort_key_upper_bound(before),
+                ),
+                consistent=False,
+                limit=limit,
+                ascending=False,
+            )
+        )
+        messages: list[CommunityMessage] = []
+        for item in result.items:
+            decoded, message = codec_core.decode_message(item)
+            validate_page_scope(
+                decoded,
+                EntityIdentity(namespace=message.namespace, community_id=message.community_id),
+                expected_key=codec_core.message_key(
+                    scope, sent_at=message.sent_at, message_id=message.message_id
+                ),
+                entity_ref="COMMUNITY_MESSAGE",
+                namespace=scope.namespace,
+                community_id=scope.community_id,
+                case_id=UNCHECKED,
+            )
+            messages.append(message)
+        return tuple(messages)
+
+    async def read_feed_signals(
+        self, scope: CommunityScope, request: PageRequest
+    ) -> Page[FeedSignalProjection]:
+        """Eventually page the discovered-pattern signals for one community feed."""
+
+        context = _PageContext(
+            binding=QueryBinding.CORE_COMMUNITY_FEED_SIGNALS,
+            partition_key=keys.community_partition(scope.namespace, scope.community_id),
+        )
+        return await self._page(
+            scope=scope,
+            context=context,
+            table=TableName.CORE,
+            sort_key=SortKeyBeginsWith(keys.FEED_SIGNAL_SORT_KEY_PREFIX),
+            request=request,
+            consistent=False,
+            decode=codec_core.decode_feed_signal,
+            # A signal claims a namespace and a community. Its case is data the row points
+            # at, not the scope it was stored under, so it is checked by the codec rather
+            # than treated as this page's case boundary.
+            identity=lambda signal: EntityIdentity(
+                namespace=signal.namespace, community_id=signal.community_id
+            ),
+            address=lambda signal: codec_core.feed_signal_key(scope, signal.message_id),
+            entity_ref="FEED_SIGNAL_PROJECTION",
         )
 
     async def read_case_facts(self, scope: CaseScope, request: PageRequest) -> Page[Fact]:
@@ -687,12 +993,110 @@ class CoreRepository:
             codec_core.encode_channel_lock(scope, lock),
         )
 
+    def stage_create_feed_signal(
+        self, scope: CommunityScope, signal: FeedSignalProjection
+    ) -> PutItem:
+        """Stage the create-only feed signal that accompanies a committed discovery."""
+
+        return create_operation(
+            codec_core.feed_signal_key(scope, signal.message_id),
+            codec_core.encode_feed_signal(scope, signal),
+        )
+
+    def stage_update_feed_signal(
+        self, scope: CommunityScope, signal: FeedSignalProjection, *, expected_version: int
+    ) -> PutItem:
+        """Stage a guarded replace of an existing feed signal.
+
+        The projection is display data, so a refreshed label or case state has to be able to
+        land. It is still a compare-and-set: two concurrent applies cannot both believe they
+        wrote the current row, and the loser reloads rather than overwriting a change it never
+        saw. What may *not* be decided here is whether the linkage itself is allowed -- that is
+        a domain rule the apply service settles before any of this is staged.
+        """
+
+        return replace_operation(
+            codec_core.feed_signal_key(scope, signal.message_id),
+            codec_core.encode_feed_signal(scope, signal),
+            expected_version=expected_version,
+            new_version=signal.version,
+        )
+
+    def stage_create_monitor_progress(
+        self, scope: OperationScope, progress: MonitorApplyProgress
+    ) -> PutItem:
+        return create_operation(
+            codec_core.monitor_progress_key(scope, progress.invocation_id),
+            codec_core.encode_monitor_progress(scope, progress),
+        )
+
+    def stage_update_monitor_progress(
+        self, scope: OperationScope, progress: MonitorApplyProgress, *, expected_version: int
+    ) -> PutItem:
+        return replace_operation(
+            codec_core.monitor_progress_key(scope, progress.invocation_id),
+            codec_core.encode_monitor_progress(scope, progress),
+            expected_version=expected_version,
+            new_version=progress.version,
+        )
+
+    def stage_append_operation_agent_invocation(
+        self, scope: OperationScope, result: AgentInvocationResult
+    ) -> PutItem:
+        return create_operation(
+            codec_fence.operation_agent_invocation_key(scope, result.invocation_id),
+            codec_fence.encode_operation_agent_invocation(scope, result),
+        )
+
+    async def record_operation_agent_invocation(
+        self, scope: OperationScope, result: AgentInvocationResult
+    ) -> None:
+        """Write the run's invocation record, or accept that it is already written.
+
+        A single create-only conditional write rather than a transaction, for two reasons.
+        It is one item, so a transaction would buy nothing but a commit proof it would then
+        need somewhere to put; and this record must be writable on the failure path, where
+        the domain was left untouched and the point is to leave a durable trace of *why*
+        without the tracing itself becoming another way to fail.
+
+        A conditional failure means the record is already there. Both writers describe the
+        same invocation identity with the same hashes, so the loser has nothing to correct.
+        """
+
+        try:
+            await self.driver.write_item(
+                self.stage_append_operation_agent_invocation(scope, result)
+            )
+        except PersistenceConflictError:
+            return
+
     def stage_create_operation(
         self, scope: NamespaceScope, operation: ApplicationOperation
     ) -> PutItem:
         return create_operation(
             codec_core.operation_key(scope, operation.operation_id),
             codec_core.encode_operation(scope, operation),
+        )
+
+    async def apply_operation_transition(
+        self,
+        scope: NamespaceScope,
+        operation: ApplicationOperation,
+        *,
+        expected_version: int,
+    ) -> None:
+        """Apply one guarded operation transition as a single conditional write.
+
+        Deliberately not routed through a transaction. A ``TransactWriteItems`` call carries a
+        client request token derived from the plan, and DynamoDB treats a repeat of that token
+        inside a ten-minute window as an idempotent replay -- so two workers composing the
+        byte-identical claim at one injected instant would both be told they had won it. A
+        bare conditional write has no token, so the version condition is evaluated for every
+        caller and exactly one of them succeeds.
+        """
+
+        await self.driver.write_item(
+            self.stage_update_operation(scope, operation, expected_version=expected_version)
         )
 
     def stage_update_operation(

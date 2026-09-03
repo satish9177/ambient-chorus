@@ -62,6 +62,12 @@ Purpose: a contributor-scoped assertion extracted from one or more messages.
 
 Fields: `report_id`, `case_id?`, `community_id`, `contributor_id`, `source_message_ids: nonempty tuple`, `issue_type`, `private_summary: SensitiveStr[1..1000]`, `occurred_at?`, `location_area?`, `evidence_ids`, `status: ACTIVE|DUPLICATE|RETRACTED`, `duplicate_of_report_id?`, `version`, timestamps. Every source message has the same community and, when known, contributor. A duplicate never counts independently. Case linkage/status may change; lineage and owner do not. Private-zone only.
 
+`case_id` remains optional in the broader domain model, because a later correction or split path may hold a report between cases. **A Phase-3 persisted `Report` row always has a non-null `case_id`**: the Core key grammar addresses a report inside its case partition, so a case-less report has no address to live at.
+
+A Monitor report proposal that cannot satisfy the candidate-creation guard therefore stays **provisional**. It becomes no `Report`, no `Fact`, no case, and no feed signal, and V1 does not invent an unlinked-report table to hold it. It is not lost either: the source messages remain ordinary community messages, and the bounded Monitor context window described in [03-agent-architecture.md](03-agent-architecture.md) includes recent prior messages, so a later run over a corroborating message reconsiders them and may then form a candidate. Discovery is deferred, not discarded.
+
+Phase-3 Monitor may **not** move an already-linked report from one case to another. If a message or report that a feed signal already binds to one case is proposed for a different case, the whole apply fails closed with a typed linkage conflict. Re-linking is an explicit later correction/split use case with its own authority.
+
 ### Fact
 
 Purpose: smallest policy-addressable assertion.
@@ -150,11 +156,70 @@ Fields: `commitment_id`, `case_id`, `action_id?`, `source_evidence_id`, `obligor
 
 Purpose: append-only proof of security and lifecycle decisions without private payloads.
 
-Fields: `audit_event_id: UUIDv4`, `namespace`, `community_id?`, `case_id?`, `actor_type: HUMAN|SYSTEM|AGENT|AWS_SERVICE`, `actor_id_hash`, `event_type`, `occurred_at`, `correlation_id`, `causation_id?`, `idempotency_key_hash?`, `entity_refs: tuple[{entity_type,id,version?}]`, `decision: ALLOW|DENY|NONE`, `reason_codes`, `safe_details: AuditDetails` closed union, `input_hash?`, `output_hash?`, `schema_version`. Immutable, append-only, and ordered by `occurred_at + audit_event_id` in storage; 90-day TTL in demo. It never contains raw values, prompt/completion bodies, private URIs, emails, apartment numbers, or health text.
+Fields: `audit_event_id`, `namespace`, `community_id?`, `case_id?`, `actor_type: HUMAN|SYSTEM|AGENT|AWS_SERVICE`, `actor_id_hash`, `event_type`, `occurred_at`, `correlation_id`, `causation_id?`, `idempotency_key_hash?`, `entity_refs: tuple[{entity_type,id,version?}]`, `decision: ALLOW|DENY|NONE`, `reason_codes`, `safe_details: AuditDetails` closed union, `input_hash?`, `output_hash?`, `schema_version`. Immutable, append-only, and ordered by `occurred_at + audit_event_id` in storage; 90-day TTL in demo. It never contains raw values, prompt/completion bodies, private URIs, emails, apartment numbers, or health text.
+
+An ordinary audit event uses a UUIDv4 identifier. A **replay-bound Monitor apply** audit event uses the deterministic exception accepted in [ADR-011](../adr/ADR-011-monitor-deterministic-identities.md): it is addressed by the invocation and the case it records, so a redelivered apply re-stages the identical create-only row instead of appending a second record of one decision. No other audit event may use a derived identifier.
 
 ### ApplicationOperation
 
-Purpose: durable status for work that may outlive an HTTP request. Fields: `operation_id`, `kind: MONITOR|INVESTIGATE|PROPOSE_ACTION|SEND_ACTION|DEMO_DUE`, `namespace`, `actor_id_hash`, `case_id?`, `request_hash`, `status: PENDING|RUNNING|SUCCEEDED|FAILED`, `result_refs`, `error_code?`, timestamps, `version`, `expires_at_epoch`. It is mutable by guarded worker transitions, contains no raw command/agent content, and is private unless its result is safe. It is an application projection, not a case state or authorization artifact.
+Purpose: durable status for work that may outlive an HTTP request. Fields: `operation_id`, `kind: MONITOR|INVESTIGATE|PROPOSE_ACTION|SEND_ACTION|DEMO_DUE`, `namespace`, `actor_id_hash`, `case_id?`, `request_hash`, `status: PENDING|RUNNING|SUCCEEDED|FAILED`, `result_refs`, `error_code?`, `monitor_invocation_id?`, `monitor_locator_hash?`, timestamps, `version`, `expires_at_epoch`. It is mutable by guarded worker transitions, contains no raw command/agent content, and is private unless its result is safe. It is an application projection, not a case state or authorization artifact.
+
+#### The Monitor handover identity
+
+`monitor_invocation_id` and `monitor_locator_hash` are the durable statement of **which agent invocation this operation authorizes, and over exactly which new messages**. They exist because a worker delivery is data on a queue and a queue can be wrong, while the operation row cannot be: without them, the *first* delivery for an operation had no durable record to disagree with, so any invocation identity and any subset of the delivered locators were accepted on trust — and a caller retaining a valid `request_hash` could still change what the Monitor was given.
+
+| Rule | Statement |
+|---|---|
+| Presence | required for `kind = MONITOR` before dispatch; `null` for every other kind |
+| Pairing | both are set or neither is; an operation is never half-bound |
+| Content | identifiers and digests only — never a locator list, never message text |
+| Mutability | immutable for the operation's lifetime; every status transition copies them forward |
+| Creation | written by the same transaction that creates the operation and completes its command-idempotency record, so the two can never disagree |
+| API exposure | not part of the public operation status response; a poller learns status, not handover identity |
+
+`monitor_locator_hash` is the digest of the canonical, **sorted** set of `{message_id, sent_at}` locators the run may treat as its new messages. It is sorted because the endpoint takes a batch and Monitor processing canonicalizes its order anyway, so two deliveries of the same messages in a different order are the same work. `sent_at` is inside the digest because the earliest new message anchors the recent-context window: moving one instant would change what the model reads without changing which messages it was given.
+
+Before claiming an operation a worker must prove `job.operation_id`, `job.namespace`, `operation.kind = MONITOR`, `job.actor_id_hash`, `job.request_hash`, `job.invocation_id = operation.monitor_invocation_id`, and `hash(job.message_locators) = operation.monitor_locator_hash`. Any mismatch claims nothing, invokes nothing, mutates nothing, and leaves the operation's status and version untouched.
+
+#### Operation transitions
+
+| Edge | Guard | Meaning |
+|---|---|---|
+| `PENDING→RUNNING` | expected version; a bare conditional write, never a transaction | exactly one worker claims the operation |
+| `PENDING→FAILED` | expected version | the work was refused before it started |
+| `RUNNING→SUCCEEDED` | expected version | the worker finished and recorded its result refs |
+| `RUNNING→FAILED` | expected version | the attempt is over, and the outcome is a verdict |
+| `RUNNING→PENDING` | expected version; **MONITOR only**, and only under the four conditions below | the attempt was interrupted, and the operation is eligible to resume |
+
+`RUNNING→PENDING` is deliberately narrow, and it exists because a Monitor operation with a persisted validated-plan snapshot is *finishable*: the model has already answered, the answer is frozen, and the only work left is bounded deterministic writes. Marking such an operation `FAILED` would abandon durable, valid, committed state and make the remainder unreachable except by a human minting a new invocation — which would mean a second pass over private text for work already paid for.
+
+All four conditions must hold:
+
+1. the operation's `kind` is `MONITOR`;
+2. a validated-plan snapshot is already persisted for this invocation;
+3. apply steps remain incomplete;
+4. the failure is classified as a **resumable** apply interruption — a storage or transport failure while executing the frozen plan, with no ambiguous external side effect.
+
+There is deliberately no new broad `RETRYABLE` status. Redelivery of a `PENDING` operation takes the ordinary `PENDING→RUNNING` claim, loads the frozen plan snapshot and the progress record, resumes at the first incomplete step, and makes **zero** model calls.
+
+A **non-resumable** failure after partial valid progress — a stale case version, a case moved to a state intake may not extend, an integrity failure, or any deterministic conflict that means the frozen plan can no longer legally finish — is `RUNNING→FAILED` with the safe code `PARTIAL_APPLY_CONFLICT`. That code does not pretend the operation was atomic: state already committed by earlier steps remains valid and is left exactly as it is.
+
+#### Finalization is the last step of the plan
+
+A Monitor apply plan is *N* data steps **plus one finalization step**, and `total_steps` counts both. The finalization step commits the successful `AgentInvocationResult` in the same transaction that advances apply progress to complete, which makes one invariant hold by construction:
+
+> `progress.is_complete` implies the durable successful invocation record already exists.
+
+Only after that step is durable may the operation transition to `SUCCEEDED`. The ordering matters because the alternative produced the worst possible outcome: every data write committed, progress reading complete, no record saying the invocation succeeded, and the operation settled `FAILED`.
+
+Finalization carries the same three guarantees every data step carries — its own idempotency key, its own commit proof, and *interruption rather than failure* when storage refuses — so an attempt that dies there becomes a resumable `PENDING` operation whose redelivery finishes exactly that one step, with **zero** model calls and no new domain mutation.
+
+Once the record is durable the `SUCCEEDED` transition is independently replayable, because it writes nothing but a status:
+
+* transition refused or its response lost → strongly reload the operation; if it is already `SUCCEEDED`, that is the answer;
+* still `RUNNING` (or `PENDING`) with a durable finalized invocation → conditionally transition it to `SUCCEEDED`, whether the claim is fresh or long past the stale window.
+
+A finalized operation is therefore **never** aged into `FAILED` by stale recovery. Stale recovery still applies exactly where it always did: to a `RUNNING` operation with no finalized invocation, where "the worker vanished" and "the worker is still going" remain indistinguishable.
 
 ## Ownership, mutation, and version summary
 
@@ -207,6 +272,7 @@ Every transition command supplies `case_id`, `expected_version`, `transition`, `
 | Transition | Required guard | Caused by | Retry/state on failure |
 |---|---|---|---|
 | create `CANDIDATE` | at least 2 potentially related report proposals, not necessarily corroborated | intake service | retryable before persist; no case on failure |
+| Monitor links a report into an existing case | case state is Monitor-linkable *and* the case version the agent saw is still current | intake service | case unchanged; typed stale/ineligible failure |
 | `CANDIDATE→AWAITING_MANDATES` | human/demo accepts candidate; proposals exist for every participating owner | application/human | remains candidate |
 | `AWAITING_MANDATES→INVESTIGATING` | at least one non-proposed decision or timeout/refusal recorded | application | remains awaiting |
 | `INVESTIGATING→READY_FOR_ACTION` | validated assessment; `independent_source_count>=2`; no material unresolved different-issue finding; a compile preflight finds eligible facts | application | remains investigating |
@@ -217,6 +283,12 @@ Every transition command supplies `case_id`, `expected_version`, `transition`, `
 | `VERIFYING→READY_FOR_ACTION` | affected contributor records `MISSED`/not fulfilled | human/application | same verification replay is no-op |
 | any allowed → `CLOSED_UNRESOLVED` | human reason from fixed enum; no active `SENDING` execution | human | source state retained on conflict |
 | terminal reopen | new report/evidence and explicit human/demo command | human/application | terminal state retained on failure |
+
+### Monitor linkage eligibility
+
+Attaching a new Monitor-derived report to an existing case is a mutation of that case, so it is gated by state, not merely by similarity. The Monitor-linkable states are `CANDIDATE`, `AWAITING_MANDATES`, `INVESTIGATING`, `READY_FOR_ACTION`, `ACTION_PROPOSED`, `ACTIONED`, and `VERIFYING`. In every one of those, linking appends reports and facts and leaves `state` unchanged.
+
+`RESOLVED` and `CLOSED_UNRESOLVED` are **not** Monitor-linkable. The state machine reopens a terminal case only through an explicit human/demo reopen command, and Phase-3 Monitor has no such authority. A proposal to attach a report to a terminal case fails closed with a typed ineligible-state error; the case's `state`, `state_reason_code`, and `version` are all left exactly as they were, and no report, fact, signal, or audit row is written for that group. A terminal case is also excluded from the candidate summaries the Monitor is shown, so the ordinary path never proposes one.
 
 Mandate revocation or policy/case changes trigger a deterministic readiness reconciliation. They do not unsend a `SENT` action. If an unsent proposal becomes stale, it is invalidated and case returns to `READY_FOR_ACTION` or `INVESTIGATING`. Case transition never relies solely on an agent recommendation.
 

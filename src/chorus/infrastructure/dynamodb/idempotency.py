@@ -197,3 +197,19 @@ class IdempotencyRepository:
             key=codec_idempotency.idempotency_item_key(key, table=self.table),
             request_hash=request_hash,
         )
+
+    def completion_proof(self, record: IdempotencyRecord) -> CommitProof:
+        """Return the proof for the transaction that completes this reserved record.
+
+        Deliberately keyed on the record rather than on the key alone: what proves the
+        completing transaction committed is the *version* the record reaches, and only the
+        record the caller reserved knows which version that is.
+        """
+
+        if record.status is not IdempotencyStatus.IN_PROGRESS:
+            raise ValueError("only an in-progress record can be completed by a plan")
+        return CommitProof(
+            key=codec_idempotency.idempotency_item_key(record.key, table=self.table),
+            request_hash=record.request_hash,
+            completed_version=record.version + 1,
+        )

@@ -34,7 +34,7 @@ jobs:
       - run: npm ci
       - run: uv run ruff format --check .
       - run: uv run ruff check .
-      - run: uv run mypy src tests infra tools
+      - run: uv run mypy src tests infra tools apps/api runtimes
       - run: uv run lint-imports
       - run: uv run pytest
       - run: uv run python tools/check_architecture_links.py

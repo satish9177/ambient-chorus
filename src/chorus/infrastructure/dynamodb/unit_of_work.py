@@ -80,6 +80,10 @@ class StorageUnitOfWork:
         _, record = codec_idempotency.decode_idempotency(item)
         if record.request_hash != proof.request_hash:
             raise IdempotencyConflictError("COMMIT_PROOF")
+        if proof.completed_version is not None and record.version < proof.completed_version:
+            # The record is still the reservation this plan meant to complete, so the guarded
+            # write definitely did not land. Presence alone would have said the opposite.
+            return TransactionNotCommitted()
         return TransactionCommitted()
 
     async def commit(self, plan: TransactionPlan) -> None:

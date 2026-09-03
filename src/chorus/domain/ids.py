@@ -183,6 +183,14 @@ class IdGenerator(Protocol):
     def new(self, identifier_type: type[IdentifierT]) -> IdentifierT:
         """Create one identifier of the requested nominal type."""
 
+    def new_uuid(self) -> UUID:
+        """Create one bare identifier for something with no nominal wrapper type.
+
+        An agent invocation and a correlation are UUIDs without a domain wrapper, and they
+        still must not be minted by calling ``uuid4`` inline: a test that needs a reproducible
+        run has to be able to substitute this source like any other.
+        """
+
 
 @dataclass(slots=True)
 class Uuid4Generator:
@@ -190,6 +198,9 @@ class Uuid4Generator:
 
     def new(self, identifier_type: type[IdentifierT]) -> IdentifierT:
         return identifier_type(uuid4())
+
+    def new_uuid(self) -> UUID:
+        return uuid4()
 
 
 @dataclass(slots=True)
@@ -204,3 +215,7 @@ class Uuid5Generator:
         self._counter += 1
         value = uuid5(self.namespace, f"{self.prefix}:{identifier_type.__name__}:{self._counter}")
         return identifier_type(value)
+
+    def new_uuid(self) -> UUID:
+        self._counter += 1
+        return uuid5(self.namespace, f"{self.prefix}:UUID:{self._counter}")

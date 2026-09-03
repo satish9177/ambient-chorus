@@ -22,6 +22,8 @@ Every runtime receives:
 | `policy_version` | string | context only; agent cannot interpret as grant |
 | `payload` | agent-specific DTO | `extra='forbid'` |
 
+The input envelope carries **no** `prompt_version`. A runtime runs exactly one reviewed prompt, pinned in its own artifact, so a caller-supplied prompt version would either be ignored or would let the caller select prompt text. The runtime rejects an invocation addressed to a different agent and answers with the prompt version it actually ran; the application then refuses any result whose `prompt_version` is not the one it expects for that agent.
+
 The runtime returns `AgentResultEnvelope` with `schema_version='agent-output/v1'`, the same invocation/case/version values, `agent_name`, `model_profile_arn_hash`, `prompt_version`, `started_at`, `completed_at`, and the agent-specific output. The runtime never returns chain-of-thought. Prompts and completions are not logged.
 
 Runtime-level validation checks schema, 1 MiB application payload limit, UTF-8, bounded collection sizes, exact agent name, and no unknown fields. Application-level validation additionally checks that every returned ID existed in the input and belongs to the same case.
@@ -46,12 +48,30 @@ Attachments are descriptors `{evidence_id, media_type, safe_caption?}`. Raw byte
 - `message_results[]` keyed by input `message_id`;
 - `proposed_reports[]: {client_ref, message_ids[], contributor_pseudonym_id, issue_type, summary, occurred_at?, location_area?, confidence_basis[]}`;
 - `proposed_facts[]: {client_ref, report_client_ref, fact_type, typed_value, sensitivity, evidence_ids[], source_spans[]}`;
-- `candidate_links[]: {report_client_ref, existing_case_id?, proposed_case_title, similarity_reasons[], dissimilarity_reasons[], confidence}`;
+- `candidate_links[]: {report_client_ref, existing_case_id?, candidate_group_ref?, proposed_case_title, similarity_reasons[], dissimilarity_reasons[], confidence}`;
 - `sensitive_signals[]: {message_id, category, source_span}`;
 - `missing_information_requests[]: {contributor_pseudonym_id, report_client_ref, requested_fields[], reason}`;
 - `mandate_suggestions[]: {report_client_ref, fact_client_refs[], suggested_max_scope, suggested_purpose}`.
 
 Confidence is a decimal string in `[0,1]`; it is diagnostic, never an authorization or automatic truth threshold. The deterministic intake service assigns durable IDs, verifies spans against input text, maps typed values, and applies linkage thresholds. A mandate suggestion creates only a `PROPOSED` mandate; it can never produce approval.
+
+#### Candidate grouping
+
+`candidate_group_ref` is an **ephemeral, model-local label** that names one proposed *new* case within one output. It exists because a link that only says "not an existing case" gives the application no way to tell two unrelated new problems apart: without it, every new-case link sharing an issue type collapses into one case, so an unrelated `OTHER` plumbing complaint and an unrelated `OTHER` garage-gate complaint would be filed as the same case.
+
+Rules, all enforced by deterministic validation over the whole output:
+
+- it is a bounded string in the same closed alphabet as `client_ref`, and it is rejected if it parses as a UUID — it must not look like a durable identifier;
+- it never becomes a `case_id` and never survives validation;
+- exactly one of `existing_case_id` and `candidate_group_ref` is present on any link. An existing-case link carrying a group ref is refused, and a new-case link without one is refused;
+- every link sharing a `candidate_group_ref` must agree on `issue_type` and on the proposed case title. Disagreement refuses the whole output rather than picking a winner;
+- two different `candidate_group_ref` values stay two different candidate groups even when their issue types are identical.
+
+Durable `case_id` for a new candidate is still assigned by application code from the validated authoritative reports, never from `candidate_group_ref`, exactly as [ADR-011](../adr/ADR-011-monitor-deterministic-identities.md) requires. A group that does not satisfy the candidate-creation guard produces no durable state; see [04-domain-state-and-events.md](04-domain-state-and-events.md).
+
+#### Bounded Monitor context
+
+The Monitor sees only what the application deliberately loaded. For an ingestion-triggered run the application builds the batch from the newly ingested messages plus a bounded window of recent prior community messages, capped at the frozen maximum of 50 messages. It then loads the feed-signal projections for **exactly those message IDs**, collects the distinct case IDs those signals name, and strongly loads at most 20 eligible case summaries. No scan, no GSI, and no client-supplied case identifier is involved: an HTTP ingestion request cannot name a case, because a client that could name a case would be doing the discovery.
 
 ### Tools and permissions
 
@@ -135,6 +155,22 @@ flowchart TD
 ```
 
 An agent call is automatically retried once only when no output was persisted and the failure is a timeout, throttling, or transient AgentCore/Bedrock 5xx. It uses the same `invocation_id` and input hash. Invalid JSON/schema, invented IDs, cross-case IDs, policy-like instructions, and semantic violations are not retried automatically. A persisted output is never duplicated; the invocation record maps its input hash to the result ID.
+
+Before invoking, the application strongly reads the durable invocation record for this `invocation_id`. A completed record with the same input hash replays its recorded outcome and calls **no model**; a record with a different input hash is a conflict. Only the absence of a durable result permits an invocation.
+
+### One retry means one retry
+
+The application owns exactly one automatic agent retry, so exactly one model attempt must happen inside one runtime invocation. Every layer that could add a hidden attempt is pinned:
+
+| Layer | Setting | Effect |
+|---|---|---|
+| Strands agent/event loop | maximum model attempts = 1 | no SDK-internal re-ask |
+| `BedrockModel` botocore client | `retries={"mode": "standard", "total_max_attempts": 1}` | no SDK-internal re-send |
+| Bedrock read timeout | `model_timeout` | bounds one model attempt |
+| Runtime handler budget | `runtime_budget > model_timeout` | the runtime returns a typed failure before its caller gives up |
+| AgentCore client read timeout | `agent_timeout_seconds > runtime_budget` | the application never abandons a runtime that is still running |
+
+The ordering is the invariant: `model_timeout < runtime_budget < agent_timeout_seconds`. There is no state in which the application launches a second runtime invocation while the first is still executing, so at most two runtime invocations and at most two model attempts exist per command. Defaults are never relied on; each value is configured explicitly and asserted from the instantiated client.
 
 Application orchestration is a set of explicit use cases—not a generic workflow abstraction:
 

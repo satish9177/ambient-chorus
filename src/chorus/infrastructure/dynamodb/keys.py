@@ -131,6 +131,17 @@ def channel_lock_sort_key(adapter: str, channel_message_id_sha256: Sha256Digest)
     return _join("MESSAGE_KEY", adapter, channel_message_id_sha256.value)
 
 
+def feed_signal_sort_key(message_id: MessageId) -> str:
+    """``MESSAGE_SIGNAL#{message_id}`` in the community partition.
+
+    The signal is keyed by message rather than by case so the ambient feed can resolve which
+    of its rows carry a discovered pattern with one bounded query on the partition it is
+    already reading. There is no message-to-case index and no scan, by design.
+    """
+
+    return _join("MESSAGE_SIGNAL", str(message_id))
+
+
 def operation_sort_key() -> str:
     return "OPERATION"
 
@@ -179,6 +190,44 @@ def agent_invocation_sort_key(invocation_id: UUID) -> str:
     return _join("AGENT_INVOCATION", str(invocation_id))
 
 
+def monitor_progress_sort_key(invocation_id: UUID) -> str:
+    """``AGENT_PROGRESS#{invocation_id}`` in the application-operation partition.
+
+    Apply progress lives beside the operation rather than beside a case, because one answer
+    may touch several cases and may touch none at all. A resumed worker has an operation ID
+    in its hand before it has anything else, so this is the one address it can always reach.
+    """
+
+    return _join("AGENT_PROGRESS", str(invocation_id))
+
+
+SNAPSHOT_CHUNK_INDEX_WIDTH = 6
+
+
+def monitor_snapshot_manifest_sort_key(kind: str, invocation_id: UUID) -> str:
+    """``{kind}#{invocation_id}#MANIFEST`` in the application-operation partition.
+
+    The kind leads so the two snapshots one invocation owns -- its frozen input and its
+    validated plan -- are distinct addresses rather than one row with a mode flag. Both live
+    beside the operation for the same reason apply progress does: a resumed worker holds an
+    operation ID before it holds anything else.
+    """
+
+    return _join(kind, str(invocation_id), "MANIFEST")
+
+
+def monitor_snapshot_chunk_sort_key(kind: str, invocation_id: UUID, index: int) -> str:
+    """``{kind}#{invocation_id}#CHUNK#{index}`` with a fixed zero-padded width.
+
+    Zero padding keeps the chunk order lexicographic as well as numeric, so the ordering the
+    manifest asserts and the ordering the key grammar implies can never disagree.
+    """
+
+    if index < 0 or len(str(index)) > SNAPSHOT_CHUNK_INDEX_WIDTH:
+        raise ValueError("snapshot chunk index exceeds the fixed key width")
+    return _join(kind, str(invocation_id), "CHUNK", str(index).zfill(SNAPSHOT_CHUNK_INDEX_WIDTH))
+
+
 def send_fence_sort_key() -> str:
     return "SEND_FENCE"
 
@@ -223,6 +272,13 @@ def audit_event_sort_key(occurred_at: datetime, audit_event_id: UUID) -> str:
     return _join("EVENT", format_utc(occurred_at), str(audit_event_id))
 
 
+OPERATION_INVOCATION_SORT_KEY_PREFIX = "AGENT_"
+"""Covers both records under an operation partition that name an invocation.
+
+``AGENT_INVOCATION#`` and ``AGENT_PROGRESS#`` share it, so "which invocation owns this
+operation" is one bounded range query rather than two.
+"""
+
 HISTORY_SORT_KEY_PREFIX = "HISTORY#"
 EVENT_SORT_KEY_PREFIX = "EVENT#"
 FACT_SORT_KEY_PREFIX = "FACT#"
@@ -231,3 +287,4 @@ ASSESSMENT_SORT_KEY_PREFIX = "ASSESSMENT#"
 MANDATE_CURRENT_SORT_KEY_PREFIX = "MANDATE_CURRENT#"
 COMMITMENT_SORT_KEY_PREFIX = "COMMITMENT#"
 MESSAGE_SORT_KEY_PREFIX = "MESSAGE#"
+FEED_SIGNAL_SORT_KEY_PREFIX = "MESSAGE_SIGNAL#"

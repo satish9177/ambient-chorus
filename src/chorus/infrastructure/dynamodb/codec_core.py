@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Final
+from uuid import UUID
 
 from chorus.domain.entities import (
     ApplicationOperation,
@@ -29,6 +30,7 @@ from chorus.domain.errors import IntegrityError
 from chorus.domain.ids import (
     ActionId,
     AssessmentId,
+    CaseId,
     CommunityId,
     ContributorId,
     DestinationId,
@@ -38,6 +40,7 @@ from chorus.domain.ids import (
     MessageId,
     OperationId,
     ReportId,
+    SensitiveStr,
     Sha256Digest,
     ViewId,
 )
@@ -60,8 +63,13 @@ from chorus.infrastructure.dynamodb.codec import (
 )
 from chorus.ports.records import (
     ChannelUniquenessLock,
+    FeedSignalProjection,
+    MonitorApplyProgress,
+    MonitorSnapshotChunk,
+    MonitorSnapshotKind,
+    MonitorSnapshotManifest,
 )
-from chorus.ports.scopes import CaseScope, CommunityScope, NamespaceScope
+from chorus.ports.scopes import CaseScope, CommunityScope, NamespaceScope, OperationScope
 from chorus.ports.storage import ItemKey, StoredItem, StoredValue, TableName
 
 _CORE: Final = TableName.CORE
@@ -73,6 +81,10 @@ CHANNEL_LOCK_SCHEMA_VERSIONS: Final = frozenset({"channel-uniqueness-lock/v1"})
 OPERATION_SCHEMA_VERSIONS: Final = frozenset({"application-operation/v1"})
 EVIDENCE_ROOT_SCHEMA_VERSIONS: Final = frozenset({"evidence-root/v1"})
 CASE_SCHEMA_VERSIONS: Final = frozenset({"community-case/v1"})
+FEED_SIGNAL_SCHEMA_VERSIONS: Final = frozenset({"feed-signal-projection/v2"})
+MONITOR_PROGRESS_SCHEMA_VERSIONS: Final = frozenset({"monitor-apply-progress/v1"})
+MONITOR_SNAPSHOT_MANIFEST_SCHEMA_VERSIONS: Final = frozenset({"monitor-snapshot-manifest/v1"})
+MONITOR_SNAPSHOT_CHUNK_SCHEMA_VERSIONS: Final = frozenset({"monitor-snapshot-chunk/v1"})
 
 
 def build_entity_error(reader: ItemReader, name: str) -> IntegrityError:
@@ -294,6 +306,297 @@ def decode_message(item: StoredItem) -> tuple[DecodedScope, CommunityMessage]:
     return scope, message
 
 
+def feed_signal_key(scope: CommunityScope, message_id: MessageId) -> ItemKey:
+    return ItemKey(
+        table=_CORE,
+        partition_key=keys.community_partition(scope.namespace, scope.community_id),
+        sort_key=keys.feed_signal_sort_key(message_id),
+    )
+
+
+def encode_feed_signal(scope: CommunityScope, signal: FeedSignalProjection) -> StoredItem:
+    key = feed_signal_key(scope, signal.message_id)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.FEED_SIGNAL_PROJECTION,
+        schema_version=signal.schema_version,
+        key=key,
+        namespace=signal.namespace,
+        community_id=signal.community_id,
+        # The signal names its case in a body attribute rather than the scope envelope. The
+        # row lives in the community partition, and putting a case ID in the envelope would
+        # make a community-scoped page look like case-scoped data to the scope validator.
+        case_id=None,
+    )
+    item.update(
+        {
+            "message_id": identifier(signal.message_id),
+            "signal_case_id": identifier(signal.case_id),
+            "case_version": signal.case_version,
+            "label": signal.label,
+            "related_message_count": signal.related_message_count,
+            "case_state": signal.case_state.value,
+            "detected_at": instant(signal.detected_at),
+            "version": signal.version,
+        }
+    )
+    return item
+
+
+def decode_feed_signal(item: StoredItem) -> tuple[DecodedScope, FeedSignalProjection]:
+    reader = ItemReader(item, entity_ref="FEED_SIGNAL_PROJECTION")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.FEED_SIGNAL_PROJECTION,
+        accepted_schema_versions=FEED_SIGNAL_SCHEMA_VERSIONS,
+    )
+    if scope.community_id is None:
+        raise build_entity_error(reader, "community_id")
+    if scope.case_id is not None:
+        raise build_entity_error(reader, "case_id")
+    signal = build_entity(
+        reader.entity_ref,
+        FeedSignalProjection,
+        namespace=scope.namespace,
+        community_id=scope.community_id,
+        message_id=reader.identifier("message_id", MessageId),
+        case_id=reader.identifier("signal_case_id", CaseId),
+        case_version=reader.number("case_version"),
+        label=reader.text("label"),
+        related_message_count=reader.number("related_message_count"),
+        case_state=reader.enum("case_state", CaseState),
+        detected_at=reader.instant("detected_at"),
+        version=reader.number("version"),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return scope, signal
+
+
+# --------------------------------------------------------------------------------------
+# Monitor apply progress
+# --------------------------------------------------------------------------------------
+
+
+def monitor_progress_key(scope: OperationScope, invocation_id: UUID) -> ItemKey:
+    return ItemKey(
+        table=_CORE,
+        partition_key=keys.operation_partition(scope.namespace, scope.operation_id),
+        sort_key=keys.monitor_progress_sort_key(invocation_id),
+    )
+
+
+def encode_monitor_progress(scope: OperationScope, progress: MonitorApplyProgress) -> StoredItem:
+    key = monitor_progress_key(scope, progress.invocation_id)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.MONITOR_APPLY_PROGRESS,
+        schema_version=progress.schema_version,
+        key=key,
+        namespace=progress.namespace,
+        # The row lives in the operation partition, so the scope envelope names neither a
+        # community nor a case. The community it belongs to is a body attribute, checked
+        # against the caller's scope after decoding like every other cross-scope field.
+        community_id=None,
+        case_id=None,
+    )
+    item.update(
+        {
+            "invocation_id": str(progress.invocation_id),
+            "operation_id": identifier(progress.operation_id),
+            "progress_community_id": identifier(progress.community_id),
+            "input_hash": progress.input_hash.value,
+            "output_hash": progress.output_hash.value,
+            "plan_hash": progress.plan_hash.value,
+            "completed_steps": progress.completed_steps,
+            "total_steps": progress.total_steps,
+            "version": progress.version,
+            "created_at": instant(progress.created_at),
+            "updated_at": instant(progress.updated_at),
+        }
+    )
+    return item
+
+
+def decode_monitor_progress(item: StoredItem) -> tuple[DecodedScope, MonitorApplyProgress]:
+    reader = ItemReader(item, entity_ref="MONITOR_APPLY_PROGRESS")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.MONITOR_APPLY_PROGRESS,
+        accepted_schema_versions=MONITOR_PROGRESS_SCHEMA_VERSIONS,
+    )
+    if scope.community_id is not None or scope.case_id is not None:
+        raise build_entity_error(reader, "scope")
+    progress = build_entity(
+        reader.entity_ref,
+        MonitorApplyProgress,
+        invocation_id=reader.uuid("invocation_id"),
+        operation_id=reader.identifier("operation_id", OperationId),
+        namespace=scope.namespace,
+        community_id=reader.identifier("progress_community_id", CommunityId),
+        input_hash=reader.digest("input_hash"),
+        output_hash=reader.digest("output_hash"),
+        plan_hash=reader.digest("plan_hash"),
+        completed_steps=reader.number("completed_steps"),
+        total_steps=reader.number("total_steps"),
+        version=reader.number("version"),
+        created_at=reader.instant("created_at"),
+        updated_at=reader.instant("updated_at"),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return scope, progress
+
+
+# --------------------------------------------------------------------------------------
+# Monitor invocation snapshots
+# --------------------------------------------------------------------------------------
+
+
+def monitor_snapshot_manifest_key(
+    scope: OperationScope, kind: MonitorSnapshotKind, invocation_id: UUID
+) -> ItemKey:
+    return ItemKey(
+        table=_CORE,
+        partition_key=keys.operation_partition(scope.namespace, scope.operation_id),
+        sort_key=keys.monitor_snapshot_manifest_sort_key(kind.value, invocation_id),
+    )
+
+
+def monitor_snapshot_chunk_key(
+    scope: OperationScope, kind: MonitorSnapshotKind, invocation_id: UUID, index: int
+) -> ItemKey:
+    return ItemKey(
+        table=_CORE,
+        partition_key=keys.operation_partition(scope.namespace, scope.operation_id),
+        sort_key=keys.monitor_snapshot_chunk_sort_key(kind.value, invocation_id, index),
+    )
+
+
+def encode_monitor_snapshot_manifest(
+    scope: OperationScope, manifest: MonitorSnapshotManifest
+) -> StoredItem:
+    key = monitor_snapshot_manifest_key(scope, manifest.kind, manifest.invocation_id)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.MONITOR_SNAPSHOT_MANIFEST,
+        schema_version=manifest.schema_version,
+        key=key,
+        namespace=manifest.namespace,
+        community_id=None,
+        case_id=None,
+    )
+    item.update(
+        {
+            "invocation_id": str(manifest.invocation_id),
+            "operation_id": identifier(manifest.operation_id),
+            "snapshot_community_id": identifier(manifest.community_id),
+            "kind": manifest.kind.value,
+            "content_sha256": manifest.content_sha256.value,
+            "byte_length": manifest.byte_length,
+            "chunk_count": manifest.chunk_count,
+            "input_hash": manifest.input_hash.value,
+            "output_hash": None if manifest.output_hash is None else manifest.output_hash.value,
+            "plan_hash": None if manifest.plan_hash is None else manifest.plan_hash.value,
+            "model_profile_hash": (
+                None if manifest.model_profile_hash is None else manifest.model_profile_hash.value
+            ),
+            "provenance_hash": (
+                None if manifest.provenance_hash is None else manifest.provenance_hash.value
+            ),
+            "prompt_version": manifest.prompt_version,
+            "created_at": instant(manifest.created_at),
+            ATTR_EXPIRES_AT_EPOCH: manifest.expires_at_epoch,
+        }
+    )
+    return item
+
+
+def decode_monitor_snapshot_manifest(
+    item: StoredItem,
+) -> tuple[DecodedScope, MonitorSnapshotManifest]:
+    reader = ItemReader(item, entity_ref="MONITOR_SNAPSHOT_MANIFEST")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.MONITOR_SNAPSHOT_MANIFEST,
+        accepted_schema_versions=MONITOR_SNAPSHOT_MANIFEST_SCHEMA_VERSIONS,
+    )
+    if scope.community_id is not None or scope.case_id is not None:
+        raise build_entity_error(reader, "scope")
+    manifest = build_entity(
+        reader.entity_ref,
+        MonitorSnapshotManifest,
+        invocation_id=reader.uuid("invocation_id"),
+        operation_id=reader.identifier("operation_id", OperationId),
+        namespace=scope.namespace,
+        community_id=reader.identifier("snapshot_community_id", CommunityId),
+        kind=reader.enum("kind", MonitorSnapshotKind),
+        content_sha256=reader.digest("content_sha256"),
+        byte_length=reader.number("byte_length"),
+        chunk_count=reader.number("chunk_count"),
+        input_hash=reader.digest("input_hash"),
+        output_hash=reader.optional_digest("output_hash"),
+        plan_hash=reader.optional_digest("plan_hash"),
+        model_profile_hash=reader.optional_digest("model_profile_hash"),
+        provenance_hash=reader.optional_digest("provenance_hash"),
+        prompt_version=reader.text("prompt_version"),
+        created_at=reader.instant("created_at"),
+        expires_at_epoch=reader.number(ATTR_EXPIRES_AT_EPOCH),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return scope, manifest
+
+
+def encode_monitor_snapshot_chunk(scope: OperationScope, chunk: MonitorSnapshotChunk) -> StoredItem:
+    key = monitor_snapshot_chunk_key(scope, chunk.kind, chunk.invocation_id, chunk.index)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.MONITOR_SNAPSHOT_CHUNK,
+        schema_version=chunk.schema_version,
+        key=key,
+        namespace=chunk.namespace,
+        community_id=None,
+        case_id=None,
+    )
+    item.update(
+        {
+            "invocation_id": str(chunk.invocation_id),
+            "operation_id": identifier(chunk.operation_id),
+            "snapshot_community_id": identifier(chunk.community_id),
+            "kind": chunk.kind.value,
+            "chunk_index": chunk.index,
+            # Canonical UTF-8 text, stored as a string attribute. DynamoDB stores strings as
+            # UTF-8, so there is nothing to base64-expand and nothing gained by doing so.
+            "content": sensitive(chunk.content),
+            ATTR_EXPIRES_AT_EPOCH: chunk.expires_at_epoch,
+        }
+    )
+    return item
+
+
+def decode_monitor_snapshot_chunk(item: StoredItem) -> tuple[DecodedScope, MonitorSnapshotChunk]:
+    reader = ItemReader(item, entity_ref="MONITOR_SNAPSHOT_CHUNK")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.MONITOR_SNAPSHOT_CHUNK,
+        accepted_schema_versions=MONITOR_SNAPSHOT_CHUNK_SCHEMA_VERSIONS,
+    )
+    if scope.community_id is not None or scope.case_id is not None:
+        raise build_entity_error(reader, "scope")
+    chunk = build_entity(
+        reader.entity_ref,
+        MonitorSnapshotChunk,
+        invocation_id=reader.uuid("invocation_id"),
+        operation_id=reader.identifier("operation_id", OperationId),
+        namespace=scope.namespace,
+        community_id=reader.identifier("snapshot_community_id", CommunityId),
+        kind=reader.enum("kind", MonitorSnapshotKind),
+        index=reader.number("chunk_index"),
+        content=SensitiveStr(reader.text("content")),
+        expires_at_epoch=reader.number(ATTR_EXPIRES_AT_EPOCH),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return scope, chunk
+
+
 def channel_lock_key(
     scope: CommunityScope, *, adapter: str, channel_message_id_sha256: Sha256Digest
 ) -> ItemKey:
@@ -387,6 +690,19 @@ def encode_operation(scope: NamespaceScope, operation: ApplicationOperation) -> 
             "status": operation.status.value,
             "result_refs": identifiers(operation.result_refs),
             "error_code": operation.error_code,
+            # The Monitor handover identity: which agent invocation this operation authorizes
+            # and the digest of the exact new-message set it may be run over. Identifiers and
+            # a hash only -- never the locators themselves, and never message content.
+            "monitor_invocation_id": (
+                None
+                if operation.monitor_invocation_id is None
+                else str(operation.monitor_invocation_id)
+            ),
+            "monitor_locator_hash": (
+                None
+                if operation.monitor_locator_hash is None
+                else operation.monitor_locator_hash.value
+            ),
             ATTR_EXPIRES_AT_EPOCH: operation.expires_at_epoch,
             "version": operation.version,
             "created_at": instant(operation.created_at),
@@ -415,6 +731,8 @@ def decode_operation(item: StoredItem) -> tuple[DecodedScope, ApplicationOperati
         status=reader.enum("status", ApplicationOperationStatus),
         result_refs=reader.uuids("result_refs"),
         error_code=reader.optional_text("error_code"),
+        monitor_invocation_id=reader.optional_uuid("monitor_invocation_id"),
+        monitor_locator_hash=reader.optional_digest("monitor_locator_hash"),
         expires_at_epoch=reader.number(ATTR_EXPIRES_AT_EPOCH),
         version=reader.number("version"),
         created_at=reader.instant("created_at"),

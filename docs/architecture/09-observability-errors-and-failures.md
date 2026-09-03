@@ -57,6 +57,13 @@ Strands/OpenTelemetry content capture is disabled. An exporter processor drops `
 | commitment | `commitment.created`, `schedule.created/failed`, `commitment.due/replayed/fulfilled/missed`; IDs/generation |
 | security | `cross_case.denied`, `private_uri.denied`, `prompt_injection.observed`, `iam.probe.denied`; no malicious content |
 | replay | `idempotency.replay/conflict`, `scheduler.replay`, `lambda.replay`; command/event key hash |
+| worker | `worker.job.mismatch`, `operation.resume.scheduled`, `operation.resumed`, `monitor.batch.noop`; operation/invocation IDs, safe reason codes |
+
+### Service attribution
+
+The `service` field names the process that actually emitted the record, not the package the emitter happens to live in. Application events raised while the Monitor operation worker is running carry `worker`; the same emitters called inside an HTTP request carry `chorus-api`. Attributing a worker's agent invocation to the API would make "which process invoked the model" unanswerable from the logs, which is the one question the agent events exist to answer.
+
+`attempt` is the ordinal of the **application-owned** agent attempt within one invocation identity: `1` for the first call and `2` only when the single licensed retry actually happens. It is never the SDK's internal attempt count, because both the Strands event loop and the Bedrock client are pinned to a single attempt.
 
 ## CloudWatch metrics and alarms
 
@@ -117,6 +124,14 @@ Policy denial is not logged as an application error. Unknown exceptions become `
 | duplicate reporter/multiple incidents | unique contributor set counts once for corroboration/privacy where applicable | reports remain; no dedupe loss | all reports, one contributor source | UI shows multiple reports/one source |
 | Bedrock/AgentCore timeout | cancel attempt; retry once with same invocation/input ID if no result | one automatic worker retry; replay result record | no partial agent output; op fails after retry | `agent.timeout`; 504-equivalent operation error |
 | AgentCore unavailable | same as transient dependency; backoff within worker budget | one retry, then manual command replay same key | operation FAILED, domain unchanged | `AGENTCORE_UNAVAILABLE`; retry banner |
+| runtime exceeds its own budget | the runtime cancels the in-flight model call at `RUNTIME_BUDGET_SECONDS` and answers with a typed runtime error | the application's one licensed retry still applies | no partial agent output | runtime timeout code; the caller never sees a hung invocation |
+| storage failure part-way through a frozen apply plan | remaining steps stay pending; `RUNNING→PENDING` | redelivery resumes at the first incomplete step; **zero** model calls | committed steps stand; progress record is authoritative | `operation.resume.scheduled`; operation polls as `PENDING` again |
+| case changed externally between two apply steps | the next step's expected version no longer matches the frozen plan | not resumable; never re-planned under the old invocation | committed steps stand and remain valid | `PARTIAL_APPLY_CONFLICT`; operation `FAILED` |
+| a job handed to the wrong worker | the worker binds kind, namespace, operation, actor hash, request hash, the operation's own `monitor_invocation_id`, and the digest of its `monitor_locator_hash` before claiming | never claimed, never invoked, never mutated | operation untouched | `worker.job.mismatch` |
+| a Monitor apply whose finalization write fails | finalization is the last step of the plan, so the failure is an interruption | `RUNNING→PENDING`; redelivery finishes one step with zero model calls | data steps stay committed | `operation.resume.scheduled` |
+| a `SUCCEEDED` transition refused or its response lost | the durable successful invocation record already exists, so the status write is pure transcription | strong reload; conditionally transition to `SUCCEEDED`, fresh claim or stale | never aged into `FAILED` | `operation.resumed` |
+| batch with no attributable message | frozen projection is empty of attributable messages; no model call | deterministic; a redelivery reaches the same conclusion | no case, report, fact, or signal | operation `SUCCEEDED` as a no-op with `NO_ATTRIBUTABLE_MESSAGES` |
+| projection integrity failure (e.g. an undescribable attachment) | translated to a closed typed application error before any model call | not retryable | domain unchanged | operation `FAILED` with a safe code; never a stranded `RUNNING` |
 | invalid agent JSON/schema | reject entire output before semantic use | not automatically retryable | domain unchanged; invocation failure record | `agent.contract.denied`; 502 operation result |
 | hallucinated nonexistent fact/evidence ID | semantic validator rejects entire agent output | not retryable without new invocation/prompt fix | domain unchanged | contract violation with ID hash only |
 | agent cites fact from another case | deny whole output as cross-case security event | never skip/retry automatically | domain unchanged | `cross_case.denied`; generic failure to UI |

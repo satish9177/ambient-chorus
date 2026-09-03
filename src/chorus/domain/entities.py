@@ -607,6 +607,22 @@ class AuditEvent:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ApplicationOperation:
+    """Durable status for one asynchronous command, plus the handover it authorizes.
+
+    ``monitor_invocation_id`` and ``monitor_locator_hash`` are the authoritative Monitor
+    handover identity. They exist because a worker delivery is data on a queue and data on a
+    queue can be wrong: without them the first delivery for an operation that had written
+    nothing yet had nothing to disagree with, so *any* invocation identity and *any* subset of
+    message locators would have been accepted on trust. They are written when the operation is
+    created -- before the job is dispatched and before the first model call -- so the durable
+    operation, not the delivery, is what says which invocation and which exact new-message set
+    this run is authorized to use.
+
+    They carry identifiers and a digest only, never a locator list and never message content.
+    They are immutable for the operation's lifetime: every transition copies them forward, and
+    nothing in the system rebinds an operation to a second invocation.
+    """
+
     operation_id: OperationId
     kind: ApplicationOperationKind
     namespace: Namespace
@@ -620,6 +636,8 @@ class ApplicationOperation:
     version: int
     created_at: datetime
     updated_at: datetime
+    monitor_invocation_id: UUID | None = None
+    monitor_locator_hash: Sha256Digest | None = None
     schema_version: str = "application-operation/v1"
 
     def __post_init__(self) -> None:
@@ -628,3 +646,8 @@ class ApplicationOperation:
             raise ValueError("expires_at_epoch cannot be negative")
         _positive_version(self.version)
         _timestamps(self.created_at, self.updated_at)
+        bound = (self.monitor_invocation_id is None, self.monitor_locator_hash is None)
+        if len(set(bound)) != 1:
+            raise ValueError("a Monitor handover binds an invocation and a locator hash together")
+        if self.kind is not ApplicationOperationKind.MONITOR and self.monitor_invocation_id:
+            raise ValueError("only a MONITOR operation carries a Monitor handover identity")

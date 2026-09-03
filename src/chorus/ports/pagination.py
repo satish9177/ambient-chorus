@@ -16,6 +16,7 @@ class QueryBinding(StrEnum):
     """Closed set of paginated access patterns a cursor may be replayed against."""
 
     CORE_COMMUNITY_FEED = "CORE_COMMUNITY_FEED"
+    CORE_COMMUNITY_FEED_SIGNALS = "CORE_COMMUNITY_FEED_SIGNALS"
     CORE_CASE_FACTS = "CORE_CASE_FACTS"
     CORE_CASE_REPORTS = "CORE_CASE_REPORTS"
     CORE_CASE_ASSESSMENTS = "CORE_CASE_ASSESSMENTS"

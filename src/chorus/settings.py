@@ -65,7 +65,16 @@ class Settings(BaseSettings):
     monitor_model_profile_arn: str | None = None
     investigator_model_profile_arn: str | None = None
     action_model_profile_arn: str | None = None
-    agent_timeout_seconds: int = Field(default=30, ge=1, le=120)
+    agent_timeout_seconds: int = Field(default=90, ge=1, le=300)
+    """The outermost rung of the agent timeout hierarchy.
+
+    It bounds how long the application waits on one AgentCore invocation, and it must exceed
+    the runtime's own budget, which must exceed the model read timeout. The ordering is the
+    invariant, not the numbers: if the application gave up first, it would launch its one
+    licensed retry while the first runtime was still running, and two runtimes would be
+    reading the same private batch at once. A test asserts the ordering against the values the
+    runtime artifact actually declares.
+    """
 
     sender_function_arn: str | None = None
     compiler_function_arn: str | None = None
