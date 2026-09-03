@@ -38,6 +38,17 @@ class DomainError(Exception):
         return f"{type(self).__name__}(code={self.code.value!r}, entity_ref={self.entity_ref!r})"
 
 
+class ValidationError(DomainError):
+    """A command or boundary value violates a closed domain invariant.
+
+    It carries an opaque reference and never the rejected value, so a malformed ambient
+    message cannot smuggle its own text into an error string, a log line, or an API response.
+    """
+
+    def __init__(self, entity_ref: str | None = None) -> None:
+        super().__init__(DomainErrorCode.VALIDATION_ERROR, entity_ref)
+
+
 class StateTransitionError(DomainError):
     """An illegal edge or unsatisfied deterministic transition guard."""
 

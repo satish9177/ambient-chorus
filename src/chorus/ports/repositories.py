@@ -46,6 +46,7 @@ from chorus.domain.ids import (
     ExecutionId,
     FactId,
     MandateId,
+    MessageId,
     OperationId,
     ReportId,
     Sha256Digest,
@@ -67,15 +68,26 @@ from chorus.ports.records import (
     CurrentActionPointer,
     CurrentViewPointer,
     FactMandateAssociation,
+    FeedSignalProjection,
     MandatePointerExpectation,
     MessageFeedEntry,
+    MonitorApplyProgress,
+    MonitorSnapshotChunk,
+    MonitorSnapshotKind,
+    MonitorSnapshotManifest,
     SendFence,
     StoredCurrentMandatePointer,
     StoredShareableView,
     ViewHistoryLocator,
     ViewPointerExpectation,
 )
-from chorus.ports.scopes import ActionScope, CaseScope, CommunityScope, NamespaceScope
+from chorus.ports.scopes import (
+    ActionScope,
+    CaseScope,
+    CommunityScope,
+    NamespaceScope,
+    OperationScope,
+)
 from chorus.ports.storage import CheckItem, PutItem
 from chorus.ports.unit_of_work import CommitProof
 
@@ -97,9 +109,14 @@ class CoreRepositoryPort(Protocol):
         """Strongly read one ambient message by its time-ordered locator."""
 
     async def load_channel_lock(
-        self, scope: CommunityScope, *, adapter: str, channel_message_id: str
+        self, scope: CommunityScope, *, adapter: str, channel_message_id_sha256: Sha256Digest
     ) -> ChannelUniquenessLock | None:
-        """Strongly read the uniqueness lock that proves a channel message was ingested."""
+        """Strongly read the uniqueness lock that proves a channel message was ingested.
+
+        The lock is addressed by the *digest* of the channel identifier because user-supplied
+        text never enters a key. Callers hash once and pass the digest, so the port and the
+        key grammar cannot drift apart.
+        """
 
     async def load_operation(
         self, scope: NamespaceScope, operation_id: OperationId
@@ -161,6 +178,61 @@ class CoreRepositoryPort(Protocol):
     ) -> Page[CommunityMessage]:
         """Eventually read the ambient feed in canonical time order."""
 
+    async def read_recent_messages(
+        self, scope: CommunityScope, *, before: datetime, limit: int
+    ) -> tuple[CommunityMessage, ...]:
+        """Read the newest messages at or before an instant, newest first, bounded."""
+
+    async def read_feed_signals(
+        self, scope: CommunityScope, request: PageRequest
+    ) -> Page[FeedSignalProjection]:
+        """Eventually page discovered-pattern feed signals for one community."""
+
+    async def load_feed_signals(
+        self, scope: CommunityScope, message_ids: tuple[MessageId, ...]
+    ) -> dict[MessageId, FeedSignalProjection]:
+        """Strongly read the signals for exactly these messages, by direct key.
+
+        Strong because the Monitor apply gates read it: whether a message is already bound to
+        another case decides whether a whole answer is refused.
+        """
+
+    async def read_feed_signals_for_messages(
+        self, scope: CommunityScope, message_ids: tuple[MessageId, ...]
+    ) -> dict[MessageId, FeedSignalProjection]:
+        """Eventually read the signals for exactly these messages, for display only."""
+
+    async def load_monitor_progress(
+        self, scope: OperationScope, invocation_id: UUID
+    ) -> MonitorApplyProgress | None:
+        """Strongly read how far one Monitor apply has been committed."""
+
+    async def load_operation_agent_invocation(
+        self, scope: OperationScope, invocation_id: UUID
+    ) -> AgentInvocationResult | None:
+        """Strongly read the invocation record of a Monitor run that produced no case."""
+
+    async def load_operation_invocation_ids(self, scope: OperationScope) -> tuple[UUID, ...]:
+        """Strongly read which agent invocations this operation partition already records.
+
+        A bounded single-partition query, used by the operation worker to bind a delivered job
+        to the operation it names before anything is claimed.
+        """
+
+    async def load_monitor_snapshot_manifest(
+        self, scope: OperationScope, *, kind: MonitorSnapshotKind, invocation_id: UUID
+    ) -> MonitorSnapshotManifest | None:
+        """Strongly read the header of one immutable Monitor snapshot, or ``None``."""
+
+    async def load_monitor_snapshot_chunks(
+        self, scope: OperationScope, manifest: MonitorSnapshotManifest
+    ) -> tuple[MonitorSnapshotChunk, ...]:
+        """Strongly read exactly the chunks a manifest names, in manifest order.
+
+        A chunk the manifest names that is absent, foreign, or duplicated fails the whole
+        read rather than yielding a shorter snapshot.
+        """
+
     async def read_case_facts(self, scope: CaseScope, request: PageRequest) -> Page[Fact]:
         """Eventually page case facts for display."""
 
@@ -196,6 +268,39 @@ class CoreRepositoryPort(Protocol):
         self, scope: CommunityScope, lock: ChannelUniquenessLock
     ) -> PutItem: ...
 
+    def stage_create_feed_signal(
+        self, scope: CommunityScope, signal: FeedSignalProjection
+    ) -> PutItem: ...
+
+    def stage_update_feed_signal(
+        self, scope: CommunityScope, signal: FeedSignalProjection, *, expected_version: int
+    ) -> PutItem: ...
+
+    def stage_create_monitor_progress(
+        self, scope: OperationScope, progress: MonitorApplyProgress
+    ) -> PutItem: ...
+
+    def stage_update_monitor_progress(
+        self, scope: OperationScope, progress: MonitorApplyProgress, *, expected_version: int
+    ) -> PutItem: ...
+
+    def stage_create_monitor_snapshot_manifest(
+        self, scope: OperationScope, manifest: MonitorSnapshotManifest
+    ) -> PutItem: ...
+
+    def stage_create_monitor_snapshot_chunk(
+        self, scope: OperationScope, chunk: MonitorSnapshotChunk
+    ) -> PutItem: ...
+
+    def stage_append_operation_agent_invocation(
+        self, scope: OperationScope, result: AgentInvocationResult
+    ) -> PutItem: ...
+
+    async def record_operation_agent_invocation(
+        self, scope: OperationScope, result: AgentInvocationResult
+    ) -> None:
+        """Create the run's invocation record, treating an existing one as already written."""
+
     def stage_create_operation(
         self, scope: NamespaceScope, operation: ApplicationOperation
     ) -> PutItem: ...
@@ -203,6 +308,21 @@ class CoreRepositoryPort(Protocol):
     def stage_update_operation(
         self, scope: NamespaceScope, operation: ApplicationOperation, *, expected_version: int
     ) -> PutItem: ...
+
+    async def apply_operation_transition(
+        self,
+        scope: NamespaceScope,
+        operation: ApplicationOperation,
+        *,
+        expected_version: int,
+    ) -> None:
+        """Apply one guarded operation transition as a single conditional write.
+
+        Exposed as its own method rather than left to the caller's transaction because the
+        exclusivity of an operation claim depends on it: a transaction's client request token
+        makes two byte-identical claims at one instant both succeed, and a bare conditional
+        write does not.
+        """
 
     def stage_create_evidence_root(self, scope: CommunityScope, root: EvidenceRoot) -> PutItem: ...
 
@@ -420,3 +540,10 @@ class IdempotencyRepositoryPort(Protocol):
 
     def commit_proof(self, key: IdempotencyKey, *, request_hash: Sha256Digest) -> CommitProof:
         """Return the proof item a plan writes so an unknown outcome can be resolved."""
+
+    def completion_proof(self, record: IdempotencyRecord) -> CommitProof:
+        """Return the proof for a plan that *completes* this reserved record.
+
+        The record already exists, so presence cannot settle anything. The proof names the
+        version the completing write moves it to, which is what a resolution reads.
+        """

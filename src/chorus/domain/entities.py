@@ -46,6 +46,42 @@ class EvidenceStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+UNNAMED_ISSUE_TYPE = "OTHER"
+"""The issue type that records the absence of a name rather than a problem.
+
+Spelled here, in the domain, because a stored ``CommunityCase.issue_type`` is a plain string
+and the rule below has to read a case row exactly as it reads a fresh proposal. The agent
+contract's ``IssueType.OTHER`` is the wire spelling of this same value.
+"""
+
+
+def issue_type_names_a_subject(issue_type: str) -> bool:
+    """Whether this vocabulary word identifies *what* went wrong, and may therefore group.
+
+    This is the whole of the candidate-grouping discriminator, and it is deliberately the only
+    one (ADR-012). A candidate case is a merge -- the creation guard needs two reports before a
+    case exists at all -- so filing two reports under one case is a claim that they describe
+    one incident. Deterministic code can only prove that claim from a closed signal the input
+    already carries, and the issue type is the only closed signal that says anything about the
+    problem. ``LocationAreaCode`` is a four-member *area kind*
+    (``LOBBY``/``ELEVATOR_CAB``/``COMMON_AREA``/``BUILDING``), not a place identity, so it
+    cannot separate an elevator fault from a water-pressure complaint that share a building;
+    the proposed title and the similarity reasons are free text the model wrote itself, so
+    agreeing with them proves only that the model was consistent.
+
+    ``OTHER`` therefore does not group. Widening what intake may group is a *vocabulary*
+    change -- add a named member to the issue vocabulary -- reviewed once, in the open, rather
+    than inferred per answer from prose.
+
+    The comparison is case- and whitespace-insensitive so that no spelling of the unnamed type
+    can be the thing that grants grouping. The contract enum admits only the canonical form, so
+    this cannot matter for an answer; it matters for a stored ``issue_type``, which is an
+    ordinary string, and there the fail-closed reading is the one to take.
+    """
+
+    return issue_type.strip().upper() != UNNAMED_ISSUE_TYPE
+
+
 class CaseState(StrEnum):
     CANDIDATE = "CANDIDATE"
     AWAITING_MANDATES = "AWAITING_MANDATES"
@@ -607,6 +643,22 @@ class AuditEvent:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ApplicationOperation:
+    """Durable status for one asynchronous command, plus the handover it authorizes.
+
+    ``monitor_invocation_id`` and ``monitor_locator_hash`` are the authoritative Monitor
+    handover identity. They exist because a worker delivery is data on a queue and data on a
+    queue can be wrong: without them the first delivery for an operation that had written
+    nothing yet had nothing to disagree with, so *any* invocation identity and *any* subset of
+    message locators would have been accepted on trust. They are written when the operation is
+    created -- before the job is dispatched and before the first model call -- so the durable
+    operation, not the delivery, is what says which invocation and which exact new-message set
+    this run is authorized to use.
+
+    They carry identifiers and a digest only, never a locator list and never message content.
+    They are immutable for the operation's lifetime: every transition copies them forward, and
+    nothing in the system rebinds an operation to a second invocation.
+    """
+
     operation_id: OperationId
     kind: ApplicationOperationKind
     namespace: Namespace
@@ -620,6 +672,8 @@ class ApplicationOperation:
     version: int
     created_at: datetime
     updated_at: datetime
+    monitor_invocation_id: UUID | None = None
+    monitor_locator_hash: Sha256Digest | None = None
     schema_version: str = "application-operation/v1"
 
     def __post_init__(self) -> None:
@@ -628,3 +682,8 @@ class ApplicationOperation:
             raise ValueError("expires_at_epoch cannot be negative")
         _positive_version(self.version)
         _timestamps(self.created_at, self.updated_at)
+        bound = (self.monitor_invocation_id is None, self.monitor_locator_hash is None)
+        if len(set(bound)) != 1:
+            raise ValueError("a Monitor handover binds an invocation and a locator hash together")
+        if self.kind is not ApplicationOperationKind.MONITOR and self.monitor_invocation_id:
+            raise ValueError("only a MONITOR operation carries a Monitor handover identity")

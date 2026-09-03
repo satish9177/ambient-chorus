@@ -1,0 +1,95 @@
+# Deployment manifest for the Monitor AgentCore direct-code runtime.
+#
+# This declares what the artifact *is*: which files it ships, which module answers an
+# invocation, which dependencies it needs, and which capabilities it must not have. It is read
+# by the artifact build and asserted by `tests/unit/tooling/test_monitor_boundaries.py`, so a
+# file that quietly acquires an import the artifact may not contain fails before deployment
+# rather than after it.
+#
+# The runtime resource itself is created in Phase 11, because the frozen network design puts it
+# in two isolated VPC subnets with no NAT route and that VPC belongs to the deployment stack.
+# See `server_binding` below: the one genuinely missing piece is the HTTP shim that hands a
+# request body to `handle`, and it is tracked rather than guessed at.
+
+[runtime]
+name = "chorus-monitor"
+agent_name = "MONITOR"
+prompt_version = "monitor/v2"
+python_version = "3.12"
+network_mode = "VPC"
+
+[entrypoint]
+module = "runtimes.monitor.entrypoint"
+callable = "handle"
+signature = "async (raw: bytes) -> bytes"
+# `handle` takes the raw request body and returns the raw response body. It reads no
+# environment beyond the two variables below, holds no state between calls, and constructs a
+# fresh agent per invocation, so a server shim around it is a transport adapter and nothing
+# more.
+
+[artifact]
+include = [
+  "runtimes/__init__.py",
+  "runtimes/monitor/__init__.py",
+  "runtimes/monitor/agent.py",
+  "runtimes/monitor/entrypoint.py",
+  "runtimes/monitor/prompt.py",
+  "src/chorus/contracts/__init__.py",
+  "src/chorus/contracts/common.py",
+  "src/chorus/contracts/monitor.py",
+  "src/chorus/domain/entities.py",
+  "src/chorus/domain/facts.py",
+  "src/chorus/domain/ids.py",
+  "src/chorus/domain/time.py",
+]
+# An explicit allowlist rather than a package glob. The Monitor's isolation is a property of
+# what is in the zip, and a glob would let a new module join the artifact by being written next
+# to one that belongs there.
+
+[dependencies]
+# The minimal subset the artifact actually imports. Exact resolved versions live in `uv.lock`;
+# the ranges here are the contract, not a second source of truth for versions.
+required = [
+  "strands-agents>=1.10,<2",
+  "pydantic>=2.9,<3",
+  "botocore>=1.35,<2",
+]
+
+[capabilities]
+tools = false
+memory = false
+gateway = false
+code_interpreter = false
+browser = false
+filesystem_persistence = false
+session_reuse = false
+outbound_internet = false
+# Every one of these is false because the frozen agent architecture says so, and because an
+# agent that reads private community text should be able to do exactly one thing with it:
+# answer in a strict schema.
+
+[limits]
+max_payload_bytes = 1048576
+max_output_tokens = 4000
+temperature = 0.0
+max_model_attempts = 1
+model_read_timeout_seconds = 45
+runtime_budget_seconds = 60
+# `max_model_attempts` is one because the application owns the single licensed agent retry.
+# The two timeouts are the inner two rungs of the hierarchy; the outer rung is the
+# application's `CHORUS_AGENT_TIMEOUT_SECONDS`, which must be larger than both.
+
+[phase_11]
+server_binding = "NOT_IMPLEMENTED"
+# The remaining gap, stated plainly rather than papered over.
+#
+# AgentCore invokes a runtime over HTTP, and binding `handle` to that transport is the job of
+# the official `bedrock-agentcore` server SDK. That package is not installed in this
+# environment, so its exact API cannot be verified here -- and a hand-written shim guessed at
+# from documentation would be a deployment artifact nobody has ever run, presented as if it
+# had been. The handler, its contract, its bounds, and its isolation are complete and tested;
+# what is missing is one adapter, and it lands with the runtime resource in Phase 11.
+live_evaluation = "NOT_RUN"
+# The four tests in `tests/evaluation/test_live_monitor.py` have never been run against a real
+# model. `tools/run_live_monitor_eval.py` is the manual command that runs them, and it fails
+# loudly rather than skipping when its prerequisites are absent.

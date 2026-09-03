@@ -137,12 +137,13 @@ def test_each_table_is_tagged_with_its_trust_zone() -> None:
     assert data_class("chorus-audit-development") == "AUDIT"
 
 
-def test_the_application_synthesizes_both_stacks() -> None:
+def test_the_application_synthesizes_every_declared_stack() -> None:
     assembly = build_app().synth()
 
     assert {stack.stack_name for stack in assembly.stacks} == {
         "AmbientChorusFoundation",
         "AmbientChorusData",
+        "AmbientChorusAgents",
     }
 
 

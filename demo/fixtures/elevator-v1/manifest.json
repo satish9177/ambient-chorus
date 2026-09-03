@@ -1,0 +1,82 @@
+{
+  "schema_version": "ambient-manifest/v1",
+  "seed_version": "elevator/v1",
+  "uuid5_namespace": "cb586bfc-8255-5baa-938c-4dc8c6078f41",
+  "uuid5_name_prefix": "ambient-chorus/elevator-v1/",
+  "logical_clock_start": "2030-01-14T09:00:00.000000Z",
+  "community": {
+    "community_id": "18669fad-d8e1-5995-99fd-296c1ac62a9a",
+    "name": "Example Community Building",
+    "timezone": "UTC",
+    "public_label": "Example Community Building"
+  },
+  "corpus": {
+    "file": "feed.json",
+    "message_count": 24,
+    "sha256": "sha256:6a501c33bdac1765fafe17b9f988a4cf06fed5935b95b9a44f1ab9c9621b337d"
+  },
+  "contributors": [
+    {
+      "pseudonym": "resident-a",
+      "display_name": "Resident A",
+      "is_resident": true,
+      "contributor_id": "c635eb97-d7a3-5400-8ef3-e0c5040e0e42"
+    },
+    {
+      "pseudonym": "resident-b",
+      "display_name": "Resident B",
+      "is_resident": true,
+      "contributor_id": "4b112227-4176-5cfb-bb9a-370d96f4a73a"
+    },
+    {
+      "pseudonym": "resident-c",
+      "display_name": "Resident C",
+      "is_resident": true,
+      "contributor_id": "8e568a9e-a9c7-5da0-91f0-0e4ced842457"
+    },
+    {
+      "pseudonym": "resident-d",
+      "display_name": "Resident D",
+      "is_resident": true,
+      "contributor_id": "7eeb5e75-e955-5cdd-aca3-3afd1f4d5770"
+    },
+    {
+      "pseudonym": "attacker-fixture",
+      "display_name": "Unverified Notice Sender",
+      "is_resident": false,
+      "contributor_id": "a46a3abd-e8c4-59e3-83ff-f3493624aa40"
+    }
+  ],
+  "evidence": [
+    {
+      "fixture_id": "elevator-e42-photo",
+      "evidence_id": "d090b535-ad4e-5beb-895d-bde9b4f889c2",
+      "file": "evidence/elevator-e42.jpg",
+      "media_type": "image/jpeg",
+      "byte_length": 631,
+      "sha256": "sha256:25cf0f0ce42f8acd9ea6facc223f54105c7fd0cce63fb7bb5d83e6600100acbd",
+      "safe_caption": "A photograph of the lift control panel showing an error code.",
+      "ingested_with_feed": true
+    },
+    {
+      "fixture_id": "injection-notice",
+      "evidence_id": "69d3155d-c405-5c96-b6c3-2647f680c48b",
+      "file": "evidence/injection-notice.txt",
+      "media_type": "text/plain",
+      "byte_length": 414,
+      "sha256": "sha256:08b8ebb679988b526b0acf69d052336c1a97a54929292b9d7025752cbd16542a",
+      "safe_caption": null,
+      "ingested_with_feed": true
+    },
+    {
+      "fixture_id": "management-reply",
+      "evidence_id": "c26cf270-d3df-5b47-b432-443a69db933a",
+      "file": "evidence/management-reply.eml",
+      "media_type": "message/rfc822",
+      "byte_length": 227,
+      "sha256": "sha256:55e23d50b295ba016ada87bd2ea6220b981913f5b8d1324e32b72424b8741234",
+      "safe_caption": null,
+      "ingested_with_feed": false
+    }
+  ]
+}

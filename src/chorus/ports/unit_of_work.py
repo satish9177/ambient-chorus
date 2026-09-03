@@ -23,7 +23,12 @@ from chorus.ports.errors import (
     TransactionLimitExceededError,
     UnauditedMutationError,
 )
-from chorus.ports.idempotency import REQUEST_HASH_ATTRIBUTE
+from chorus.ports.idempotency import (
+    REQUEST_HASH_ATTRIBUTE,
+    STATUS_ATTRIBUTE,
+    VERSION_ATTRIBUTE,
+    IdempotencyStatus,
+)
 from chorus.ports.limits import TRANSACTION_MAX_OPERATIONS
 from chorus.ports.storage import (
     AllOf,
@@ -48,17 +53,35 @@ if TYPE_CHECKING:  # pragma: no cover - typing-only import
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CommitProof:
-    """The idempotency item whose presence proves this exact transaction committed.
+    """The idempotency item whose state proves this exact transaction committed.
 
     The proof binds four things at once: the physical table and the exact partition/sort key
     the item lives at (all three carried by ``key``), the request hash the item records, and
-    -- enforced by the plan -- create-only write semantics. A proof that does not match the
-    item its own plan persists would let a *different* command's record be read as evidence
-    that this one committed, so the plan refuses to be built at all.
+    -- enforced by the plan -- the write semantics that make the item evidence at all. A proof
+    that does not match the item its own plan persists would let a *different* command's
+    record be read as evidence that this one committed, so the plan refuses to be built at all.
+
+    ``completed_version`` distinguishes the two shapes a proof can take.
+
+    * ``None`` -- the ordinary case. The plan *creates* the record, so the item's presence is
+      the evidence and the plan must contain a create-only write at that exact key.
+    * set -- the plan *completes a reservation* that was already durable before it ran, so
+      presence proves nothing. The plan must contain a version-guarded replace at that key
+      which moves the record to ``COMPLETED`` at exactly this version, and resolution reads
+      the stored version rather than merely observing that an item is there.
+
+    The second shape exists because command idempotency for a route has to be claimable
+    *before* the route mutates anything, and a claim that cannot later be completed atomically
+    with the thing it stands for is not a claim at all.
     """
 
     key: ItemKey
     request_hash: Sha256Digest
+    completed_version: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.completed_version is not None and self.completed_version < 2:
+            raise ValueError("a completion proof names the version a reservation moves to")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -103,6 +126,9 @@ class TransactionPlan:
         proof = self.commit_proof
         if proof is None:
             return
+        if proof.completed_version is not None:
+            self._validate_completion_proof(proof)
+            return
         writes = tuple(
             operation
             for operation in self.operations
@@ -115,6 +141,37 @@ class TransactionPlan:
         for operation in writes:
             if operation.item.get(REQUEST_HASH_ATTRIBUTE) != proof.request_hash.value:
                 raise ValueError("commit proof must bind the request hash its plan persists")
+
+    def _validate_completion_proof(self, proof: CommitProof) -> None:
+        """Reject a completion proof this plan does not actually move to ``COMPLETED``.
+
+        Presence is not evidence here -- the reserved record already existed -- so the plan has
+        to be the thing that advances it. Every element is checked locally: the write is guarded
+        on the predecessor version, it lands the exact version the proof names, it records the
+        proof's request hash, and it leaves the record ``COMPLETED``. A plan that satisfies only
+        some of those would let a reservation somebody else completed be read as evidence for
+        this transaction.
+        """
+
+        version = proof.completed_version
+        assert version is not None
+        expected = AttributeEqualsNumber(name=VERSION_ATTRIBUTE, value=version - 1)
+        writes = tuple(
+            operation
+            for operation in self.operations
+            if isinstance(operation, PutItem)
+            and operation.key == proof.key
+            and operation.condition == expected
+        )
+        if not writes:
+            raise ValueError("completion proof must name the guarded write inside this plan")
+        for operation in writes:
+            if operation.item.get(REQUEST_HASH_ATTRIBUTE) != proof.request_hash.value:
+                raise ValueError("commit proof must bind the request hash its plan persists")
+            if operation.item.get(VERSION_ATTRIBUTE) != version:
+                raise ValueError("completion proof must bind the version its plan persists")
+            if operation.item.get(STATUS_ATTRIBUTE) != IdempotencyStatus.COMPLETED.value:
+                raise ValueError("completion proof must name a write that completes the record")
 
     def _audit_writes(self) -> tuple[WriteOperation, ...]:
         return tuple(

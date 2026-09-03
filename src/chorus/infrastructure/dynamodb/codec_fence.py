@@ -8,7 +8,9 @@ from uuid import UUID
 from chorus.domain.ids import (
     ActionId,
     ApprovalId,
+    CommunityId,
     ExecutionId,
+    OperationId,
     ViewId,
 )
 from chorus.infrastructure.dynamodb import keys
@@ -31,12 +33,12 @@ from chorus.ports.records import (
     AgentName,
     SendFence,
 )
-from chorus.ports.scopes import CaseScope
+from chorus.ports.scopes import CaseScope, OperationScope
 from chorus.ports.storage import ItemKey, StoredItem, StoredValue, TableName
 
 _CORE: Final = TableName.CORE
 
-AGENT_INVOCATION_SCHEMA_VERSIONS: Final = frozenset({"agent-invocation-result/v1"})
+AGENT_INVOCATION_SCHEMA_VERSIONS: Final = frozenset({"agent-invocation-result/v2"})
 SEND_FENCE_SCHEMA_VERSIONS: Final = frozenset({"send-fence/v1"})
 
 ATTR_FENCE_EXECUTION_ID: Final = "execution_id"
@@ -83,6 +85,41 @@ def agent_invocation_key(scope: CaseScope, invocation_id: UUID) -> ItemKey:
     )
 
 
+def operation_agent_invocation_key(scope: OperationScope, invocation_id: UUID) -> ItemKey:
+    """Address the invocation record of a Monitor run that produced no case.
+
+    The frozen Core mapping puts a case-scoped invocation record in its case partition, which
+    presumes a case. A Monitor batch of ordinary chatter has none, and the run still has to
+    leave a durable record -- so the unlinked form lives under the operation that ran it,
+    under the same sort-key grammar.
+    """
+
+    return ItemKey(
+        table=_CORE,
+        partition_key=keys.operation_partition(scope.namespace, scope.operation_id),
+        sort_key=keys.agent_invocation_sort_key(invocation_id),
+    )
+
+
+def _invocation_body(result: AgentInvocationResult) -> dict[str, StoredValue]:
+    return {
+        "invocation_id": str(result.invocation_id),
+        "invocation_community_id": identifier(result.community_id),
+        "agent_name": result.agent_name.value,
+        "prompt_version": result.prompt_version,
+        "input_hash": result.input_hash.value,
+        "output_hash": None if result.output_hash is None else result.output_hash.value,
+        "model_profile_hash": (
+            None if result.model_profile_hash is None else result.model_profile_hash.value
+        ),
+        "outcome": result.outcome.value,
+        "failure_code": result.failure_code,
+        "operation_id": None if result.operation_id is None else identifier(result.operation_id),
+        "result_refs": encode_entity_refs(result.result_refs),
+        "created_at": instant(result.created_at),
+    }
+
+
 def encode_agent_invocation(scope: CaseScope, result: AgentInvocationResult) -> StoredItem:
     key = agent_invocation_key(scope, result.invocation_id)
     item: dict[str, StoredValue] = envelope(
@@ -93,19 +130,56 @@ def encode_agent_invocation(scope: CaseScope, result: AgentInvocationResult) -> 
         community_id=result.community_id,
         case_id=result.case_id,
     )
-    item.update(
-        {
-            "invocation_id": str(result.invocation_id),
-            "agent_name": result.agent_name.value,
-            "prompt_version": result.prompt_version,
-            "input_hash": result.input_hash.value,
-            "output_hash": None if result.output_hash is None else result.output_hash.value,
-            "outcome": result.outcome.value,
-            "result_refs": encode_entity_refs(result.result_refs),
-            "created_at": instant(result.created_at),
-        }
-    )
+    item.update(_invocation_body(result))
     return item
+
+
+def encode_operation_agent_invocation(
+    scope: OperationScope, result: AgentInvocationResult
+) -> StoredItem:
+    key = operation_agent_invocation_key(scope, result.invocation_id)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.AGENT_INVOCATION_RESULT,
+        schema_version=result.schema_version,
+        key=key,
+        namespace=result.namespace,
+        # The operation partition is namespace-scoped, so the envelope names no community and
+        # no case; the community is carried in the body and revalidated after decoding.
+        community_id=None,
+        case_id=None,
+    )
+    item.update(_invocation_body(result))
+    return item
+
+
+def _decode_invocation(
+    reader: ItemReader,
+    scope: DecodedScope,
+    schema_version: str,
+    *,
+    case_id: object,
+) -> AgentInvocationResult:
+    result = build_entity(
+        reader.entity_ref,
+        AgentInvocationResult,
+        invocation_id=reader.uuid("invocation_id"),
+        namespace=scope.namespace,
+        community_id=reader.identifier("invocation_community_id", CommunityId),
+        case_id=case_id,
+        agent_name=reader.enum("agent_name", AgentName),
+        prompt_version=reader.text("prompt_version"),
+        input_hash=reader.digest("input_hash"),
+        output_hash=reader.optional_digest("output_hash"),
+        model_profile_hash=reader.optional_digest("model_profile_hash"),
+        outcome=reader.enum("outcome", AgentInvocationOutcome),
+        failure_code=reader.optional_text("failure_code"),
+        operation_id=reader.optional_identifier("operation_id", OperationId),
+        result_refs=decode_entity_refs(reader, "result_refs"),
+        created_at=reader.instant("created_at"),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return result
 
 
 def decode_agent_invocation(item: StoredItem) -> tuple[DecodedScope, AgentInvocationResult]:
@@ -117,24 +191,21 @@ def decode_agent_invocation(item: StoredItem) -> tuple[DecodedScope, AgentInvoca
     )
     if scope.community_id is None or scope.case_id is None:
         raise build_entity_error(reader, "scope")
-    result = build_entity(
-        reader.entity_ref,
-        AgentInvocationResult,
-        invocation_id=reader.uuid("invocation_id"),
-        namespace=scope.namespace,
-        community_id=scope.community_id,
-        case_id=scope.case_id,
-        agent_name=reader.enum("agent_name", AgentName),
-        prompt_version=reader.text("prompt_version"),
-        input_hash=reader.digest("input_hash"),
-        output_hash=reader.optional_digest("output_hash"),
-        outcome=reader.enum("outcome", AgentInvocationOutcome),
-        result_refs=decode_entity_refs(reader, "result_refs"),
-        created_at=reader.instant("created_at"),
-        schema_version=schema_version,
+    return scope, _decode_invocation(reader, scope, schema_version, case_id=scope.case_id)
+
+
+def decode_operation_agent_invocation(
+    item: StoredItem,
+) -> tuple[DecodedScope, AgentInvocationResult]:
+    reader = ItemReader(item, entity_ref="AGENT_INVOCATION_RESULT")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.AGENT_INVOCATION_RESULT,
+        accepted_schema_versions=AGENT_INVOCATION_SCHEMA_VERSIONS,
     )
-    reader.finish()
-    return scope, result
+    if scope.community_id is not None or scope.case_id is not None:
+        raise build_entity_error(reader, "scope")
+    return scope, _decode_invocation(reader, scope, schema_version, case_id=None)
 
 
 def send_fence_key(scope: CaseScope) -> ItemKey:

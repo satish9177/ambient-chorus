@@ -44,6 +44,7 @@ There is no privacy-threshold exception in V1. The phrase “unless an explicit 
 
 - All instants are timezone-aware UTC and serialize as RFC 3339 with exactly six fractional digits and `Z`.
 - Entity IDs are UUIDv4 in normal operation and namespace-scoped UUIDv5 in fixed demo fixtures. IDs serialize as lowercase hyphenated strings.
+- One explicit exception exists, accepted in [ADR-011](../adr/ADR-011-monitor-deterministic-identities.md): **Monitor-derived replay identities** — a Monitor-derived `Report`, a candidate `CommunityCase`, an `EvidenceRoot`, a Monitor fact slot, and the Monitor apply progress and audit rows that replay must re-address — are namespace- and community-scoped UUIDv5 derived from canonical authoritative input. Every other entity, including `ActionProposal`, `Approval`, `ActionExecution`, `Commitment`, `InvestigationAssessment`, `ApplicationOperation`, and every ordinary `AuditEvent`, stays UUIDv4. No agent-authored text — a summary, title, confidence, reason, client reference, or model-chosen typed value — may enter a replay identity. No hash or identity algorithm changes without a superseding ADR.
 - Persisted versions are positive monotonically increasing integers. Mutation is a conditional `version = expected_version` update producing `version + 1`; immutable artifacts never update.
 - Sets serialize as sorted arrays; maps have string keys; floating-point values are forbidden in authorization artifacts.
 - Canonical JSON uses RFC 8785 JSON Canonicalization Scheme and UTF-8. Hashes are `sha256:` plus 64 lowercase hex characters.

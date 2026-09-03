@@ -31,11 +31,23 @@ import infrastructure -- has to verify that the proof it carries matches the req
 plan actually persists.
 """
 
+STATUS_ATTRIBUTE: Final = "status"
+VERSION_ATTRIBUTE: Final = "version"
+"""The two further attributes a *completion* proof binds to.
+
+A commit proof is ordinarily the create-only record its own transaction writes, so the item's
+mere presence settles the outcome. A transaction that instead **completes a reservation** has
+no such luxury: the record was already there, in ``IN_PROGRESS``, before the transaction ran.
+Its proof therefore names the exact status and version the completing write moves the record
+to, and presence alone proves nothing.
+"""
+
 
 class IdempotentCommand(StrEnum):
     """Closed set of replayable commands; the value is an uppercase key segment."""
 
     INGEST_MESSAGE = "INGEST_MESSAGE"
+    START_MONITOR_OPERATION = "START_MONITOR_OPERATION"
     APPLY_MONITOR_OUTPUT = "APPLY_MONITOR_OUTPUT"
     DECIDE_MANDATE = "DECIDE_MANDATE"
     APPLY_INVESTIGATION = "APPLY_INVESTIGATION"

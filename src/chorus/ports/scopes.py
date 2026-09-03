@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from chorus.domain.ids import ActionId, CaseId, CommunityId, Namespace
+from chorus.domain.ids import ActionId, CaseId, CommunityId, Namespace, OperationId
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -64,3 +64,21 @@ class ActionScope:
             community_id=self.community_id,
             case_id=self.case_id,
         )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OperationScope:
+    """Application-operation partition boundary inside one namespace.
+
+    A Monitor run may have no case at all, so the durable records that describe *the run*
+    rather than *a case* -- its apply progress and, when unlinked, its invocation outcome --
+    live beside the operation they belong to. The scope exists so those calls are addressed
+    as deliberately as a case-scoped one, rather than by assembling a partition key inline.
+    """
+
+    namespace: Namespace
+    operation_id: OperationId
+
+    @property
+    def namespace_scope(self) -> NamespaceScope:
+        return NamespaceScope(namespace=self.namespace)

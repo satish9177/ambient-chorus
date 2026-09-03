@@ -5,7 +5,7 @@ from __future__ import annotations
 from aws_cdk import App
 
 from infra.cdk.config import CdkBuildConfig
-from infra.cdk.stacks import ChorusDataStack, ChorusFoundationStack
+from infra.cdk.stacks import ChorusAgentStack, ChorusDataStack, ChorusFoundationStack
 
 
 def build_app() -> App:
@@ -26,6 +26,11 @@ def build_app() -> App:
     ChorusDataStack(
         app,
         "AmbientChorusData",
+        config=config,
+    )
+    ChorusAgentStack(
+        app,
+        "AmbientChorusAgents",
         config=config,
     )
     return app

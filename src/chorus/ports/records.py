@@ -11,6 +11,7 @@ privacy package; a parity test asserts the two field sets never drift.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -18,6 +19,7 @@ from uuid import UUID
 
 from chorus.domain.entities import (
     ActionProposalStatus,
+    CaseState,
     DestinationKind,
     DisclosureScope,
     EvidenceStatus,
@@ -38,13 +40,18 @@ from chorus.domain.ids import (
     MandateId,
     MessageId,
     Namespace,
+    OperationId,
     SafeEvidenceRefId,
+    SensitiveStr,
     Sha256Digest,
     ViewId,
 )
 from chorus.domain.mandates import CurrentMandatePointer
 from chorus.domain.time import epoch_micros, epoch_seconds_ceiling, require_utc
 from chorus.ports.idempotency import EntityRef
+
+_SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+"""Closed shape every safe code persisted by these records must satisfy."""
 
 
 class AgentName(StrEnum):
@@ -87,13 +94,95 @@ class ChannelUniquenessLock:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class FeedSignalProjection:
+    """The ambient feed's view of one message that a validated agent proposal linked.
+
+    This is a **mutable display projection**, written inside the same bounded transaction that
+    creates the durable reports, facts, and candidate case, so the feed can never show a
+    signal for state that was not committed.
+
+    What it is not is as load-bearing as what it is. It is not an authorization artifact, not
+    the ownership boundary for a report, not the authority that decides whether a message may
+    join a case, and not a permanent one-message-one-case lock. An earlier create-only version
+    of this row made the *storage* row the linkage decision: once written, otherwise-valid
+    domain state at that address became permanently unreachable, and a refreshed label or a
+    later legitimate correction had nowhere to go.
+
+    So it carries a ``version`` and is replaced by a guarded update. Whether Phase-3 Monitor
+    may relink an already-linked report is decided *before* any write is staged, by a domain
+    rule in the apply service -- and the answer there is no. A later correction or split use
+    case, which does have that authority, updates this row like any other display projection.
+
+    It exists at all because the frozen access patterns forbid a scan and require no GSI.
+    Without a signal row in the community partition, resolving "which of these feed rows
+    belong to a discovered pattern" would need exactly the message-to-case index V1 refuses
+    to build.
+    """
+
+    namespace: Namespace
+    community_id: CommunityId
+    message_id: MessageId
+    case_id: CaseId
+    case_version: int
+    label: str
+    related_message_count: int
+    case_state: CaseState
+    detected_at: datetime
+    version: int = 1
+    schema_version: str = "feed-signal-projection/v2"
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.label) <= 160:
+            raise ValueError("feed signal label length is invalid")
+        if self.case_version < 1:
+            raise ValueError("case version must be positive")
+        if self.version < 1:
+            raise ValueError("version must be positive")
+        if self.related_message_count < 1:
+            raise ValueError("a signal always relates at least its own message")
+        require_utc(self.detected_at)
+
+    def same_display_state(self, other: FeedSignalProjection) -> bool:
+        """True when two projections describe the identical display state.
+
+        Compared field by field rather than by equality, because three fields are bookkeeping
+        rather than display. ``version`` and ``detected_at`` belong to the row; ``case_version``
+        records which version of the case the signal was written against, and the feed never
+        shows it. Including any of them would make an exact replay look like a change worth
+        another write, and would make every case version bump rewrite every signal it has.
+        """
+
+        return (
+            self.namespace == other.namespace
+            and self.community_id == other.community_id
+            and self.message_id == other.message_id
+            and self.case_id == other.case_id
+            and self.label == other.label
+            and self.related_message_count == other.related_message_count
+            and self.case_state is other.case_state
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class AgentInvocationResult:
-    """Durable agent invocation record holding hashes and result refs, never content."""
+    """Durable agent invocation record holding hashes and result refs, never content.
+
+    ``case_id`` is optional because a Monitor run need not produce a case: a batch of
+    ordinary neighbourly chatter, or a proposal that did not meet the candidate guard, still
+    happened and still has to leave a durable record of what was asked and what came back.
+    A case-scoped record lives in its case partition; an unlinked one lives under the
+    application operation that ran it.
+
+    ``failure_code`` is a safe closed code and never a message. The record holds hashes,
+    versions, and codes -- never raw agent output, prompt text, completion text, or a
+    provider response body -- so it can be read freely without becoming a second corpus of
+    the private text the invocation was about.
+    """
 
     invocation_id: UUID
     namespace: Namespace
     community_id: CommunityId
-    case_id: CaseId
+    case_id: CaseId | None
     agent_name: AgentName
     prompt_version: str
     input_hash: Sha256Digest
@@ -101,7 +190,10 @@ class AgentInvocationResult:
     outcome: AgentInvocationOutcome
     result_refs: tuple[EntityRef, ...]
     created_at: datetime
-    schema_version: str = "agent-invocation-result/v1"
+    model_profile_hash: Sha256Digest | None = None
+    failure_code: str | None = None
+    operation_id: OperationId | None = None
+    schema_version: str = "agent-invocation-result/v2"
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.prompt_version) <= 64:
@@ -109,9 +201,195 @@ class AgentInvocationResult:
         require_utc(self.created_at)
         if self.outcome is AgentInvocationOutcome.SUCCEEDED and self.output_hash is None:
             raise ValueError("a succeeded invocation must record an output hash")
+        if self.outcome is AgentInvocationOutcome.SUCCEEDED and self.failure_code is not None:
+            raise ValueError("a succeeded invocation cannot carry a failure code")
+        if self.outcome is AgentInvocationOutcome.FAILED and self.failure_code is None:
+            raise ValueError("a failed invocation must record a safe failure code")
+        if self.failure_code is not None and not _SAFE_CODE.fullmatch(self.failure_code):
+            raise ValueError("failure code is not a safe closed code")
+        if self.case_id is None and self.operation_id is None:
+            raise ValueError("an unlinked invocation record must name its operation")
         refs = tuple((ref.entity_type, ref.entity_id) for ref in self.result_refs)
         if len(set(refs)) != len(refs):
             raise ValueError("result references must be unique")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MonitorApplyProgress:
+    """How far one validated Monitor answer has been applied.
+
+    The frozen persistence design applies a validated Monitor answer as a sequence of bounded
+    transactions rather than one large one, because at the contract maxima a single answer
+    implies far more writes than DynamoDB permits in one transaction. That immediately raises
+    the question this record answers: if delivery repeats after step three of five, how does
+    the second attempt know not to write the first three again?
+
+    It knows because this row advances *inside* each step's own transaction. Step ``k``
+    updates ``completed_steps`` to ``k`` under ``version = k - 1``, so the row and the writes
+    it describes commit together or not at all, and a resumed attempt reads one item to learn
+    exactly where to continue.
+
+    ``plan_hash`` binds the progress to the exact ordered plan it describes. A resumed attempt
+    whose plan hashes differently is not a continuation of this one -- the world changed
+    underneath it -- so it must not skip steps on the strength of somebody else's progress.
+    """
+
+    invocation_id: UUID
+    operation_id: OperationId
+    namespace: Namespace
+    community_id: CommunityId
+    input_hash: Sha256Digest
+    output_hash: Sha256Digest
+    plan_hash: Sha256Digest
+    completed_steps: int
+    total_steps: int
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    schema_version: str = "monitor-apply-progress/v1"
+
+    def __post_init__(self) -> None:
+        if self.total_steps < 1:
+            raise ValueError("a progress record describes at least one step")
+        if not 0 <= self.completed_steps <= self.total_steps:
+            raise ValueError("completed steps must lie within the plan")
+        if self.version < 1:
+            raise ValueError("version must be positive")
+        require_utc(self.created_at)
+        require_utc(self.updated_at)
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at precedes created_at")
+
+    @property
+    def is_complete(self) -> bool:
+        return self.completed_steps == self.total_steps
+
+
+class MonitorSnapshotKind(StrEnum):
+    """Which of a Monitor invocation's two frozen stages a snapshot holds."""
+
+    MONITOR_INPUT = "MONITOR_INPUT"
+    MONITOR_PLAN = "MONITOR_PLAN"
+
+
+MAX_SNAPSHOT_CHUNK_BYTES = 300_000
+"""How many canonical UTF-8 bytes one snapshot chunk may carry.
+
+Comfortably below DynamoDB's 400 KiB item limit, with room left for the envelope, the key,
+and the rest of the item's attributes. It is a fixed safe maximum rather than a tuned one:
+the point is that no legitimate snapshot can ever produce an item that storage will refuse.
+"""
+
+MAX_SNAPSHOT_BYTES = 1_048_576
+"""The frozen 1 MiB application payload bound, which a whole snapshot stays within."""
+
+MAX_SNAPSHOT_CHUNKS = 8
+"""A hard chunk-count bound, so a manifest can never describe an unbounded read."""
+
+SNAPSHOT_CHUNK_INDEX_WIDTH = 6
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MonitorSnapshotManifest:
+    """The immutable header of one chunked Monitor snapshot.
+
+    A Monitor operation has three durable stages -- frozen input, validated apply plan, and
+    apply progress -- and the first two are snapshots so that a partially applied operation
+    is *finishable* rather than merely diagnosable. Same ``invocation_id`` therefore always
+    means the same ``MonitorInput``, and once the plan snapshot exists the model invocation
+    is permanently complete.
+
+    The manifest carries the digest of the whole canonical byte string and the exact number
+    of chunks it was cut into, so reassembly is checkable rather than hopeful: a missing
+    chunk, a wrong count, or a digest mismatch is an integrity failure, not a shorter
+    snapshot. It never carries the content itself.
+    """
+
+    invocation_id: UUID
+    operation_id: OperationId
+    namespace: Namespace
+    community_id: CommunityId
+    kind: MonitorSnapshotKind
+    content_sha256: Sha256Digest
+    byte_length: int
+    chunk_count: int
+    input_hash: Sha256Digest
+    prompt_version: str
+    created_at: datetime
+    expires_at_epoch: int
+    output_hash: Sha256Digest | None = None
+    plan_hash: Sha256Digest | None = None
+    model_profile_hash: Sha256Digest | None = None
+    provenance_hash: Sha256Digest | None = None
+    """The single digest that chains a validated-plan snapshot to everything that identifies it.
+
+    ``content_sha256`` covers the reassembled document and nothing else, so every scalar the
+    manifest restates beside it -- operation, invocation, input hash, output hash, plan hash,
+    prompt version, model profile -- would otherwise be an unverified duplicate of a field
+    inside that document. Two copies of a value are not a check; they agree by construction
+    until something rewrites one of them.
+
+    ``provenance_hash`` is what turns the duplication into a chain: it is the digest of exactly
+    those seven values, written on the manifest and recomputed on load from the document. To
+    move any one of them, all of manifest scalar, document field, document digest, and this
+    hash have to move together -- and the loader still independently recomputes the output hash
+    from the stored answer and the plan hash from the stored steps, so a consistent set of
+    metadata edits describing content that was not edited fails anyway.
+    """
+    schema_version: str = "monitor-snapshot-manifest/v1"
+
+    def __post_init__(self) -> None:
+        require_utc(self.created_at)
+        if not 1 <= self.byte_length <= MAX_SNAPSHOT_BYTES:
+            raise ValueError("snapshot byte length is outside the frozen payload bound")
+        if not 1 <= self.chunk_count <= MAX_SNAPSHOT_CHUNKS:
+            raise ValueError("snapshot chunk count is outside the frozen bound")
+        if not 1 <= len(self.prompt_version) <= 64:
+            raise ValueError("prompt_version length is invalid")
+        if self.expires_at_epoch < 0:
+            raise ValueError("expires_at_epoch cannot be negative")
+        if self.kind is MonitorSnapshotKind.MONITOR_PLAN and (
+            self.output_hash is None
+            or self.plan_hash is None
+            or self.model_profile_hash is None
+            or self.provenance_hash is None
+        ):
+            raise ValueError("a validated-plan snapshot binds its whole provenance")
+        if self.kind is MonitorSnapshotKind.MONITOR_INPUT and (
+            self.output_hash is not None
+            or self.plan_hash is not None
+            or self.model_profile_hash is not None
+            or self.provenance_hash is not None
+        ):
+            raise ValueError("a frozen-input snapshot binds neither output nor plan")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MonitorSnapshotChunk:
+    """One immutable ordered slice of a snapshot's canonical UTF-8 bytes.
+
+    ``content`` is :class:`SensitiveStr` because a snapshot legitimately holds material
+    derived from private community text. It lives only in the private Core table, under the
+    operation partition, and no read path outside the Monitor use case addresses it.
+    """
+
+    invocation_id: UUID
+    operation_id: OperationId
+    namespace: Namespace
+    community_id: CommunityId
+    kind: MonitorSnapshotKind
+    index: int
+    content: SensitiveStr
+    expires_at_epoch: int
+    schema_version: str = "monitor-snapshot-chunk/v1"
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.index < MAX_SNAPSHOT_CHUNKS:
+            raise ValueError("snapshot chunk index is outside the frozen bound")
+        if len(self.content.reveal().encode("utf-8")) > MAX_SNAPSHOT_CHUNK_BYTES:
+            raise ValueError("snapshot chunk exceeds the frozen chunk bound")
+        if self.expires_at_epoch < 0:
+            raise ValueError("expires_at_epoch cannot be negative")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
