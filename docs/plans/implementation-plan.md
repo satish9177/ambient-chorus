@@ -66,7 +66,7 @@ This plan begins only after explicit approval. Each phase is a dependency gate; 
 
 **Tasks:** fixed fixtures/checksums; message uniqueness/content conflict; EvidenceRoot creation for initial items; Monitor input projection/delimiters/prompt v1; Strands structured output; schema and same-input ID/span validation; deterministic durable IDs; report/fact/candidate apply progress; async operation worker; feed signal projection; AgentCore runtime/CDK role.
 
-**Tests:** exact replay/conflict; noise and valid-pattern scenarios; malicious instruction has no authority; malformed/hallucinated Monitor output; timeout/retry invocation record; agent has no tools/data IAM; live synthetic eval gate.
+**Tests:** exact replay/conflict; noise and valid-pattern scenarios; malicious instruction has no authority; malformed/hallucinated Monitor output; timeout/retry invocation record; agent has no tools/data IAM; live synthetic eval gate. The Monitor output schema carries no disclosure-terms field and the pinned prompt version is `monitor/v3` ([ADR-014](../adr/ADR-014-monitor-proposes-no-disclosure-terms.md)); a runtime serving `monitor/v2` is refused by version rather than partially accepted.
 
 **Exit criteria:** from reset messages, live/fake Monitor produces a case candidate through validated contracts, unrelated messages remain noise, replay creates no duplicate reports, UI API can retrieve signal.
 
@@ -82,7 +82,9 @@ This plan begins only after explicit approval. Each phase is a dependency gate; 
 
 **Files/modules:** application mandate commands/queries, API DTO/routes, seed actor/demo access registry, mandate UI surface basic form may wait for Phase 10 but API contracts complete.
 
-**Tasks:** proposed mandates from validated Monitor suggestion plus deterministic allowed maximums; contributor ownership checks; fact/identity grants; adjustment validation; immutable version/current pointer/case bump/audit; expiration; send-fence conflict; readiness reconciliation; friendly safe wording separate from raw fact.
+**Tasks:** proposed mandates derived from the case's own validated facts, each grant set to the deterministic least-permissive default for that fact and capped by the policy/v1 allowed maximum, created by the candidate-acceptance command in [ADR-013](../adr/ADR-013-mandate-proposal-endpoint.md); contributor ownership checks; fact/identity grants; adjustment validation; immutable version/current pointer/case bump/audit; expiration; send-fence conflict; readiness reconciliation; friendly safe wording separate from raw fact.
+
+The Monitor contributes nothing to a mandate. It has no field in which to name a scope, a purpose, or a set of facts that may travel: [ADR-014](../adr/ADR-014-monitor-proposes-no-disclosure-terms.md) removed `MandateSuggestion` from `MonitorOutput` rather than leaving a scope field in a schema the model is handed while the prose beside it said the field meant nothing. A **policy ceiling is not a proposed grant**: `policy_maximum_scope` caps what any decision may say, `proposed_scope` is what version 1 actually offers, and for a general incident fact those are `EXTERNAL_ACTION` and `ANONYMOUS_CASE` respectively. `APPROVE` authorizes the proposal exactly; reaching the ceiling is an `ADJUST` the fact's owner has to make deliberately.
 
 **Tests:** all decisions/replays/conflicts; foreign fact/contributor; overbroad scope; identity/content pairs; revoke before/after fence ordering; expiry boundary; old view/proposal stale.
 

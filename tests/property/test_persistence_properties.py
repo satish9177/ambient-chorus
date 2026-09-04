@@ -206,5 +206,31 @@ def test_a_transaction_token_distinguishes_different_requests(
             name="property", operations=(operation,), audit_required=False
         ).client_request_token
 
-    same_content = {**base, **left} == {**base, **right}
+    same_content = _identical_item({**base, **left}, {**base, **right})
     assert (token(left) == token(right)) == same_content
+
+
+def _identical_item(left: StoredValue, right: StoredValue) -> bool:
+    """Structural equality that distinguishes stored *types*, which ``==`` does not.
+
+    Python's ``bool`` subclasses ``int``, so ``False == 0`` and ``True == 1``. DynamoDB draws
+    no such equivalence: one is a ``BOOL`` attribute and the other an ``N``, and two requests
+    differing only in that are genuinely different requests that must not share a token --
+    ten minutes of token idempotency would otherwise discard the second as a replay of the
+    first.
+
+    So the oracle has to be at least as strict as the thing it is checking. Comparing with
+    ``==`` made this property assert the opposite of the invariant for exactly those pairs.
+    """
+
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _identical_item(left[name], right[name]) for name in left
+        )
+    if isinstance(left, tuple) and isinstance(right, tuple):
+        return len(left) == len(right) and all(
+            _identical_item(one, other) for one, other in zip(left, right, strict=True)
+        )
+    return bool(left == right)

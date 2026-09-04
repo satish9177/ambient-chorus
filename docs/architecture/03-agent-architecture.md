@@ -50,10 +50,11 @@ Attachments are descriptors `{evidence_id, media_type, safe_caption?}`. Raw byte
 - `proposed_facts[]: {client_ref, report_client_ref, fact_type, typed_value, sensitivity, evidence_ids[], source_spans[]}`;
 - `candidate_links[]: {report_client_ref, existing_case_id?, candidate_group_ref?, proposed_case_title, similarity_reasons[], dissimilarity_reasons[], confidence}`;
 - `sensitive_signals[]: {message_id, category, source_span}`;
-- `missing_information_requests[]: {contributor_pseudonym_id, report_client_ref, requested_fields[], reason}`;
-- `mandate_suggestions[]: {report_client_ref, fact_client_refs[], suggested_max_scope, suggested_purpose}`.
+- `missing_information_requests[]: {contributor_pseudonym_id, report_client_ref, requested_fields[], reason}`.
 
-Confidence is a decimal string in `[0,1]`; it is diagnostic, never an authorization or automatic truth threshold. The deterministic intake service assigns durable IDs, verifies spans against input text, maps typed values, and applies linkage thresholds. A mandate suggestion creates only a `PROPOSED` mandate; it can never produce approval.
+Confidence is a decimal string in `[0,1]`; it is diagnostic, never an authorization or automatic truth threshold. The deterministic intake service assigns durable IDs, verifies spans against input text, maps typed values, and applies linkage thresholds.
+
+**The Monitor proposes no disclosure terms.** There is no field in which it names a scope, a purpose, or a set of facts that may travel, and there is no path by which anything it returns reaches a mandate. Version 1 of every `DisclosureMandate` is derived by the candidate-acceptance command from the case's own `ACTIVE` facts and the deterministic policy/v1 tables ([ADR-013](../adr/ADR-013-mandate-proposal-endpoint.md)). An earlier `mandate_suggestions[]` field was removed by [ADR-014](../adr/ADR-014-monitor-proposes-no-disclosure-terms.md): a scope written into a structured-output schema is a scope the model is being asked to choose, whatever the prose beside it says. Flagging that a message contains a health detail is an observation about text the model was given, and that is what `sensitive_signals[]` is for; deciding how far that detail may travel is not, and no agent has a field for it.
 
 #### Candidate grouping
 
@@ -138,7 +139,7 @@ The system prompt says every factual assertion must be represented as a claim ci
 
 - All agents use application inference profiles backed by `amazon.nova-2-lite-v1:0`, one profile per agent for IAM and cost attribution.
 - `temperature=0`; maximum output tokens are 4,000 Monitor, 6,000 Investigator, and 3,000 Action.
-- Prompt IDs are `monitor/v2`, `investigator/v1`, and `action/v1`; prompt text is version-controlled next to each runtime. The Monitor prompt moved to `v2` with [ADR-012](../adr/ADR-012-candidate-grouping-invariant.md), which put the candidate-grouping invariant into the instructions rather than leaving it as a validator rule the model was never told about.
+- Prompt IDs are `monitor/v3`, `investigator/v1`, and `action/v1`; prompt text is version-controlled next to each runtime. A pinned prompt version names the whole reviewed artifact — the prompt text *and* the structured-output model the runtime asks for — because the runtime passes both in one call. The Monitor moved to `v2` with [ADR-012](../adr/ADR-012-candidate-grouping-invariant.md), which put the candidate-grouping invariant into the instructions rather than leaving it as a validator rule the model was never told about, and to `v3` with [ADR-014](../adr/ADR-014-monitor-proposes-no-disclosure-terms.md), which removed `mandate_suggestions[]` from the output schema. In both cases the version moves so a runtime serving the old artifact is refused once, by version, rather than failing every batch it answers.
 - Strands structured output is backed by strict Pydantic v2 models. `extra='forbid'`, bounded strings/arrays, discriminated unions, and semantic validators are mandatory.
 - AgentCore sessions are stateless, one invocation per random session ID. Direct-code Python 3.12 runtimes use isolated VPC subnets with no NAT/internet and endpoint-scoped AWS egress. No Memory, Gateway, Browser, Code Interpreter, MCP, A2A, filesystem persistence, or dynamic tool loading.
 

@@ -51,6 +51,7 @@ Strands/OpenTelemetry content capture is disabled. An exporter processor drops `
 | linkage | `candidate.detected`, `report.linked`, `report.link.denied`; case/report IDs, reason codes |
 | agents | `agent.invocation.started/completed/failed`, `agent.contract.denied`; agent/prompt/profile hash, IDs, latency/tokens |
 | investigation | `investigation.applied`, `evidence.independence.computed`, `contradiction.recorded`; counts/IDs/statuses |
+| mandate | `mandate.requested`, `mandate.decided`, `mandate.denied`; case/mandate IDs, version, decision and status codes, granted-fact count, one identity-shared bit, denial reason codes |
 | compiler | `compile.started/allowed/denied`, `compile.fact.included/excluded`, `view.persisted`; opaque IDs, rule/reason, scope, hashes |
 | action | `proposal.validated/denied`, `approval.recorded/conflict`, `send.fence.acquired/denied/released`; IDs/hashes |
 | SES | `execution.sending/sent/failed/unknown/reconciled`; execution ID, safe error, SES ID when known |
@@ -100,6 +101,7 @@ Domain/application code returns/raises closed typed errors; adapters translate S
 | `StateTransitionError` | 409 | after reload | illegal source state/guard |
 | `PolicyDeniedError` | 422 | only after terms/state change | deterministic disclosure deny with reason codes |
 | `StaleAuthorizationError` | 409 | no same artifact | recompile/re-propose/reapprove |
+| `SendAuthorizationInProgressError` | 409 | **yes**, after the fence expires (<=60s) | an authorized send holds the case fence; the authorization mutation waits rather than racing it |
 | `IdempotencyConflictError` | 409 | no | same key bound to different request |
 | `CrossCaseViolationError` | 404 externally; 403 admin | no | whole operation denied and security-audited |
 | `AgentContractViolationError` | 502 | no automatic | schema-valid or JSON output semantically invalid |

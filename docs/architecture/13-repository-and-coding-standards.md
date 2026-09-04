@@ -52,7 +52,7 @@ ambient-chorus/
 │       ├── observability/
 │       └── local/
 ├── runtimes/
-│   ├── monitor/                     # entrypoint + monitor/v2 prompt + deployment manifest
+│   ├── monitor/                     # entrypoint + monitor/v3 prompt + deployment manifest
 │   ├── investigator/                # entrypoint + investigator/v1 prompt
 │   └── action/                      # entrypoint + action/v1 prompt; allowlisted artifact build
 ├── functions/

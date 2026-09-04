@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 AGENT_INPUT_SCHEMA_VERSION: Final = "agent-input/v1"
 AGENT_OUTPUT_SCHEMA_VERSION: Final = "agent-output/v1"
 
-MONITOR_PROMPT_VERSION: Final = "monitor/v2"
+MONITOR_PROMPT_VERSION: Final = "monitor/v3"
 """The only Monitor prompt identity this contract version accepts.
 
 The prompt is pinned rather than negotiated. A runtime that answers with a different prompt

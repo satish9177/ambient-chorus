@@ -1,0 +1,8 @@
+# The synthetic ambient corpus is checksum-verified byte for byte before a single message is
+# replayed, so its bytes are content rather than text. Left to the default, a Windows checkout
+# with core.autocrlf=true rewrites every newline and the integrity guard fails on a corpus
+# nobody edited -- which is the guard working correctly against the wrong question.
+demo/fixtures/** -text
+
+# Golden vectors and recorded fixtures are compared byte for byte for the same reason.
+tests/**/golden/** -text

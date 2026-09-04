@@ -92,6 +92,10 @@ class EventName:
     OPERATION_RESUMED: Final = "operation.resumed"
     MONITOR_BATCH_NOOP: Final = "monitor.batch.noop"
 
+    MANDATE_REQUESTED: Final = "mandate.requested"
+    MANDATE_DECIDED: Final = "mandate.decided"
+    MANDATE_DENIED: Final = "mandate.denied"
+
     PROMPT_INJECTION_OBSERVED: Final = "prompt_injection.observed"
 
 
@@ -408,6 +412,100 @@ def report_link_denied(
         invocation_id=invocation_id,
         outcome="DENIED",
         reason_codes=(reason_code,),
+    )
+
+
+def mandate_requested(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    case_version: int,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    proposal_count: int,
+    fact_count: int,
+) -> None:
+    """Record that a candidate was accepted and its mandate proposals became durable.
+
+    Counts, never contents. How many contributors were asked and how many facts were described
+    to them is an operational fact; which facts, and whose, is not.
+    """
+
+    _emit(
+        EventName.MANDATE_REQUESTED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        outcome="SUCCEEDED",
+        counts={"proposals": proposal_count, "facts": fact_count},
+    )
+
+
+def mandate_decided(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    case_version: int,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    decision: str,
+    mandate_version: int,
+    granted_fact_count: int,
+    identity_shared: bool,
+    replayed: bool = False,
+) -> None:
+    """Record one immutable authorization decision.
+
+    ``decision`` is a closed enum value and ``identity_shared`` is the single bit that says
+    whether identity permission was given -- the one fact about a mandate that has to be
+    auditable separately from content, because the two authorizations are independent and a
+    count of granted facts can never reveal which way identity went.
+    """
+
+    _emit(
+        EventName.MANDATE_DECIDED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        outcome="REPLAYED" if replayed else "SUCCEEDED",
+        reason_codes=(decision,),
+        counts={
+            "mandate_version": mandate_version,
+            "granted_facts": granted_fact_count,
+            "identity_shared": int(identity_shared),
+        },
+    )
+
+
+def mandate_denied(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record that a mandate command was refused, and by which deterministic rules."""
+
+    _emit(
+        EventName.MANDATE_DENIED,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        outcome="DENIED",
+        reason_codes=reason_codes,
     )
 
 

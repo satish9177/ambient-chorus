@@ -65,6 +65,8 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-010](adr/ADR-010-agentcore-runtime.md) | AgentCore Runtime for all three agents |
 | [ADR-011](adr/ADR-011-monitor-deterministic-identities.md) | Replay-safe deterministic identities for Monitor-derived entities |
 | [ADR-012](adr/ADR-012-candidate-grouping-invariant.md) | Candidate grouping only under an issue type that names a subject |
+| [ADR-013](adr/ADR-013-mandate-proposal-endpoint.md) | Candidate acceptance is the command that creates mandate proposals |
+| [ADR-014](adr/ADR-014-monitor-proposes-no-disclosure-terms.md) | The Monitor proposes no disclosure terms; `mandate_suggestions` removed |
 
 ## Implementation control
 

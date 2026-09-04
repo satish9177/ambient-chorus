@@ -105,8 +105,28 @@ def test_the_prompt_version_moved_with_the_rule() -> None:
 
     from runtimes.monitor.prompt import MONITOR_PROMPT_VERSION as runtime_version
 
-    assert MONITOR_PROMPT_VERSION == "monitor/v2"
+    assert MONITOR_PROMPT_VERSION == "monitor/v3"
     assert runtime_version == MONITOR_PROMPT_VERSION
+
+
+def test_the_output_schema_is_part_of_the_pinned_artifact() -> None:
+    """A field in the schema is an instruction, so removing one moves the version too.
+
+    The runtime hands the model this prompt and ``MonitorOutput`` in the same call. ADR-014
+    removed ``mandate_suggestions`` without changing a character of the text, which is exactly
+    the case a text-only version rule would have let through silently.
+    """
+
+    from runtimes.monitor.prompt import MONITOR_SYSTEM_PROMPT
+
+    assert "mandate_suggestions" not in MonitorOutput.model_fields
+    # The *sent* instructions, not ``_prompt_text()``: that helper joins every string in the
+    # module, module docstring included, and a negative assertion over it would be answering a
+    # question about this repository's prose rather than about what the model is told.
+    assert "mandate" not in MONITOR_SYSTEM_PROMPT.lower(), (
+        "the prompt must not ask for what the schema dropped"
+    )
+    assert MONITOR_PROMPT_VERSION == "monitor/v3"
 
 
 # ---------------------------------------------------------------------------------------

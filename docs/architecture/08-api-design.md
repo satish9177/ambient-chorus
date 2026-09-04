@@ -56,6 +56,7 @@ Lambda async delivery may repeat; the operation/input hash and underlying comman
 | `GET /operations/{operation_id}` | initiating role/presenter | 200 status | actor/case visibility |
 | `GET /cases/{case_id}` | presenter/approver safe subset | 200 case surface | case membership; approver gets no private data |
 | `GET /cases/{case_id}/investigation` | presenter admin | 200 private projection | private role only |
+| `POST /cases/{case_id}/mandates` | presenter admin | 200 proposals + case version | case `CANDIDATE`; expected case version; no active send fence |
 | `GET /contributors/{contributor_id}/mandates/current?case_id=` | same contributor/presenter | 200 mandate thread | actor=contributor or presenter |
 | `POST /cases/{case_id}/mandates/{mandate_id}/decisions` | same contributor | 200 new version | expected current version; no active send fence |
 | `POST /cases/{case_id}/investigations` | presenter admin | 202 operation | case in candidate/awaiting/investigating/terminal-reopen flow |
@@ -131,6 +132,9 @@ privacy_counts: {included,excluded,denied_by_reason}
 For `case_approver`, private title/fact labels and privacy exclusion reasons are omitted; only view/action-safe fields remain. `GET .../investigation` returns reports, private facts, contradictions, root/independence groups, assessment, and per-fact compile inclusion/exclusion explanations to presenter admin. It never returns contributor contact or private S3 URI; private evidence uses a separate controlled preview reference.
 
 ### Mandate thread and decision
+
+`POST /v1/cases/{case_id}/mandates` is the human/demo candidate acceptance defined in [ADR-013](../adr/ADR-013-mandate-proposal-endpoint.md). Its body is `{"expected_case_version": 3}` and nothing else; it carries no fact identifier, no grant, and no text. It derives one `PROPOSED` mandate version 1 for every contributor owning an active fact in the case, each grant set to the deterministic least-permissive default for that fact and capped by the policy/v1 maximum (the two are different values; see [ADR-014](../adr/ADR-014-monitor-proposes-no-disclosure-terms.md)), and commits those versions, their current pointers, the `CANDIDATE→AWAITING_MANDATES` transition, the no-live-fence condition, one `mandate.requested` audit event, and its idempotency record in one transaction. It returns `{case_id, case_version, state, proposals:[{mandate_id, version, contributor_id, status, terms_hash, fact_grant_count}]}`. A case that is not `CANDIDATE`, a stale expected version, or a case with no participating contributor is refused with nothing written.
+
 
 Current mandate response contains proposed/current terms rendered from fact-safe contributor wording, separate content grants, identity grant, destination/purpose, validity, status/version, and revocation history. A contributor sees only mandates they own.
 

@@ -36,9 +36,7 @@ from chorus.contracts.common import (
 )
 from chorus.domain.entities import (
     UNNAMED_ISSUE_TYPE,
-    DisclosureScope,
     FactType,
-    Purpose,
     SensitivityCategory,
 )
 from chorus.domain.facts import (
@@ -417,34 +415,17 @@ class MissingInformationRequest(StrictModel):
         return reject_identifier_shaped(value, "missing information report_client_ref")
 
 
-class MandateSuggestion(StrictModel):
-    """A suggested starting point for a contributor's disclosure decision.
-
-    A suggestion can only ever produce a ``PROPOSED`` mandate. It is never an approval, never
-    widens a policy maximum, and is not authorization of any kind.
-    """
-
-    report_client_ref: ClientRefStr
-    fact_client_refs: Annotated[tuple[ClientRefStr, ...], Field(min_length=1, max_length=20)]
-    suggested_max_scope: DisclosureScope
-    suggested_purpose: Purpose
-
-    @field_validator("report_client_ref")
-    @classmethod
-    def validate_client_ref(cls, value: str) -> str:
-        return reject_identifier_shaped(value, "mandate suggestion report_client_ref")
-
-    @model_validator(mode="after")
-    def validate_suggestion(self) -> Self:
-        if len(set(self.fact_client_refs)) != len(self.fact_client_refs):
-            raise ValueError("mandate suggestion fact references must be unique")
-        for value in self.fact_client_refs:
-            reject_identifier_shaped(value, "mandate suggestion fact_client_ref")
-        return self
-
-
 class MonitorOutput(StrictModel):
-    """Everything one Monitor invocation proposes. None of it is durable state."""
+    """Everything one Monitor invocation proposes. None of it is durable state.
+
+    There is deliberately **no field for disclosure terms**. An earlier ``mandate_suggestions``
+    field let the model name a scope and a purpose for a set of facts; it was removed by
+    ADR-014, because a ``DisclosureScope`` in a structured-output schema is the model being
+    asked to choose one, whatever the prose beside the field says, and the pinned prompt never
+    asked for it. Version 1 of every mandate is derived by the candidate-acceptance command
+    from the case's own active facts and the deterministic policy/v1 tables. An answer that
+    supplies the old field is refused here by ``extra='forbid'``.
+    """
 
     schema_version: Literal["monitor-output/v1"] = MONITOR_OUTPUT_SCHEMA_VERSION
     message_results: Annotated[
@@ -460,9 +441,6 @@ class MonitorOutput(StrictModel):
     sensitive_signals: Annotated[tuple[SensitiveSignal, ...], Field(max_length=50)] = ()
     missing_information_requests: Annotated[
         tuple[MissingInformationRequest, ...], Field(max_length=25)
-    ] = ()
-    mandate_suggestions: Annotated[
-        tuple[MandateSuggestion, ...], Field(max_length=MAX_PROPOSED_REPORTS)
     ] = ()
 
     @model_validator(mode="after")
@@ -481,7 +459,4 @@ class MonitorOutput(StrictModel):
         link_refs = tuple(link.report_client_ref for link in self.candidate_links)
         if len(set(link_refs)) != len(link_refs):
             raise ValueError("a report may appear in at most one candidate link")
-        suggestion_refs = tuple(item.report_client_ref for item in self.mandate_suggestions)
-        if len(set(suggestion_refs)) != len(suggestion_refs):
-            raise ValueError("a report may carry at most one mandate suggestion")
         return self

@@ -63,8 +63,8 @@
       "evidence_id": "69d3155d-c405-5c96-b6c3-2647f680c48b",
       "file": "evidence/injection-notice.txt",
       "media_type": "text/plain",
-      "byte_length": 414,
-      "sha256": "sha256:08b8ebb679988b526b0acf69d052336c1a97a54929292b9d7025752cbd16542a",
+      "byte_length": 406,
+      "sha256": "sha256:aebe6d5b9b2c681905be2ebe8f070d6f73200aba86b94d83e72a01b61718cd90",
       "safe_caption": null,
       "ingested_with_feed": true
     },
@@ -73,8 +73,8 @@
       "evidence_id": "c26cf270-d3df-5b47-b432-443a69db933a",
       "file": "evidence/management-reply.eml",
       "media_type": "message/rfc822",
-      "byte_length": 227,
-      "sha256": "sha256:55e23d50b295ba016ada87bd2ea6220b981913f5b8d1324e32b72424b8741234",
+      "byte_length": 222,
+      "sha256": "sha256:ace2d0cf382c14eb81010c855e28024fac0756860eeea8167cf68077db4701b0",
       "safe_caption": null,
       "ingested_with_feed": false
     }
