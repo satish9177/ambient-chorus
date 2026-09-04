@@ -358,8 +358,8 @@ class MonitorHarness:
             kind=kind,
             actor_id_hash=actor_id_hash,
             request_hash=request_hash,
-            monitor_invocation_id=(invocation_id or uuid4()) if is_monitor else None,
-            monitor_locator_hash=monitor_locator_hash(locators) if is_monitor else None,
+            agent_invocation_id=(invocation_id or uuid4()) if is_monitor else None,
+            agent_binding_hash=monitor_locator_hash(locators) if is_monitor else None,
         )
 
     def job_for(
@@ -378,7 +378,7 @@ class MonitorHarness:
             operation_id=operation.operation_id,
             namespace=self.namespace,
             community_id=self.community_id,
-            invocation_id=invocation_id or operation.monitor_invocation_id or uuid4(),
+            invocation_id=invocation_id or operation.agent_invocation_id or uuid4(),
             correlation_id=correlation_id or uuid4(),
             actor_id_hash=actor_id_hash or operation.actor_id_hash,
             request_hash=request_hash or operation.request_hash,

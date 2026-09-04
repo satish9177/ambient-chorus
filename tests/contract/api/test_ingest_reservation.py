@@ -479,14 +479,14 @@ async def test_two_reservations_racing_to_complete_converge_on_one_operation(
         namespace=api.harness.namespace,
         kind=ApplicationOperationKind.MONITOR,
         actor_id_hash=PRESENTER_ACTOR_HASH,
-        monitor_locator_hash=locator_hash,
+        agent_binding_hash=locator_hash,
     )
     started_second = await api.harness.operations.complete_start(
         reserved_second,
         namespace=api.harness.namespace,
         kind=ApplicationOperationKind.MONITOR,
         actor_id_hash=PRESENTER_ACTOR_HASH,
-        monitor_locator_hash=locator_hash,
+        agent_binding_hash=locator_hash,
     )
 
     assert started_first.operation.operation_id == started_second.operation.operation_id
@@ -533,6 +533,6 @@ async def test_the_operation_a_completed_key_names_carries_its_monitor_handover(
     )
 
     assert operation.status is ApplicationOperationStatus.PENDING
-    assert operation.monitor_invocation_id == job.invocation_id
-    assert operation.monitor_locator_hash is not None
+    assert operation.agent_invocation_id == job.invocation_id
+    assert operation.agent_binding_hash is not None
     assert operation.request_hash == job.request_hash

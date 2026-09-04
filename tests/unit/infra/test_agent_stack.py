@@ -52,8 +52,15 @@ def actions_of(sid: str) -> set[str]:
     return {action} if isinstance(action, str) else set(action)
 
 
-def test_the_stack_creates_exactly_one_runtime_role() -> None:
-    template().resource_count_is(ROLE_TYPE, 1)
+def test_the_stack_creates_exactly_one_role_per_agent_runtime() -> None:
+    """Two roles from Phase 5 on: the Monitor's and the Investigator's, and nothing else.
+
+    The count is asserted rather than the names, because the failure this catches is a *third*
+    role appearing -- a shared "agents" role, or a convenience role attached during a later
+    phase -- which is how two isolated identities quietly become one.
+    """
+
+    template().resource_count_is(ROLE_TYPE, 2)
 
 
 def test_the_role_is_assumable_only_by_the_agentcore_service() -> None:

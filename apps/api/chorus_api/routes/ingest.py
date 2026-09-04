@@ -241,7 +241,7 @@ async def _start_monitor_operation(
             namespace=container.namespace,
             kind=ApplicationOperationKind.MONITOR,
             actor_id_hash=actor_hash,
-            monitor_locator_hash=monitor_locator_hash(locators),
+            agent_binding_hash=monitor_locator_hash(locators),
             correlation_id=correlation_id,
         )
     else:

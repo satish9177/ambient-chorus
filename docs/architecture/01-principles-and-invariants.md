@@ -37,6 +37,7 @@
 | SEC-18 | `ACTIONED` never implies `RESOLVED`. | State guards | complete transition matrix test |
 | SEC-19 | Private URI or sensitive field cannot serialize in safe types. | Separate Pydantic models with `extra='forbid'` | serialization negative tests |
 | SEC-20 | Logs omit private content. | allowlisted event schema/redaction processor | log-capture tests |
+| SEC-21 | A model-proposed evidence status may lower a fact's status and may never raise it. | evidence-status ladder and deterministic recomputation ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md)) | ladder and overclaim-downgrade tests |
 
 There is no privacy-threshold exception in V1. The phrase “unless an explicit policy exception exists” is reserved for a future accepted policy version and ADR; `policy/v1` has none.
 

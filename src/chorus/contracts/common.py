@@ -35,6 +35,17 @@ fails an honest answer's whole batch.
 """
 
 
+INVESTIGATOR_PROMPT_VERSION: Final = "investigator/v1"
+"""The only Investigator prompt identity this contract version accepts.
+
+Pinned for the same reason the Monitor's is: the runtime hands the model this prompt *and* the
+:class:`~chorus.contracts.investigation.InvestigationAssessmentDraft` schema in one call, so
+the version names the whole reviewed artifact. A runtime answering with a different version is
+running instructions this application did not review, and its answer is refused once, by
+version, rather than being trusted field by field.
+"""
+
+
 class AgentName(StrEnum):
     """The three frozen agent identities.
 

@@ -23,6 +23,7 @@ from chorus.domain.ids import (
     CommunityId,
     ContributorId,
     EvidenceItemId,
+    EvidenceRootId,
     ExecutionId,
     FactId,
     MandateId,
@@ -148,6 +149,19 @@ def operation_sort_key() -> str:
 
 def evidence_root_sort_key(root_sha256: Sha256Digest) -> str:
     return _join("EVIDENCE_ROOT", root_sha256.value)
+
+
+def evidence_root_id_sort_key(root_id: EvidenceRootId) -> str:
+    """``EVIDENCE_ROOT_ID#{root_id}`` in the community partition (ADR-017).
+
+    The canonical evidence root is content-addressed, so a ``parent_root_id`` -- which is an
+    identifier, and for Phase-3 roots a one-way UUIDv5 -- has no address of its own. This
+    locator is that address, and it holds one field: the ``root_sha256`` the canonical row
+    lives at. Two direct-key batch gets therefore resolve an ancestry chain with no scan, no
+    GSI, and no prefix walk.
+    """
+
+    return _join("EVIDENCE_ROOT_ID", str(root_id))
 
 
 def case_sort_key() -> str:

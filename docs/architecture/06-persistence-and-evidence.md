@@ -39,6 +39,7 @@ All application gets/queries include a namespace prefix. Repositories construct 
 | Unlinked agent invocation record | `NS#n#OPERATION#o` | `AGENT_INVOCATION#{invocation_id}` | safe hashes/outcome for a Monitor run with no case |
 | Application operation | `NS#n#OPERATION#o` | `OPERATION` | status/result refs only; direct poll get; demo TTL |
 | Evidence root | `NS#n#COMM#c` | `EVIDENCE_ROOT#{root_sha256}` | dedupe/forward lineage |
+| Evidence root ID locator | `NS#n#COMM#c` | `EVIDENCE_ROOT_ID#{root_id}` | immutable create-only pointer to `root_sha256`; written in the root's own transaction ([ADR-017](../adr/ADR-017-evidence-root-id-locator.md)) |
 | Demo manifest/reset lock | `NS#DEMO` | `DEMO_MANIFEST#{seed_version}` / `DEMO_RESET_LOCK` | exact partition roots, object prefixes, schedules |
 | Case root | `NS#n#CASE#k` | `CASE` | aggregate/version/state |
 | Report | `NS#n#CASE#k` | `REPORT#r` | private |
@@ -93,6 +94,8 @@ Audit cursors follow the feed scheme. Demo audit items have `expires_at_epoch` T
 | read ambient feed signals | Core `BatchGetItem` on the exact `MESSAGE_SIGNAL#{message_id}` keys of the current feed page | eventual; display only, never an authorization input |
 | build bounded Monitor context | Core query community PK/time SK for recent messages, then `BatchGetItem` their exact signal keys, then bounded strong `load_case` per distinct case ID | strong for the case summaries |
 | load case investigation | Core query case PK; explicit entity filters | strong for commands, eventual for display |
+| load the current assessment | Core bounded descending query on the case's `ASSESSMENT#` prefix, limit 1, verified against `case.assessment_id` | strong |
+| resolve evidence-root ancestry | Core `BatchGetItem` on the exact `EVIDENCE_ROOT_ID#{root_id}` keys, then on the exact `EVIDENCE_ROOT#{root_sha256}` keys they name | strong |
 | load current mandate(s) | Core query/get current pointers + immutable versions | strong |
 | apply investigation | transaction: assessment, fact statuses, case version, audit | conditional strong |
 | compile | strong Core query/batch gets; transaction Share view + current/history pointer partition + Audit | strong |
@@ -114,7 +117,7 @@ An idempotency record contains `request_hash`, `status: IN_PROGRESS|COMPLETED|FA
 - **Ingest:** uniqueness lock, message, and idempotency item in one Core transaction. Exact duplicate returns existing message. Same channel ID/different content is an integrity conflict.
 - **Monitor apply:** the whole output is semantically validated *before any domain mutation*. Only then is it turned into a deterministic ordered list of bounded apply steps, each committed as its own transaction well under DynamoDB's 100-operation limit at the frozen Monitor maxima. Candidate case creation and that case's initial report linkage are always in one step, so a case never exists without the reports that justified it. Facts are committed in bounded chunks. A durable **apply progress** record under the operation partition advances transactionally with each step, so a retry after a partial delivery detects which steps already committed and resumes only the missing ones — no duplicate report, fact, signal, or audit event. The design permits partial durable *progress* caused by a storage failure; it never permits partial acceptance of an invalid model output, because nothing is written until the whole output has been accepted. An ambiguous transport outcome is resolved by the Phase-2 commit-proof semantics, never by a blind retry.
 - **Mandate decision:** append immutable version, update current pointer, bump case version, ensure no live send fence, and append Audit across Core/Audit in one transaction.
-- **Investigation:** up to V1's 100-fact case limit, append assessment, update affected fact statuses/case version, and audit in one transaction. Larger output is rejected before persistence.
+- **Investigation:** one transaction containing the appended immutable assessment, the guarded fact-status updates, the case update carrying the new state, version, `corroboration_source_count`, and `assessment_id`, the successful agent-invocation record, one audit event, the no-live-send-fence condition, and the idempotency record. There is no plan snapshot and no apply-progress record: the whole apply is atomic, so a partially applied investigation does not exist. `MAX_INVESTIGATION_FACT_UPDATES` is **derived** from `TRANSACTION_MAX_OPERATIONS` minus the fixed participants the implementation actually stages, and is asserted by test rather than written as a number here; a validated output touching more facts than the derived bound is rejected before any mutation.
 - **Compile:** safe S3 derivatives are first written with `pending-compile-id`; then one cross-table transaction writes immutable view, current pointer with expected previous hash, idempotency, and audit. Orphan pending objects are lifecycle-deleted after 24 hours.
 - **Proposal:** immutable proposal plus its single execution record in `DRAFT`, current pointer, idempotency, and audit in one Share/Audit transaction.
 - **Approval:** immutable approval, guarded execution transition `DRAFT→APPROVED`, idempotency, and audit in one Share/Audit transaction.
@@ -142,6 +145,8 @@ A projection update that fails cannot corrupt domain state: it participates in t
 The projection exists because the frozen access patterns forbid a scan and require no GSI. Without a signal row in the community partition, resolving "which of these feed rows belong to a discovered pattern" would need exactly the message-to-case index V1 refuses to build. The feed **joins by exact message ID**: a feed page already carries at most 100 message IDs, so the signals for that page are fetched by direct keys through a bounded `BatchGetItem` rather than by independently paginating the signal prefix and hoping the two pages overlap.
 
 ## Monitor invocation snapshots
+
+Snapshots are **`MONITOR`-only**. An `INVESTIGATE` or `PROPOSE_ACTION` operation applies in one transaction and therefore has no frozen-plan stage, no apply-progress record, and no resume path; the narrow `RUNNING→PENDING` edge exists for the Monitor alone.
 
 A Monitor operation has **three** distinct durable stages, and the boundary between them is what makes a partially applied operation finishable without ever calling a model again:
 
@@ -256,7 +261,7 @@ It uses a separate KMS key, versioning, block-public-access, and a bucket policy
 
 1. Ingestion validates adapter ID, declared size/MIME, magic bytes, and 10 MiB V1 limit before upload.
 2. It streams while computing SHA-256; no user-controlled key segment is used.
-3. A community evidence-root conditional record on content hash detects exact duplicates. `derived_from`/forward markers collapse to the earliest known root. Duplicate items remain auditable but do not add independent evidence.
+3. A community evidence-root conditional record on content hash detects exact duplicates. `derived_from`/forward markers collapse to the earliest known root. Duplicate items remain auditable but do not add independent evidence. The root's ID locator is created in the same transaction, so `parent_root_id` is addressable without a scan or a GSI; a missing locator raises `INTEGRITY_ERROR` rather than silently under-counting ([ADR-017](../adr/ADR-017-evidence-root-id-locator.md)).
 4. Upload is tagged `scan=pending`; evidence cannot support export while pending.
 5. V1 accepts only fixed synthetic fixtures. `DemoEvidenceScanner` verifies known fixture checksums and MIME/magic bytes. Arbitrary deployed uploads are rejected; a production malware service requires a future ADR.
 6. Extraction is bounded and treats all text as untrusted evidence. Text is never executed, interpreted as tool input, or placed in logs.

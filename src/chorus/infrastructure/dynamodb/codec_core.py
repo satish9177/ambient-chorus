@@ -63,6 +63,7 @@ from chorus.infrastructure.dynamodb.codec import (
 )
 from chorus.ports.records import (
     ChannelUniquenessLock,
+    EvidenceRootLocator,
     FeedSignalProjection,
     MonitorApplyProgress,
     MonitorSnapshotChunk,
@@ -78,8 +79,20 @@ COMMUNITY_SCHEMA_VERSIONS: Final = frozenset({"community/v1"})
 CONTRIBUTOR_SCHEMA_VERSIONS: Final = frozenset({"contributor/v1"})
 MESSAGE_SCHEMA_VERSIONS: Final = frozenset({"community-message/v1"})
 CHANNEL_LOCK_SCHEMA_VERSIONS: Final = frozenset({"channel-uniqueness-lock/v1"})
-OPERATION_SCHEMA_VERSIONS: Final = frozenset({"application-operation/v1"})
+OPERATION_SCHEMA_VERSION_V1: Final = "application-operation/v1"
+OPERATION_SCHEMA_VERSION_V2: Final = "application-operation/v2"
+OPERATION_SCHEMA_VERSIONS: Final = frozenset(
+    {OPERATION_SCHEMA_VERSION_V1, OPERATION_SCHEMA_VERSION_V2}
+)
+"""Read old, write new (ADR-016).
+
+A v1 item spells the handover ``monitor_invocation_id``/``monitor_locator_hash``; a v2 item
+spells the same two values ``agent_invocation_id``/``agent_binding_hash``. No stored value
+changes meaning and no digest is recomputed -- only the attribute names moved, so a v1 row
+decodes into the generalized fields directly.
+"""
 EVIDENCE_ROOT_SCHEMA_VERSIONS: Final = frozenset({"evidence-root/v1"})
+EVIDENCE_ROOT_LOCATOR_SCHEMA_VERSIONS: Final = frozenset({"evidence-root-locator/v1"})
 CASE_SCHEMA_VERSIONS: Final = frozenset({"community-case/v1"})
 FEED_SIGNAL_SCHEMA_VERSIONS: Final = frozenset({"feed-signal-projection/v2"})
 MONITOR_PROGRESS_SCHEMA_VERSIONS: Final = frozenset({"monitor-apply-progress/v1"})
@@ -675,7 +688,10 @@ def encode_operation(scope: NamespaceScope, operation: ApplicationOperation) -> 
     key = operation_key(scope, operation.operation_id)
     item: dict[str, StoredValue] = envelope(
         entity_type=EntityType.APPLICATION_OPERATION,
-        schema_version=operation.schema_version,
+        # Always the current version: a value decoded from a v1 row is already the v2 shape in
+        # memory, and writing it back under the old name with the new attributes would strand
+        # the handover where the v1 reader does not look.
+        schema_version=OPERATION_SCHEMA_VERSION_V2,
         key=key,
         namespace=operation.namespace,
         community_id=None,
@@ -690,18 +706,16 @@ def encode_operation(scope: NamespaceScope, operation: ApplicationOperation) -> 
             "status": operation.status.value,
             "result_refs": identifiers(operation.result_refs),
             "error_code": operation.error_code,
-            # The Monitor handover identity: which agent invocation this operation authorizes
-            # and the digest of the exact new-message set it may be run over. Identifiers and
-            # a hash only -- never the locators themselves, and never message content.
-            "monitor_invocation_id": (
+            # The agent handover identity: which agent invocation this operation authorizes
+            # and the digest of the exact work it may be run over. Identifiers and a hash
+            # only -- never a locator list, never message text, never a view body.
+            "agent_invocation_id": (
                 None
-                if operation.monitor_invocation_id is None
-                else str(operation.monitor_invocation_id)
+                if operation.agent_invocation_id is None
+                else str(operation.agent_invocation_id)
             ),
-            "monitor_locator_hash": (
-                None
-                if operation.monitor_locator_hash is None
-                else operation.monitor_locator_hash.value
+            "agent_binding_hash": (
+                None if operation.agent_binding_hash is None else operation.agent_binding_hash.value
             ),
             ATTR_EXPIRES_AT_EPOCH: operation.expires_at_epoch,
             "version": operation.version,
@@ -710,6 +724,26 @@ def encode_operation(scope: NamespaceScope, operation: ApplicationOperation) -> 
         }
     )
     return item
+
+
+OPERATION_V1_INVOCATION_ATTRIBUTE: Final = "monitor_invocation_id"
+OPERATION_V1_BINDING_ATTRIBUTE: Final = "monitor_locator_hash"
+OPERATION_INVOCATION_ATTRIBUTE: Final = "agent_invocation_id"
+OPERATION_BINDING_ATTRIBUTE: Final = "agent_binding_hash"
+
+
+def _handover_invocation(reader: ItemReader, schema_version: str) -> UUID | None:
+    """Read the handover invocation from whichever attribute this row version spells it in."""
+
+    if schema_version == OPERATION_SCHEMA_VERSION_V1:
+        return reader.optional_uuid(OPERATION_V1_INVOCATION_ATTRIBUTE)
+    return reader.optional_uuid(OPERATION_INVOCATION_ATTRIBUTE)
+
+
+def _handover_binding(reader: ItemReader, schema_version: str) -> Sha256Digest | None:
+    if schema_version == OPERATION_SCHEMA_VERSION_V1:
+        return reader.optional_digest(OPERATION_V1_BINDING_ATTRIBUTE)
+    return reader.optional_digest(OPERATION_BINDING_ATTRIBUTE)
 
 
 def decode_operation(item: StoredItem) -> tuple[DecodedScope, ApplicationOperation]:
@@ -731,13 +765,15 @@ def decode_operation(item: StoredItem) -> tuple[DecodedScope, ApplicationOperati
         status=reader.enum("status", ApplicationOperationStatus),
         result_refs=reader.uuids("result_refs"),
         error_code=reader.optional_text("error_code"),
-        monitor_invocation_id=reader.optional_uuid("monitor_invocation_id"),
-        monitor_locator_hash=reader.optional_digest("monitor_locator_hash"),
+        agent_invocation_id=_handover_invocation(reader, schema_version),
+        agent_binding_hash=_handover_binding(reader, schema_version),
         expires_at_epoch=reader.number(ATTR_EXPIRES_AT_EPOCH),
         version=reader.number("version"),
         created_at=reader.instant("created_at"),
         updated_at=reader.instant("updated_at"),
-        schema_version=schema_version,
+        # The decoded value is the v2 shape whatever the row said, so it names v2. The stored
+        # row is not rewritten by reading it; the next guarded write is what moves it.
+        schema_version=OPERATION_SCHEMA_VERSION_V2,
     )
     reader.finish()
     return scope, operation
@@ -809,6 +845,62 @@ def decode_evidence_root(item: StoredItem) -> tuple[DecodedScope, EvidenceRoot]:
     )
     reader.finish()
     return scope, root
+
+
+# --------------------------------------------------------------------------------------
+# Evidence root ID locator (ADR-017)
+# --------------------------------------------------------------------------------------
+
+
+def evidence_root_locator_key(scope: CommunityScope, root_id: EvidenceRootId) -> ItemKey:
+    return ItemKey(
+        table=_CORE,
+        partition_key=keys.community_partition(scope.namespace, scope.community_id),
+        sort_key=keys.evidence_root_id_sort_key(root_id),
+    )
+
+
+def encode_evidence_root_locator(scope: CommunityScope, locator: EvidenceRootLocator) -> StoredItem:
+    key = evidence_root_locator_key(scope, locator.root_id)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.EVIDENCE_ROOT_LOCATOR,
+        schema_version=locator.schema_version,
+        key=key,
+        namespace=locator.namespace,
+        community_id=locator.community_id,
+        case_id=None,
+    )
+    item.update(
+        {
+            "root_id": identifier(locator.root_id),
+            "root_sha256": locator.root_sha256.value,
+            "created_at": instant(locator.created_at),
+        }
+    )
+    return item
+
+
+def decode_evidence_root_locator(item: StoredItem) -> tuple[DecodedScope, EvidenceRootLocator]:
+    reader = ItemReader(item, entity_ref="EVIDENCE_ROOT_LOCATOR")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.EVIDENCE_ROOT_LOCATOR,
+        accepted_schema_versions=EVIDENCE_ROOT_LOCATOR_SCHEMA_VERSIONS,
+    )
+    if scope.community_id is None:
+        raise build_entity_error(reader, "community_id")
+    locator = build_entity(
+        reader.entity_ref,
+        EvidenceRootLocator,
+        namespace=scope.namespace,
+        community_id=scope.community_id,
+        root_id=reader.identifier("root_id", EvidenceRootId),
+        root_sha256=reader.digest("root_sha256"),
+        created_at=reader.instant("created_at"),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return scope, locator
 
 
 # --------------------------------------------------------------------------------------

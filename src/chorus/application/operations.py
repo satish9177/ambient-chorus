@@ -34,6 +34,7 @@ from uuid import UUID
 
 from chorus.application import observability
 from chorus.domain.entities import (
+    AGENT_INVOKING_OPERATION_KINDS,
     ApplicationOperation,
     ApplicationOperationKind,
     ApplicationOperationStatus,
@@ -129,6 +130,57 @@ def monitor_locator_hash(locators: tuple[MessageFeedEntry, ...]) -> Sha256Digest
     )
 
 
+INVESTIGATE_BINDING_SCHEMA = "investigate-binding/v1"
+PROPOSE_ACTION_BINDING_SCHEMA = "propose-action-binding/v1"
+
+
+def investigate_binding_hash(
+    *, case_id: CaseId, expected_case_version: int, reason: str
+) -> Sha256Digest:
+    """Digest the frozen identity of one investigation request (ADR-016).
+
+    The three values are exactly what the request *is*: which case, which version of it the
+    caller expected, and why the run was asked for. Nothing else varies between two legitimate
+    investigations of one case, and none of the three is agent-authored.
+
+    It is deliberately not the same digest as ``request_hash``. The request hash names the
+    *command*; this names the work one *invocation* is authorized to do, and the two differ
+    exactly where it matters: an initial run and a later ``REOPEN`` share a request shape and
+    must never share an invocation identity.
+    """
+
+    if expected_case_version < 1:
+        raise ValueError("expected_case_version must be positive")
+    return hash_value(
+        {
+            "schema": INVESTIGATE_BINDING_SCHEMA,
+            "case_id": str(case_id),
+            "expected_case_version": expected_case_version,
+            "reason": reason,
+        }
+    )
+
+
+def propose_action_binding_hash(
+    *, case_id: CaseId, view_id: UUID, view_hash: Sha256Digest
+) -> Sha256Digest:
+    """Digest the frozen identity of one action-proposal request (ADR-016).
+
+    Declared with the other two so the handover has one home rather than three, and so the
+    Action phase inherits a binding that already exists instead of inventing a fourth shape
+    for the same idea. Nothing in Phase 5 calls it.
+    """
+
+    return hash_value(
+        {
+            "schema": PROPOSE_ACTION_BINDING_SCHEMA,
+            "case_id": str(case_id),
+            "view_id": str(view_id),
+            "view_hash": view_hash.value,
+        }
+    )
+
+
 OPERATION_ENTITY_TYPE = "APPLICATION_OPERATION"
 INVOCATION_ENTITY_TYPE = "AGENT_INVOCATION"
 
@@ -169,7 +221,7 @@ class StartedOperation:
     invocation, which they only can if the second and third recover the first one's invocation
     identity instead of minting their own. It is recorded twice on purpose -- in the idempotency
     record, which is what a replay reads, and on the operation row itself as
-    ``monitor_invocation_id``, which is what a *worker* binds a delivered job against. The two
+    ``agent_invocation_id``, which is what a *worker* binds a delivered job against. The two
     are written by the same transaction, so they cannot disagree.
     """
 
@@ -211,8 +263,8 @@ class ApplicationOperations:
         actor_id_hash: Sha256Digest,
         request_hash: Sha256Digest,
         case_id: CaseId | None = None,
-        monitor_invocation_id: UUID | None = None,
-        monitor_locator_hash: Sha256Digest | None = None,
+        agent_invocation_id: UUID | None = None,
+        agent_binding_hash: Sha256Digest | None = None,
     ) -> ApplicationOperation:
         """Create a ``PENDING`` operation the caller may immediately return and poll."""
 
@@ -222,8 +274,8 @@ class ApplicationOperations:
             actor_id_hash=actor_id_hash,
             request_hash=request_hash,
             case_id=case_id,
-            monitor_invocation_id=monitor_invocation_id,
-            monitor_locator_hash=monitor_locator_hash,
+            agent_invocation_id=agent_invocation_id,
+            agent_binding_hash=agent_binding_hash,
             now=self.clock.now(),
         )
         scope = NamespaceScope(namespace=namespace)
@@ -305,7 +357,7 @@ class ApplicationOperations:
         kind: ApplicationOperationKind,
         actor_id_hash: Sha256Digest,
         case_id: CaseId | None = None,
-        monitor_locator_hash: Sha256Digest | None = None,
+        agent_binding_hash: Sha256Digest | None = None,
         correlation_id: UUID | None = None,
     ) -> StartedOperation:
         """Create the operation and complete the reservation in one transaction.
@@ -314,10 +366,16 @@ class ApplicationOperations:
         never a completed key naming an operation that does not exist, and never an operation
         the key cannot lead a retry back to.
 
-        A ``MONITOR`` operation is created already carrying its handover identity -- the
-        invocation it authorizes and the digest of the exact new-message set it may be run
-        over -- because the worker has to be able to refuse a misrouted *first* delivery, and a
-        first delivery is precisely the one with no other durable record to disagree with.
+        An **agent-invoking** operation -- ``MONITOR``, ``INVESTIGATE``, ``PROPOSE_ACTION`` --
+        is created already carrying its handover identity: the invocation it authorizes and the
+        digest of the exact work it may be run over. That is required before dispatch because
+        the worker has to be able to refuse a misrouted *first* delivery, and a first delivery
+        is precisely the one with no other durable record to disagree with. A kind that invokes
+        no agent is created with neither, and refuses to hold one (ADR-016).
+
+        A caller that names an agent-invoking kind without supplying a binding hash is refused
+        here rather than quietly given a half-bound operation, which would be the unbound state
+        this pair exists to abolish.
 
         The answer is read back from the record rather than assumed. Two callers can hold the
         same reservation, and the losing one may still be told its ambiguous write committed --
@@ -327,15 +385,19 @@ class ApplicationOperations:
 
         now = self.clock.now()
         invocation_id = self.ids.new_uuid()
-        is_monitor = kind is ApplicationOperationKind.MONITOR
+        invokes_agent = kind in AGENT_INVOKING_OPERATION_KINDS
+        if invokes_agent and agent_binding_hash is None:
+            raise ValueError("an agent-invoking operation requires its binding hash")
+        if not invokes_agent and agent_binding_hash is not None:
+            raise ValueError("only an agent-invoking operation carries a binding hash")
         operation = self._new_operation(
             namespace=namespace,
             kind=kind,
             actor_id_hash=actor_id_hash,
             request_hash=reservation.request_hash,
             case_id=case_id,
-            monitor_invocation_id=invocation_id if is_monitor else None,
-            monitor_locator_hash=monitor_locator_hash if is_monitor else None,
+            agent_invocation_id=invocation_id if invokes_agent else None,
+            agent_binding_hash=agent_binding_hash if invokes_agent else None,
             now=now,
         )
         refs = (
@@ -422,8 +484,8 @@ class ApplicationOperations:
         request_hash: Sha256Digest,
         case_id: CaseId | None,
         now: datetime,
-        monitor_invocation_id: UUID | None = None,
-        monitor_locator_hash: Sha256Digest | None = None,
+        agent_invocation_id: UUID | None = None,
+        agent_binding_hash: Sha256Digest | None = None,
     ) -> ApplicationOperation:
         return ApplicationOperation(
             operation_id=self.ids.new(OperationId),
@@ -439,8 +501,8 @@ class ApplicationOperations:
             version=1,
             created_at=now,
             updated_at=now,
-            monitor_invocation_id=monitor_invocation_id,
-            monitor_locator_hash=monitor_locator_hash,
+            agent_invocation_id=agent_invocation_id,
+            agent_binding_hash=agent_binding_hash,
         )
 
     async def load(

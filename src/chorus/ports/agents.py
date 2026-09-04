@@ -19,10 +19,17 @@ from enum import StrEnum
 from typing import Protocol
 
 from chorus.contracts.common import AgentInputEnvelope, AgentResultEnvelope
+from chorus.contracts.investigation import (
+    InvestigationAssessmentDraft,
+    InvestigationInput,
+)
 from chorus.contracts.monitor import MonitorInput, MonitorOutput
 
 type MonitorInvocation = AgentInputEnvelope[MonitorInput]
 type MonitorResult = AgentResultEnvelope[MonitorOutput]
+
+type InvestigationInvocation = AgentInputEnvelope[InvestigationInput]
+type InvestigationResult = AgentResultEnvelope[InvestigationAssessmentDraft]
 
 
 class AgentErrorCode(StrEnum):
@@ -66,6 +73,41 @@ class AgentRejection(StrEnum):
     AMBIGUOUS_FACT_SLOT = "AMBIGUOUS_FACT_SLOT"
 
 
+class InvestigationRejection(StrEnum):
+    """Every deterministic reason an Investigator answer can be refused.
+
+    A separate closed set from :class:`AgentRejection` because the two agents are refused for
+    different things: the Monitor invents reports, the Investigator invents citations. Sharing
+    one enum would have produced a vocabulary where half the members can never apply to either
+    caller, which is how a reason code stops meaning anything.
+
+    Every member here refuses the **whole** answer. There is no per-item salvage: a model that
+    cited one identifier it was never given has demonstrated that the rest of its reading is
+    unverified too, and keeping the acceptable half is exactly how a cross-case reference gets
+    quietly accepted.
+    """
+
+    SCHEMA_INVALID = "SCHEMA_INVALID"
+    ENVELOPE_MISMATCH = "ENVELOPE_MISMATCH"
+    PROMPT_VERSION_MISMATCH = "PROMPT_VERSION_MISMATCH"
+    CASE_MISMATCH = "CASE_MISMATCH"
+    CASE_VERSION_MISMATCH = "CASE_VERSION_MISMATCH"
+    UNKNOWN_FACT_ID = "UNKNOWN_FACT_ID"
+    UNKNOWN_REPORT_ID = "UNKNOWN_REPORT_ID"
+    UNKNOWN_EVIDENCE_ID = "UNKNOWN_EVIDENCE_ID"
+    UNKNOWN_ROOT_ID = "UNKNOWN_ROOT_ID"
+    DUPLICATE_CITATION = "DUPLICATE_CITATION"
+    DUPLICATE_FINDING = "DUPLICATE_FINDING"
+    DUPLICATE_GROUP = "DUPLICATE_GROUP"
+    CONTRADICTION_INVALID = "CONTRADICTION_INVALID"
+    COMMITMENT_CITATION_INVALID = "COMMITMENT_CITATION_INVALID"
+    OUTPUT_EXCEEDS_BOUNDS = "OUTPUT_EXCEEDS_BOUNDS"
+    TRANSACTION_BOUND_EXCEEDED = "TRANSACTION_BOUND_EXCEEDED"
+
+
+type AgentRejectionCode = AgentRejection | InvestigationRejection
+
+
 class AgentError(Exception):
     """Base agent failure carrying only a safe code and bounded reason codes.
 
@@ -102,7 +144,7 @@ class AgentError(Exception):
 class AgentContractViolationError(AgentError):
     """The answer was structurally or semantically unusable; the whole output is rejected."""
 
-    def __init__(self, reasons: tuple[AgentRejection, ...]) -> None:
+    def __init__(self, reasons: tuple[AgentRejectionCode, ...]) -> None:
         if not reasons:
             raise ValueError("a contract violation must name at least one reason")
         ordered = tuple(sorted({reason.value for reason in reasons}))
@@ -155,4 +197,16 @@ class MonitorAgentPort(Protocol):
 
         Implementations must not retry internally: retry identity belongs to the application
         use case, which owns the invocation ID and knows whether anything was persisted.
+        """
+
+
+class InvestigatorAgentPort(Protocol):
+    """Invoke the Investigator runtime exactly once with one bounded case payload."""
+
+    async def invoke_investigator(self, invocation: InvestigationInvocation) -> InvestigationResult:
+        """Return the strict result envelope, or raise a closed :class:`AgentError`.
+
+        Same contract as the Monitor port and for the same reason: the adapter carries one
+        payload out and one envelope back, and never decides that a second pass over a private
+        case is safe.
         """

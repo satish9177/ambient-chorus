@@ -342,13 +342,40 @@ def _source_sort_key(source: IndependentSource) -> tuple[str, str]:
     return ("evidence-root", str(source.root_id))
 
 
-def independent_source_count(
+@dataclass(frozen=True, slots=True, kw_only=True)
+class IndependenceResult:
+    """One independence calculation, with the working that produced its count.
+
+    ``count`` is the authoritative value and the only thing an authorization decision reads.
+    ``sources_by_contributor`` is the same calculation's intermediate grouping, exposed so the
+    private investigation surface and the ``evidence.independence.computed`` event can show
+    *why* a count is what it is -- which contributor contributed which origin, and where two
+    contributors collapsed onto one forwarded root. It carries identifiers only.
+
+    The mapping is deliberately not an input to anything. Recomputing a count from it would be
+    a second implementation of the matching below, and two implementations of an authorization
+    quantity is exactly one too many.
+    """
+
+    count: int
+    sources_by_contributor: dict[ContributorId, tuple[IndependentSource, ...]]
+
+
+def independent_sources(
     facts: tuple[Fact, ...],
     reports: tuple[Report, ...],
     evidence_items: tuple[EvidenceItem, ...],
     roots: tuple[EvidenceRoot, ...],
-) -> int:
-    """Count active, non-duplicate reports with distinct contributors and origins."""
+) -> IndependenceResult:
+    """Compute distinct contributor/origin independence over exactly the facts supplied.
+
+    Additive: :func:`independent_source_count` is a thin wrapper over ``count`` and neither the
+    algorithm nor any existing result changes. The function is called with two different fact
+    sets and the results mean two different things (ADR-015): the whole case's ``ACTIVE`` facts
+    give the **case-level** count that drives readiness and compiler gate 17, while one exact
+    canonical claim group gives that *fact's* corroboration. Neither may ever be substituted
+    for the other.
+    """
 
     reports_by_id = {report.report_id: report for report in reports}
     evidence_by_id = {item.evidence_id: item for item in evidence_items}
@@ -435,4 +462,21 @@ def independent_source_count(
     for contributor in sorted(sources, key=str):
         if assign(contributor, set()):
             matched += 1
-    return matched
+    return IndependenceResult(
+        count=matched,
+        sources_by_contributor={
+            contributor: tuple(sorted(found, key=_source_sort_key))
+            for contributor, found in sources.items()
+        },
+    )
+
+
+def independent_source_count(
+    facts: tuple[Fact, ...],
+    reports: tuple[Report, ...],
+    evidence_items: tuple[EvidenceItem, ...],
+    roots: tuple[EvidenceRoot, ...],
+) -> int:
+    """Count active, non-duplicate reports with distinct contributors and origins."""
+
+    return independent_sources(facts, reports, evidence_items, roots).count

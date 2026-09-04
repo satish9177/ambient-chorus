@@ -71,11 +71,15 @@ def test_every_allowlisted_file_exists_and_every_runtime_file_is_allowlisted(
     for relative in declared:
         assert (REPOSITORY_ROOT / relative).is_file(), f"{relative} is declared but absent"
 
+    # Scoped to *this* runtime's own package plus the shared ``runtimes`` package marker.
+    # A repository-wide sweep would fail the Monitor's manifest for a file that belongs to a
+    # different artifact, which says nothing about whether the Monitor's allowlist has drifted.
+    # Each runtime's manifest test owns its own package, and the union is what covers the tree.
     on_disk = {
         path.relative_to(REPOSITORY_ROOT).as_posix()
-        for path in (REPOSITORY_ROOT / "runtimes").rglob("*.py")
+        for path in (REPOSITORY_ROOT / "runtimes" / "monitor").rglob("*.py")
         if "__pycache__" not in path.parts
-    }
+    } | {"runtimes/__init__.py"}
     assert on_disk <= declared, (
         f"runtime source not in the artifact allowlist: {on_disk - declared}"
     )

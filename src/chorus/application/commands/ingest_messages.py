@@ -53,7 +53,7 @@ from chorus.ports.idempotency import (
     IdempotencyPartitionKind,
     IdempotentCommand,
 )
-from chorus.ports.records import ChannelUniquenessLock
+from chorus.ports.records import ChannelUniquenessLock, EvidenceRootLocator
 from chorus.ports.repositories import CoreRepositoryPort, IdempotencyRepositoryPort
 from chorus.ports.scopes import CommunityScope
 from chorus.ports.storage import WriteOperation
@@ -285,6 +285,22 @@ class IngestMessages:
             root = await self._evidence_root(scope, attachment, now=now)
             if root is not None:
                 operations.append(self.core.stage_create_evidence_root(scope, root))
+                # The ID locator is created in the root's own transaction, with the same
+                # create-only condition (ADR-017). A root addressable by content but not by
+                # identifier is a root whose children could never be walked back to it, and
+                # the ancestry loader fails closed on the absence rather than under-counting.
+                operations.append(
+                    self.core.stage_create_evidence_root_locator(
+                        scope,
+                        EvidenceRootLocator(
+                            namespace=root.namespace,
+                            community_id=root.community_id,
+                            root_id=root.root_id,
+                            root_sha256=root.root_sha256,
+                            created_at=now,
+                        ),
+                    )
+                )
                 roots_created += 1
 
         stored = self._message_entity(

@@ -109,7 +109,7 @@ async def test_concurrent_reservations_converge_on_one_operation(
             namespace=api.harness.namespace,
             kind=ApplicationOperationKind.MONITOR,
             actor_id_hash=PRESENTER_ACTOR_HASH,
-            monitor_locator_hash=monitor_locator_hash(locators),
+            agent_binding_hash=monitor_locator_hash(locators),
         )
         return started, locators
 
@@ -239,7 +239,7 @@ async def test_crash_between_reservation_and_completion_is_recoverable(
                     namespace=api.harness.namespace,
                     kind=ApplicationOperationKind.MONITOR,
                     actor_id_hash=PRESENTER_ACTOR_HASH,
-                    monitor_locator_hash=monitor_locator_hash(locators),
+                    agent_binding_hash=monitor_locator_hash(locators),
                 )
             )
         else:

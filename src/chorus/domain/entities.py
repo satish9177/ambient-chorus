@@ -210,12 +210,41 @@ class AuditDecision(StrEnum):
     NONE = "NONE"
 
 
+class ContradictionMateriality(StrEnum):
+    """How much a validated contradiction is allowed to cost.
+
+    Advisory and **block-only** (ADR-015). ``MEDIUM`` and ``HIGH`` block readiness; ``LOW`` is
+    nonfatal and leaves a downstream caveat obligation. No member grants anything: an accepted
+    contradiction can lower a fact's status and stop a case becoming ready, and can never make
+    a case ready, verify a fact, widen a scope, authorize an identity, or choose a destination.
+    """
+
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
 class ApplicationOperationKind(StrEnum):
     MONITOR = "MONITOR"
     INVESTIGATE = "INVESTIGATE"
     PROPOSE_ACTION = "PROPOSE_ACTION"
     SEND_ACTION = "SEND_ACTION"
     DEMO_DUE = "DEMO_DUE"
+
+
+AGENT_INVOKING_OPERATION_KINDS: frozenset[ApplicationOperationKind] = frozenset(
+    {
+        ApplicationOperationKind.MONITOR,
+        ApplicationOperationKind.INVESTIGATE,
+        ApplicationOperationKind.PROPOSE_ACTION,
+    }
+)
+"""The operation kinds that invoke an agent, and therefore carry a handover identity.
+
+Generalized from the ``MONITOR``-only pair by ADR-016. ``SEND_ACTION`` and ``DEMO_DUE`` invoke
+no agent, so they carry no handover at all -- and an operation of one of those kinds that
+arrives holding one is refused at construction rather than quietly ignored.
+"""
 
 
 class ApplicationOperationStatus(StrEnum):
@@ -420,37 +449,122 @@ class CommunityCase:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EvidenceFinding:
+    """One fact's *resolved* status and the closed code that explains how it got there.
+
+    ``evidence_status`` is never the model's proposal. It is the deterministic recomputation
+    resolved against the downgrade-only ladder of ADR-015, so a finding row is a record of what
+    application code decided rather than of what the Investigator asked for.
+    """
+
     fact_id: FactId
     evidence_status: EvidenceStatus
     reason_code: str
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class AssessmentContradiction:
+    """One validated contradiction: which facts conflict, said how, and at what cost.
+
+    Structured rather than flattened onto the assessment, because a single tuple of fact IDs
+    loses which facts belong to which contradiction and loses the ``materiality`` the readiness
+    guard reads. Both losses were in an earlier shape and both are corrected here.
+
+    The citation bounds are the domain rule, not a schema convenience: fewer than two facts
+    names no conflict, and an unbounded list would let one entry sweep a whole case into
+    ``CONTRADICTED``.
+    """
+
+    statement_fact_ids: tuple[FactId, ...]
+    description: str = field(repr=False)
+    materiality: ContradictionMateriality
+
+    def __post_init__(self) -> None:
+        if not 2 <= len(self.statement_fact_ids) <= 10:
+            raise ValueError("a contradiction cites 2 to 10 facts")
+        _unique(self.statement_fact_ids, "statement_fact_ids")
+        _bounded(self.description, 1, 500, "contradiction description")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AssessmentAlternative:
+    """One alternative explanation, with the citations that make it checkable."""
+
+    description: str = field(repr=False)
+    cited_report_ids: tuple[ReportId, ...]
+    cited_fact_ids: tuple[FactId, ...]
+    cited_evidence_ids: tuple[EvidenceItemId, ...]
+
+    def __post_init__(self) -> None:
+        _bounded(self.description, 1, 500, "alternative description")
+        _unique(self.cited_report_ids, "cited_report_ids")
+        _unique(self.cited_fact_ids, "cited_fact_ids")
+        _unique(self.cited_evidence_ids, "cited_evidence_ids")
+
+
+ASSESSMENT_SCHEMA_VERSION_V1 = "investigation-assessment/v1"
+ASSESSMENT_SCHEMA_VERSION_V2 = "investigation-assessment/v2"
+"""Writers emit v2; readers accept both. The v1 shape flattened contradictions and dropped
+their materiality, so a v1 row cannot state that a contradiction was nonfatal -- which is why
+the decoder reads one at its most conservative rather than guessing."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InvestigationAssessment:
+    """The validated, immutable record of one investigation.
+
+    Immutable and append-only. ``CommunityCase.assessment_id`` is the current-assessment
+    pointer and there is no second pointer item, so the pointer and the case version can never
+    disagree about which assessment is current.
+
+    ``independent_source_count`` is always the deterministically recomputed case-level value
+    and never the number the agent returned; ``recommended_disposition`` is recorded advice and
+    is never read by a transition guard.
+    """
+
     assessment_id: AssessmentId
     case_id: CaseId
     based_on_case_version: int
     agent_invocation_id: UUID
     linkage_decision: str
     findings: tuple[EvidenceFinding, ...]
-    contradiction_fact_ids: tuple[FactId, ...]
-    alternative_explanations: tuple[str, ...]
+    contradictions: tuple[AssessmentContradiction, ...]
+    alternative_explanations: tuple[AssessmentAlternative, ...]
     independent_source_count: int
     is_corroborated: bool
     recommended_disposition: str
     assessment_hash: Sha256Digest
     created_at: datetime
-    schema_version: str = "investigation-assessment/v1"
+    schema_version: str = ASSESSMENT_SCHEMA_VERSION_V2
 
     def __post_init__(self) -> None:
         _positive_version(self.based_on_case_version)
         _unique(tuple(item.fact_id for item in self.findings), "finding fact IDs")
-        _unique(self.contradiction_fact_ids, "contradiction_fact_ids")
         if self.independent_source_count < 0:
             raise ValueError("independent_source_count cannot be negative")
         if self.is_corroborated != (self.independent_source_count >= 2):
             raise ValueError("corroboration flag disagrees with independent source count")
         require_utc(self.created_at)
+
+    @property
+    def contradicted_fact_ids(self) -> tuple[FactId, ...]:
+        """Every fact a validated contradiction cites, sorted and deduplicated."""
+
+        cited = {
+            fact_id
+            for contradiction in self.contradictions
+            for fact_id in contradiction.statement_fact_ids
+        }
+        return tuple(sorted(cited, key=str))
+
+    @property
+    def blocking_contradiction(self) -> bool:
+        """True when any validated contradiction is material enough to block readiness."""
+
+        return any(
+            contradiction.materiality
+            in {ContradictionMateriality.MEDIUM, ContradictionMateriality.HIGH}
+            for contradiction in self.contradictions
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -645,18 +759,24 @@ class AuditEvent:
 class ApplicationOperation:
     """Durable status for one asynchronous command, plus the handover it authorizes.
 
-    ``monitor_invocation_id`` and ``monitor_locator_hash`` are the authoritative Monitor
-    handover identity. They exist because a worker delivery is data on a queue and data on a
-    queue can be wrong: without them the first delivery for an operation that had written
-    nothing yet had nothing to disagree with, so *any* invocation identity and *any* subset of
-    message locators would have been accepted on trust. They are written when the operation is
-    created -- before the job is dispatched and before the first model call -- so the durable
-    operation, not the delivery, is what says which invocation and which exact new-message set
-    this run is authorized to use.
+    ``agent_invocation_id`` and ``agent_binding_hash`` are the agent handover identity. They
+    exist because a worker delivery is data on a queue and data on a queue can be wrong:
+    without them the first delivery for an operation that had written nothing yet had nothing
+    to disagree with, so *any* invocation identity and *any* subset of the delivered work would
+    have been accepted on trust. They are written when the operation is created -- before the
+    job is dispatched and before the first model call -- so the durable operation, not the
+    delivery, is what says which invocation and which exact work this run is authorized to do.
 
-    They carry identifiers and a digest only, never a locator list and never message content.
-    They are immutable for the operation's lifetime: every transition copies them forward, and
-    nothing in the system rebinds an operation to a second invocation.
+    The pair was originally ``MONITOR``-only. ADR-016 generalized it, because an unbound
+    ``INVESTIGATE`` job could present a fresh invocation identity, find no durable invocation
+    record, and spend a second model pass over the same private case.
+
+    ``agent_binding_hash`` names the exact work per kind: the sorted locator digest for
+    ``MONITOR``, the canonical digest of ``{case_id, expected_case_version, reason}`` for
+    ``INVESTIGATE``, and of ``{case_id, view_id, view_hash}`` for ``PROPOSE_ACTION``. It
+    carries identifiers and digests only, never a locator list, never message text, and never a
+    view body. It is immutable for the operation's lifetime: every transition copies both
+    forward, and nothing in the system rebinds an operation to a second invocation.
     """
 
     operation_id: OperationId
@@ -672,9 +792,9 @@ class ApplicationOperation:
     version: int
     created_at: datetime
     updated_at: datetime
-    monitor_invocation_id: UUID | None = None
-    monitor_locator_hash: Sha256Digest | None = None
-    schema_version: str = "application-operation/v1"
+    agent_invocation_id: UUID | None = None
+    agent_binding_hash: Sha256Digest | None = None
+    schema_version: str = "application-operation/v2"
 
     def __post_init__(self) -> None:
         _unique(self.result_refs, "result_refs")
@@ -682,8 +802,8 @@ class ApplicationOperation:
             raise ValueError("expires_at_epoch cannot be negative")
         _positive_version(self.version)
         _timestamps(self.created_at, self.updated_at)
-        bound = (self.monitor_invocation_id is None, self.monitor_locator_hash is None)
+        bound = (self.agent_invocation_id is None, self.agent_binding_hash is None)
         if len(set(bound)) != 1:
-            raise ValueError("a Monitor handover binds an invocation and a locator hash together")
-        if self.kind is not ApplicationOperationKind.MONITOR and self.monitor_invocation_id:
-            raise ValueError("only a MONITOR operation carries a Monitor handover identity")
+            raise ValueError("an agent handover binds an invocation and a binding hash together")
+        if self.kind not in AGENT_INVOKING_OPERATION_KINDS and self.agent_invocation_id:
+            raise ValueError("only an agent-invoking operation carries a handover identity")

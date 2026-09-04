@@ -34,6 +34,7 @@ from chorus.domain.ids import (
     CommunityId,
     ContributorId,
     DestinationId,
+    EvidenceRootId,
     ExecutionId,
     ExportFactId,
     FactId,
@@ -72,6 +73,31 @@ class TransformationKind(StrEnum):
     ANONYMIZED = "ANONYMIZED"
     AGGREGATED = "AGGREGATED"
     GENERALIZED = "GENERALIZED"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EvidenceRootLocator:
+    """The immutable address of one evidence root, keyed by its identifier (ADR-017).
+
+    It holds exactly one field beyond its own identity: the ``root_sha256`` the canonical
+    ``EVIDENCE_ROOT#`` row lives at. Deliberately not a second copy of the root, so the two
+    can never disagree about anything except existence -- and a missing locator fails closed
+    with ``INTEGRITY_ERROR`` rather than producing a partial ancestry and an under-count.
+
+    Created in the same transaction as its canonical root, with the same create-only
+    condition, so a root is never addressable by content without being addressable by
+    identifier as well.
+    """
+
+    namespace: Namespace
+    community_id: CommunityId
+    root_id: EvidenceRootId
+    root_sha256: Sha256Digest
+    created_at: datetime
+    schema_version: str = "evidence-root-locator/v1"
+
+    def __post_init__(self) -> None:
+        require_utc(self.created_at)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

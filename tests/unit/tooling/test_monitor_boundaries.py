@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from pathlib import Path
 
 import pytest
@@ -165,19 +166,35 @@ def test_the_lexical_fake_cannot_be_the_demo_agent() -> None:
         )
 
 
-def test_no_phase_three_module_performs_a_scan() -> None:
+DYNAMODB_SCAN = re.compile(r"(?<![A-Za-z])Scan")
+"""The DynamoDB scan operation, wherever it is spelled.
+
+The lookbehind is the whole of the change from an earlier bare ``"Scan" not in text``. That
+substring also matches ``MalwareScanStatus`` and ``malware_scan_status`` -- a domain enum about
+whether storage accepted some bytes, which has nothing to do with a table read -- so the bare
+check made a legitimate domain name look like a forbidden access pattern.
+
+The lookbehind keeps every spelling that *is* one: a bare ``Scan``, ``ScanRequest``,
+``dynamodb:Scan`` in a policy string, and ``"Scan"`` in an SDK call. It admits only an
+identifier that ends in ``...Scan...`` preceded by another letter, which no scan API does.
+"""
+
+
+def test_no_application_module_performs_a_scan() -> None:
     """The frozen access patterns forbid a scan, and none of the new code has one."""
 
     sources = [
         REPOSITORY_ROOT / "src" / "chorus" / "application",
         REPOSITORY_ROOT / "apps" / "api" / "chorus_api",
-        RUNTIME_ROOT,
+        REPOSITORY_ROOT / "runtimes",
     ]
     for root in sources:
         for path in root.rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
             text = path.read_text(encoding="utf-8")
-            assert ".scan(" not in text
-            assert "Scan" not in text or path.name == "test_agent_stack.py"
+            assert ".scan(" not in text, path
+            assert DYNAMODB_SCAN.search(text) is None, path
 
 
 def test_the_validator_is_the_only_route_from_an_answer_to_the_planner() -> None:
