@@ -136,6 +136,14 @@ class FaultInjectingDriver:
     write_script: list[WriteBehaviour] = field(default_factory=list)
     scripted: Callable[[tuple[WriteOperation, ...]], bool] | None = None
     write_scripted: Callable[[PutItem | DeleteItem], bool] | None = None
+    read_scripted: Callable[[ItemKey], bool] | None = None
+    """Narrows which reads the read script applies to, and does not consume an entry otherwise.
+
+    Without it a read script fires at whichever ``get_item`` happened to come first, which for
+    a use case that strongly loads several records before it writes anything means the fault
+    lands nowhere near the read the test is about -- most importantly, nowhere near the
+    *commit-proof* read that resolves an ambiguous write.
+    """
     transact_calls: int = field(default=0, init=False)
     scripted_calls: int = field(default=0, init=False)
     read_calls: int = field(default=0, init=False)
@@ -152,6 +160,8 @@ class FaultInjectingDriver:
     """
 
     async def get_item(self, key: ItemKey, *, consistent: bool) -> StoredItem | None:
+        if self.read_scripted is not None and not self.read_scripted(key):
+            return await self.inner.get_item(key, consistent=consistent)
         index = self.read_calls
         self.read_calls += 1
         behaviour = (

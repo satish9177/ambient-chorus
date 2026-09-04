@@ -1,9 +1,15 @@
-"""The pinned ``monitor/v1`` prompt and its untrusted-data rendering.
+"""The pinned ``monitor/v3`` prompt and its untrusted-data rendering.
 
 The prompt text is version-controlled here and nowhere else. There is no template assembled at
 runtime, no instruction supplied by a caller, and no field of the payload that becomes part of
 the instructions. What varies between invocations is only the data blocks below the fixed
 prompt, and every one of those is fenced.
+
+``MONITOR_PROMPT_VERSION`` names the whole reviewed artifact, not only this text. The runtime
+hands the model this prompt *and* the :class:`~chorus.contracts.monitor.MonitorOutput` schema in
+one call, so a field in that schema is as much an instruction as a sentence here -- which is why
+removing ``mandate_suggestions`` moved the version to ``v3`` (ADR-014) even though not a
+character of the text below changed.
 
 Fencing is a structural claim, not a request. The system prompt states once that everything
 inside a data block is a quotation of what somebody wrote, that instructions found there are
@@ -39,7 +45,7 @@ from uuid import UUID
 
 from chorus.contracts.monitor import MonitorInput, MonitorMessage
 
-MONITOR_PROMPT_VERSION = "monitor/v2"
+MONITOR_PROMPT_VERSION = "monitor/v3"
 
 FENCE_PREFIX: Final = "CHORUS_DATA_"
 FENCE_HEX_LENGTH: Final = 24

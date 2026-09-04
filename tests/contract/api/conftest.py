@@ -17,13 +17,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 import pytest
-from chorus_api.dependencies import ApiContainer
+from chorus_api.dependencies import ApiContainer, DemoActor
 from chorus_api.main import build_app
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from tests.fixtures.drivers import DRIVER_PARAMS, storage_driver
-from tests.fixtures.monitor import MonitorHarness
+from tests.fixtures.monitor import DESTINATION_ID, FIXTURE_ID_NAMESPACE, MonitorHarness
 
+from chorus.domain.ids import Uuid5Generator
 from chorus.infrastructure.local.dispatch import (
     InProcessOperationDispatcher,
     RecordingOperationDispatcher,
@@ -47,9 +48,20 @@ class ApiHarness:
         headers.update(extra)
         return headers
 
+    def actor_headers(self, actor: str, **extra: str) -> dict[str, str]:
+        """Headers for any seeded persona, so a test names the actor it means to be."""
+
+        headers = {"X-Chorus-Demo-Actor": actor}
+        headers.update(extra)
+        return headers
+
 
 def build_harness(
-    driver: StorageDriver, dispatcher_kind: str, *, agent: MonitorAgentPort | None = None
+    driver: StorageDriver,
+    dispatcher_kind: str,
+    *,
+    agent: MonitorAgentPort | None = None,
+    ids_prefix: str | None = None,
 ) -> ApiHarness:
     """Wire one application over an explicit driver.
 
@@ -60,6 +72,13 @@ def build_harness(
     """
 
     harness = MonitorHarness(driver=driver)
+    if ids_prefix is not None:
+        # Before the container is built, because the use cases below capture this generator by
+        # reference. Two harnesses over one namespace otherwise mint identical identifiers, and
+        # the second one's create-only writes collide with the first one's rows.
+        harness.ids = Uuid5Generator(
+            namespace=FIXTURE_ID_NAMESPACE, prefix=f"{harness.namespace.value}:{ids_prefix}"
+        )
     dispatcher: RecordingOperationDispatcher | InProcessOperationDispatcher
     if dispatcher_kind == "recording":
         dispatcher = RecordingOperationDispatcher()
@@ -69,9 +88,18 @@ def build_harness(
         )
     container = ApiContainer(
         namespace=harness.namespace,
+        community_id=harness.community_id,
+        destination_id=DESTINATION_ID,
+        contributor_by_actor={
+            DemoActor(actor): contributor_id
+            for actor, contributor_id in harness.contributor_by_actor.items()
+        },
         ingest_messages=harness.ingest,
         read_feed=harness.read_feed,
         operations=harness.operations,
+        propose_mandates=harness.propose_mandates,
+        decide_mandate=harness.decide_mandate,
+        read_mandate_thread=harness.read_mandate_thread,
         dispatcher=dispatcher,
     )
     app = build_app(container)

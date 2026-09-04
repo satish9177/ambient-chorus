@@ -168,6 +168,62 @@ def transition_case(
     )
 
 
+MANDATE_MUTABLE_CASE_STATES: frozenset[CaseState] = frozenset(
+    {
+        CaseState.CANDIDATE,
+        CaseState.AWAITING_MANDATES,
+        CaseState.INVESTIGATING,
+        CaseState.READY_FOR_ACTION,
+        CaseState.ACTION_PROPOSED,
+        CaseState.ACTIONED,
+        CaseState.VERIFYING,
+    }
+)
+"""Where an authorization decision may still be recorded against a case.
+
+Everything except the two terminal states. ``RESOLVED`` and ``CLOSED_UNRESOLVED`` are excluded
+because the state machine reopens a terminal case only through an explicit human reopen
+command, and a mandate decision is not one: accepting it would bump the version of a case
+nothing may act on and leave the pointer describing an authorization that no longer has a
+subject. A decision against a terminal case is refused with the case left exactly as it was.
+
+``ACTIONED`` and ``VERIFYING`` are included deliberately. A revocation there cannot unsend the
+message that was already sent, and the frozen contract says so plainly -- but it still governs
+every future export, so refusing to record it would be the worse answer.
+"""
+
+
+def bump_case_authorization(
+    case: CommunityCase,
+    *,
+    expected_version: int,
+    reason_code: str,
+    now: datetime,
+) -> CommunityCase:
+    """Increment the case version for an authorization-sensitive change of no state.
+
+    The frozen compiler contract requires a mandate decision to move the case version so that
+    every previously compiled view and every proposal bound to the old version becomes stale.
+    Most decisions imply no *state* change, and :func:`transition_case` cannot express that:
+    every edge it knows is a real edge with its own guard, and ``(state, state)`` is not one.
+
+    Coercing a self-edge into the transition table would have been worse than a second
+    function. It would put an unguarded pair into a table whose entire value is that every pair
+    in it is guarded, and the first reader to add ``(READY_FOR_ACTION, READY_FOR_ACTION)`` for
+    convenience would have opened a path that skips readiness reconciliation entirely.
+    """
+
+    require_utc(now)
+    if case.version != expected_version or case.state not in MANDATE_MUTABLE_CASE_STATES:
+        raise StateTransitionError(str(case.case_id))
+    return replace(
+        case,
+        state_reason_code=reason_code,
+        version=case.version + 1,
+        updated_at=now,
+    )
+
+
 def transition_action_execution(
     execution: ActionExecution,
     target: ActionExecutionState,

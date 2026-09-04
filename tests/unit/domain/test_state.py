@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta
+from uuid import UUID
 
 import pytest
 from tests.fixtures.elevator import NOW, _uuid, build_elevator_fixture
@@ -11,14 +12,24 @@ from chorus.domain.entities import (
     ActionExecutionState,
     CaseState,
     CommitmentStatus,
+    CommunityCase,
 )
 from chorus.domain.errors import StateTransitionError
-from chorus.domain.ids import ApprovalId, ExecutionId, Sha256Digest
+from chorus.domain.ids import (
+    ApprovalId,
+    CaseId,
+    CommunityId,
+    ExecutionId,
+    Namespace,
+    Sha256Digest,
+)
 from chorus.domain.state import (
     ACTION_EXECUTION_EDGES,
     CASE_EDGES,
     COMMITMENT_EDGES,
+    MANDATE_MUTABLE_CASE_STATES,
     CaseTransitionContext,
+    bump_case_authorization,
     transition_action_execution,
     transition_case,
     transition_commitment,
@@ -175,3 +186,78 @@ def test_commitment_legal_edges_are_guarded(
     )
 
     assert updated.status is target
+
+
+# -- authorization-sensitive case version bumps --------------------------------------------
+
+MANDATE_BUMP_REASON = "MANDATE_DECIDED"
+BUMP_NOW = NOW
+
+
+def _case_in(state: CaseState, *, version: int = 3) -> CommunityCase:
+    return CommunityCase(
+        case_id=CaseId(UUID("11111111-1111-4111-8111-111111111111")),
+        community_id=CommunityId(UUID("22222222-2222-4222-8222-222222222222")),
+        namespace=Namespace("TEST_STATE_BUMP"),
+        title="Recurring elevator failures",
+        issue_type="ELEVATOR_FAILURE",
+        state=state,
+        report_ids=(),
+        fact_ids=(),
+        assessment_id=None,
+        current_view_id=None,
+        current_action_id=None,
+        corroboration_source_count=2,
+        state_reason_code="SEEDED",
+        version=version,
+        created_at=BUMP_NOW,
+        updated_at=BUMP_NOW,
+    )
+
+
+@pytest.mark.parametrize("state", sorted(MANDATE_MUTABLE_CASE_STATES, key=str))
+def test_an_authorization_bump_moves_the_version_and_keeps_the_state(
+    state: CaseState,
+) -> None:
+    """Every non-terminal state accepts the bump, and none of them changes state because of it."""
+
+    case = _case_in(state)
+
+    bumped = bump_case_authorization(
+        case, expected_version=3, reason_code=MANDATE_BUMP_REASON, now=BUMP_NOW
+    )
+
+    assert bumped.version == 4
+    assert bumped.state is state
+    assert bumped.state_reason_code == MANDATE_BUMP_REASON
+    assert bumped.updated_at == BUMP_NOW
+
+
+@pytest.mark.parametrize("state", [CaseState.RESOLVED, CaseState.CLOSED_UNRESOLVED])
+def test_a_terminal_case_refuses_an_authorization_bump(state: CaseState) -> None:
+    """A resolved or closed case has nothing left for an authorization change to govern.
+
+    The state machine reopens a terminal case only through an explicit human reopen command,
+    and a mandate decision is not one -- so recording one here would bump a version no artifact
+    is bound to, and leave a pointer describing consent with no subject.
+    """
+
+    with pytest.raises(StateTransitionError):
+        bump_case_authorization(
+            _case_in(state), expected_version=3, reason_code=MANDATE_BUMP_REASON, now=BUMP_NOW
+        )
+
+
+def test_an_authorization_bump_is_guarded_on_the_expected_version() -> None:
+    with pytest.raises(StateTransitionError):
+        bump_case_authorization(
+            _case_in(CaseState.INVESTIGATING),
+            expected_version=2,
+            reason_code=MANDATE_BUMP_REASON,
+            now=BUMP_NOW,
+        )
+
+
+def test_the_mandate_mutable_states_are_exactly_the_non_terminal_ones() -> None:
+    terminal = {CaseState.RESOLVED, CaseState.CLOSED_UNRESOLVED}
+    assert set(MANDATE_MUTABLE_CASE_STATES) == set(CaseState) - terminal

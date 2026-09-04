@@ -31,6 +31,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from chorus.application.errors import ApplicationError, ApplicationErrorCode
 from chorus.domain.errors import DomainError, DomainErrorCode
 from chorus.ports.agents import AgentError, AgentErrorCode
 from chorus.ports.errors import PersistenceError, PersistenceErrorCode
@@ -142,6 +143,27 @@ _PERSISTENCE_PROBLEMS: Final[dict[PersistenceErrorCode, ProblemShape]] = {
         title="Storage outcome is unknown",
         detail="The outcome could not be established. Do not retry; poll for current state.",
         retryable=False,
+    ),
+}
+
+_APPLICATION_PROBLEMS: Final[dict[ApplicationErrorCode, ProblemShape]] = {
+    ApplicationErrorCode.POLICY_DENIED: ProblemShape(
+        status=422,
+        title="Policy refused these terms",
+        detail="Deterministic policy does not permit this authorization. See the reason codes.",
+        retryable=False,
+    ),
+    ApplicationErrorCode.STALE_AUTHORIZATION: ProblemShape(
+        status=409,
+        title="Authorization snapshot is stale",
+        detail="Reload the current version and decide against it.",
+        retryable=False,
+    ),
+    ApplicationErrorCode.SEND_AUTHORIZATION_IN_PROGRESS: ProblemShape(
+        status=409,
+        title="A send authorization is in progress",
+        detail="An authorized send holds this case. Retry shortly.",
+        retryable=True,
     ),
 }
 
@@ -263,6 +285,19 @@ def register_problem_handlers(app: FastAPI) -> None:
             correlation_id=correlation_id_of(request),
         )
 
+    @app.exception_handler(ApplicationError)
+    async def _application(request: Request, error: ApplicationError) -> JSONResponse:
+        shape = _APPLICATION_PROBLEMS.get(error.code, _INTERNAL)
+        return problem_response(
+            code=error.code.value,
+            shape=shape,
+            instance=safe_instance(request),
+            correlation_id=correlation_id_of(request),
+            # Closed policy codes. They name which deterministic rule refused the terms
+            # without revealing the fact, the scope requested, or any stored value.
+            reason_codes=error.reason_codes,
+        )
+
     @app.exception_handler(AgentError)
     async def _agent(request: Request, error: AgentError) -> JSONResponse:
         shape = _AGENT_PROBLEMS.get(error.code, _INTERNAL)
@@ -330,6 +365,22 @@ TRANSPORT_FIELD_NAMES: Final[frozenset[str]] = frozenset(
         "operation_id",
         "Idempotency-Key",
         "X-Chorus-Demo-Actor",
+        # mandate path/query parameters
+        "case_id",
+        "mandate_id",
+        # ProposeMandatesRequest
+        "expected_case_version",
+        # MandateDecisionRequest
+        "expected_version",
+        "decision",
+        "fact_grants",
+        "identity_grant",
+        "expires_at",
+        # FactGrantRequest and IdentityGrantRequest
+        "fact_id",
+        "max_scope",
+        "allow_safe_transformation",
+        "externally_shareable",
     }
 )
 """Every field name a validation problem is allowed to say out loud.

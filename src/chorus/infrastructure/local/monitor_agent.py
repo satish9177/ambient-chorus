@@ -33,7 +33,6 @@ from chorus.contracts.monitor import (
     CandidateLink,
     IncidentOccurrenceValue,
     IssueType,
-    MandateSuggestion,
     MessageClassification,
     MonitorMessage,
     MonitorMessageResult,
@@ -42,7 +41,7 @@ from chorus.contracts.monitor import (
     ProposedFact,
     ProposedReport,
 )
-from chorus.domain.entities import DisclosureScope, FactType, Purpose, SensitivityCategory
+from chorus.domain.entities import FactType, SensitivityCategory
 from chorus.domain.facts import FailureMode, LocationAreaCode
 from chorus.ports.agents import AgentError, MonitorInvocation, MonitorResult
 
@@ -145,7 +144,6 @@ def build_lexical_output(invocation: MonitorInvocation) -> MonitorOutput:
     reports: list[ProposedReport] = []
     facts: list[ProposedFact] = []
     links: list[CandidateLink] = []
-    suggestions: list[MandateSuggestion] = []
 
     for index, message in enumerate(payload.messages, start=1):
         lowered = message.text.lower()
@@ -218,21 +216,12 @@ def build_lexical_output(invocation: MonitorInvocation) -> MonitorOutput:
                 confidence="0.6",
             )
         )
-        suggestions.append(
-            MandateSuggestion(
-                report_client_ref=report_ref,
-                fact_client_refs=(fact_ref,),
-                suggested_max_scope=DisclosureScope.ANONYMOUS_CASE,
-                suggested_purpose=Purpose.REQUEST_ELEVATOR_REPAIR_AND_RESPONSE,
-            )
-        )
 
     return MonitorOutput(
         message_results=tuple(results),
         proposed_reports=tuple(reports),
         proposed_facts=tuple(facts),
         candidate_links=tuple(links),
-        mandate_suggestions=tuple(suggestions),
     )
 
 

@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import UUID, uuid4, uuid5
 
+from chorus.application.commands.decide_mandate import DecideMandate
 from chorus.application.commands.ingest_messages import (
     IngestAttachment,
     IngestMessage,
@@ -23,10 +24,12 @@ from chorus.application.commands.ingest_messages import (
     IngestMessagesCommand,
     IngestMessagesResult,
 )
+from chorus.application.commands.propose_mandates import ProposeMandates
 from chorus.application.commands.run_monitor import RunMonitor, RunMonitorCommand
 from chorus.application.commands.run_monitor_operation import MonitorOperationWorker
 from chorus.application.operations import ApplicationOperations, monitor_locator_hash
 from chorus.application.queries.feed import ReadAmbientFeed
+from chorus.application.queries.mandates import ReadMandateThread
 from chorus.application.services.monitor_snapshots import MonitorSnapshots
 from chorus.domain.entities import (
     ApplicationOperation,
@@ -39,6 +42,7 @@ from chorus.domain.entities import (
 from chorus.domain.ids import (
     CommunityId,
     ContributorId,
+    DestinationId,
     Namespace,
     OperationId,
     SensitiveStr,
@@ -67,6 +71,26 @@ NOW = datetime(2030, 1, 14, 9, 0, 0, tzinfo=UTC)
 
 FIXTURE_ID_NAMESPACE = UUID("0f5a4a6a-6c1c-5f3a-8a4f-9d3a2b1c0e77")
 PRESENTER_ACTOR_HASH = Sha256Digest(f"sha256:{sha256(b'presenter_admin').hexdigest()}")
+DESTINATION_ID = DestinationId("property_manager:demo")
+
+RESIDENT_PSEUDONYM_BY_ACTOR: dict[str, str] = {
+    "resident_a": "resident-a",
+    "resident_b": "resident-b",
+    "resident_c": "resident-c",
+    "resident_d": "resident-d",
+}
+"""The seeded persona registry: which demo actor acts as which corpus contributor.
+
+Deliberately a mapping rather than a string transformation. A persona is an authentication
+concept and a pseudonym is corpus data, and deriving one from the other by replacing an
+underscore would mean any future persona name silently minted an identity.
+"""
+
+
+def resident_actor_hash(actor: str) -> Sha256Digest:
+    """Hash one resident persona the way the API does, for a command built without HTTP."""
+
+    return Sha256Digest(f"sha256:{sha256(actor.encode('utf-8')).hexdigest()}")
 
 
 @dataclass(slots=True)
@@ -213,6 +237,43 @@ class MonitorHarness:
     @property
     def read_feed(self) -> ReadAmbientFeed:
         return ReadAmbientFeed(core=self.core, attachments=self.adapter)
+
+    # -- mandates ----------------------------------------------------------------------
+
+    @property
+    def propose_mandates(self) -> ProposeMandates:
+        return ProposeMandates(
+            core=self.core,
+            audit=self.audit,
+            idempotency=self.idempotency,
+            unit_of_work=self.unit_of_work,
+            clock=self.clock,
+            ids=self.ids,
+        )
+
+    @property
+    def decide_mandate(self) -> DecideMandate:
+        return DecideMandate(
+            core=self.core,
+            audit=self.audit,
+            idempotency=self.idempotency,
+            unit_of_work=self.unit_of_work,
+            clock=self.clock,
+            ids=self.ids,
+        )
+
+    @property
+    def read_mandate_thread(self) -> ReadMandateThread:
+        return ReadMandateThread(core=self.core, clock=self.clock)
+
+    @property
+    def contributor_by_actor(self) -> dict[str, ContributorId]:
+        """The seeded actor registry the API resolves a resident persona through."""
+
+        return {
+            actor: self.contributor_id(pseudonym)
+            for actor, pseudonym in RESIDENT_PSEUDONYM_BY_ACTOR.items()
+        }
 
     # -- ingestion ---------------------------------------------------------------------
 

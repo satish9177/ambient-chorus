@@ -217,7 +217,7 @@ def validate_monitor_result(
         rejections=rejections,
     )
     _validate_sensitive_signals(output, messages_by_id, rejections)
-    _validate_auxiliary_references(output, set(reports_by_ref), facts, rejections)
+    _validate_auxiliary_references(output, set(reports_by_ref), rejections)
 
     groups = _validate_candidate_links(
         output=output,
@@ -449,18 +449,16 @@ def _validate_sensitive_signals(
 def _validate_auxiliary_references(
     output: MonitorOutput,
     report_refs: set[str],
-    facts: tuple[ValidatedFact, ...],
     rejections: _Rejections,
 ) -> None:
-    fact_refs = {fact.client_ref for fact in facts}
+    """Refuse an answer whose side outputs cite a report the answer never proposed.
+
+    Only ``missing_information_requests`` remains here. The Monitor has no disclosure-terms
+    output to check (ADR-014), so a fact-level reference check no longer has a caller.
+    """
+
     for request in output.missing_information_requests:
         if request.report_client_ref not in report_refs:
-            rejections.add(AgentRejection.UNKNOWN_CLIENT_REF)
-    for suggestion in output.mandate_suggestions:
-        if suggestion.report_client_ref not in report_refs:
-            rejections.add(AgentRejection.UNKNOWN_CLIENT_REF)
-            continue
-        if not set(suggestion.fact_client_refs) <= fact_refs:
             rejections.add(AgentRejection.UNKNOWN_CLIENT_REF)
 
 

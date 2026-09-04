@@ -11,6 +11,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 from tests.fixtures.monitor_outputs import (
     CONTRIBUTORS,
     NAMESPACE,
@@ -30,13 +31,15 @@ from chorus.contracts.common import MONITOR_PROMPT_VERSION
 from chorus.contracts.monitor import (
     CandidateLink,
     IssueType,
-    MandateSuggestion,
     MessageClassification,
     MonitorCandidateSummary,
+    MonitorOutput,
     MonitorSourceSpan,
+    ProposedFact,
+    ProposedReport,
     SensitiveSignal,
 )
-from chorus.domain.entities import DisclosureScope, FactType, Purpose, SensitivityCategory
+from chorus.domain.entities import FactType, SensitivityCategory
 from chorus.ports.agents import AgentContractViolationError, AgentRejection
 
 
@@ -106,7 +109,7 @@ def test_an_answer_from_an_unreviewed_prompt_version_is_refused() -> None:
         )
     assert AgentRejection.PROMPT_VERSION_MISMATCH.value in raised.value.reason_codes
     assert "prompt_version" not in type(case.invocation).model_fields
-    assert MONITOR_PROMPT_VERSION == "monitor/v2"
+    assert MONITOR_PROMPT_VERSION == "monitor/v3"
 
 
 def test_a_missing_message_classification_is_refused() -> None:
@@ -315,17 +318,36 @@ def test_a_sensitive_signal_with_an_invalid_span_is_refused() -> None:
     _expect(poisoned, AgentRejection.SOURCE_SPAN_INVALID)
 
 
-def test_a_mandate_suggestion_naming_an_unknown_fact_is_refused() -> None:
-    case = valid_case()
-    suggestion = MandateSuggestion(
-        report_client_ref="report-1",
-        fact_client_refs=("fact-does-not-exist",),
-        suggested_max_scope=DisclosureScope.ANONYMOUS_CASE,
-        suggested_purpose=Purpose.REQUEST_ELEVATOR_REPAIR_AND_RESPONSE,
-    )
-    poisoned = _mutate(case, mandate_suggestions=(suggestion,))
+def test_the_monitor_answer_has_no_field_for_disclosure_terms() -> None:
+    """ADR-014: an answer that names a scope is refused at parse, not reference-checked.
 
-    _expect(poisoned, AgentRejection.UNKNOWN_CLIENT_REF)
+    The field this replaces used to be validated and then discarded, which meant the schema
+    handed to the model still invited it to choose how far a fact may travel. Asserting on
+    ``model_fields`` rather than on a rejection code is the point: the guarantee is that the
+    field does not exist, not that some validator copes with it.
+    """
+
+    assert "mandate_suggestions" not in MonitorOutput.model_fields
+    forbidden = {"suggested_max_scope", "suggested_purpose", "max_scope", "disclosure_scope"}
+    for model in (MonitorOutput, ProposedFact, ProposedReport, CandidateLink, SensitiveSignal):
+        assert not forbidden & set(model.model_fields)
+
+    with pytest.raises(PydanticValidationError):
+        MonitorOutput.model_validate(
+            {
+                "message_results": [
+                    {"message_id": str(uuid4()), "classification": "NOISE", "reason": "none"}
+                ],
+                "mandate_suggestions": [
+                    {
+                        "report_client_ref": "report-1",
+                        "fact_client_refs": ["fact-1"],
+                        "suggested_max_scope": "EXTERNAL_ACTION",
+                        "suggested_purpose": "REQUEST_ELEVATOR_REPAIR_AND_RESPONSE",
+                    }
+                ],
+            }
+        )
 
 
 def test_a_noise_classification_is_reported_without_creating_anything() -> None:

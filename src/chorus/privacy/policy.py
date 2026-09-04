@@ -8,7 +8,13 @@ from datetime import datetime
 from enum import IntEnum, StrEnum
 from uuid import UUID
 
-from chorus.domain.entities import DestinationKind, Purpose
+from chorus.domain.entities import (
+    DestinationKind,
+    DisclosureScope,
+    FactType,
+    Purpose,
+    SensitivityCategory,
+)
 from chorus.domain.ids import (
     CaseId,
     DestinationId,
@@ -194,6 +200,178 @@ class IncludedFact:
 class ExcludedFact:
     fact_id: FactId
     reason_codes: tuple[CompileReasonCode, ...]
+
+
+ALLOWED_PURPOSES: frozenset[Purpose] = frozenset({Purpose.REQUEST_ELEVATOR_REPAIR_AND_RESPONSE})
+"""Every purpose policy/v1 recognises. A new purpose requires a policy/ADR update."""
+
+ALLOWED_DESTINATION_KINDS: frozenset[DestinationKind] = frozenset(
+    {DestinationKind.PROPERTY_MANAGER}
+)
+"""Every destination kind policy/v1 recognises. There is no wildcard destination in V1."""
+
+
+SCOPE_PERMITS: dict[DisclosureScope, frozenset[DisclosureScope]] = {
+    DisclosureScope.INTERNAL_ONLY: frozenset({DisclosureScope.INTERNAL_ONLY}),
+    DisclosureScope.AGGREGATE_ONLY: frozenset(
+        {DisclosureScope.INTERNAL_ONLY, DisclosureScope.AGGREGATE_ONLY}
+    ),
+    DisclosureScope.ANONYMOUS_CASE: frozenset(
+        {
+            DisclosureScope.INTERNAL_ONLY,
+            DisclosureScope.AGGREGATE_ONLY,
+            DisclosureScope.ANONYMOUS_CASE,
+        }
+    ),
+    DisclosureScope.NAMED_CASE: frozenset(
+        {
+            DisclosureScope.INTERNAL_ONLY,
+            DisclosureScope.AGGREGATE_ONLY,
+            DisclosureScope.ANONYMOUS_CASE,
+            DisclosureScope.NAMED_CASE,
+        }
+    ),
+    DisclosureScope.EXTERNAL_ACTION: frozenset(DisclosureScope),
+}
+"""Which scopes a ceiling permits a grant to hold. An explicit table, never an enum ordinal.
+
+The frozen contract is emphatic that scopes are capabilities rather than a numeric ordering,
+so this is written out rather than computed from member order. Two entries deserve their
+reasoning stated, because they are the ones that look like an ordering and are not.
+
+``AGGREGATE_ONLY`` appears under every non-internal ceiling. That is not because it sits low on
+a scale but because of what it can produce: a compiler-created aggregate backed by at least
+three distinct contributors, with no source-level text and no identity. It discloses strictly
+less than a standalone anonymous case fact, so a contributor whose ceiling is
+``ANONYMOUS_CASE`` or higher can always choose it and always discloses less by doing so.
+
+``EXTERNAL_ACTION`` permits the full set, including ``NAMED_CASE`` -- but permitting a *content*
+scope is not permitting identity. Identity requires its own grant, evaluated independently at
+compiler gate 15, and no entry in this table can supply it.
+"""
+
+
+def scope_permits(ceiling: DisclosureScope, requested: DisclosureScope) -> bool:
+    """True when a ceiling permits a grant at exactly the requested scope."""
+
+    return requested in SCOPE_PERMITS[ceiling]
+
+
+_FACT_TYPE_CEILING: dict[FactType, DisclosureScope] = {
+    FactType.INCIDENT_OCCURRENCE: DisclosureScope.EXTERNAL_ACTION,
+    FactType.SERVICE_IMPACT: DisclosureScope.EXTERNAL_ACTION,
+    FactType.LOCATION_AREA: DisclosureScope.EXTERNAL_ACTION,
+    FactType.CONTRADICTION: DisclosureScope.EXTERNAL_ACTION,
+    FactType.EVIDENCE_DESCRIPTION: DisclosureScope.EXTERNAL_ACTION,
+    # An identity fact stops at NAMED_CASE. policy/v1's only identity rule is
+    # `p1.identity.named.v1`, which produces a display name inside a named case; there is no
+    # rule that attaches a name to an outbound action, so a higher ceiling would be an
+    # authorization for an export the compiler can never construct.
+    FactType.IDENTITY_ATTRIBUTE: DisclosureScope.NAMED_CASE,
+    # policy/v1 hard-codes these as non-exportable. A mandate that purported to allow one would
+    # be overridden by the compiler anyway; refusing it here means it is never written down as
+    # an authorization in the first place.
+    FactType.UNIT_LOCATION: DisclosureScope.INTERNAL_ONLY,
+    FactType.HEALTH_DETAIL: DisclosureScope.INTERNAL_ONLY,
+    # A structured management statement still carries a direct private quote, and the
+    # re-identification gate rejects every one of them. Only a separately typed CONTRADICTION
+    # produces the neutral policy/v1 transformation.
+    FactType.MANAGEMENT_STATEMENT: DisclosureScope.INTERNAL_ONLY,
+    # Not in the minimum-necessary allowlist for the policy/v1 purpose.
+    FactType.COMMITMENT_TERM: DisclosureScope.INTERNAL_ONLY,
+}
+
+_HARD_INTERNAL_SENSITIVITIES: frozenset[SensitivityCategory] = frozenset(
+    {
+        SensitivityCategory.CONTACT,
+        SensitivityCategory.UNIT_LOCATION,
+        SensitivityCategory.HEALTH,
+        SensitivityCategory.MINOR,
+        SensitivityCategory.PRIVATE_QUOTE,
+        SensitivityCategory.PRIVATE_EVIDENCE_URI,
+    }
+)
+"""Sensitivity categories policy/v1 keeps internal whatever the fact type says.
+
+The same set the compiler's scope gate uses. Sensitivity is checked *after* type because it
+can only ever narrow: a ``SERVICE_IMPACT`` carrying a health category is internal, and no fact
+type can raise a ceiling that its sensitivity has lowered.
+"""
+
+_PROPOSED_SCOPE: dict[FactType, DisclosureScope] = {
+    FactType.INCIDENT_OCCURRENCE: DisclosureScope.ANONYMOUS_CASE,
+    FactType.SERVICE_IMPACT: DisclosureScope.ANONYMOUS_CASE,
+    FactType.LOCATION_AREA: DisclosureScope.ANONYMOUS_CASE,
+    FactType.CONTRADICTION: DisclosureScope.ANONYMOUS_CASE,
+}
+"""What a proposal offers by default, which is never the ceiling.
+
+Only the four fact types that carry no person-level detail are offered at all, and they are
+offered at ``ANONYMOUS_CASE`` -- enough to state that an incident happened, not enough to
+attach it to anyone. Everything absent from this mapping is proposed ``INTERNAL_ONLY`` and
+has to be widened by a deliberate contributor decision.
+
+``EVIDENCE_DESCRIPTION`` is deliberately absent even though its ceiling is
+``EXTERNAL_ACTION``: exporting a photo derivative is exactly the kind of choice that must be
+opted into rather than arrived at by accepting a default.
+"""
+
+IDENTITY_CEILING: DisclosureScope = DisclosureScope.NAMED_CASE
+"""The most identity permission policy/v1 lets a contributor give, for the reason above."""
+
+
+class MandateDenialCode(StrEnum):
+    """Every deterministic reason a proposed or adjusted mandate term is refused.
+
+    Bounded codes, so a denial can be returned, logged, and counted without the fact
+    identifier, the scope the caller asked for, or any private value travelling with it.
+
+    ``UNKNOWN_FACT`` deliberately covers four distinct situations: the identifier names no
+    fact, it names a fact in another case, it names a fact in another community or namespace,
+    and it names a fact owned by a different contributor. Separate codes would be more helpful
+    to a well-behaved client and would also be an oracle -- a caller could walk identifiers and
+    learn which ones exist inside a case they are not entitled to read, and which of their
+    neighbours owns what. One code answers all four identically.
+    """
+
+    UNKNOWN_FACT = "UNKNOWN_FACT"
+    DUPLICATE_FACT_GRANT = "DUPLICATE_FACT_GRANT"
+    SCOPE_EXCEEDS_POLICY_MAXIMUM = "SCOPE_EXCEEDS_POLICY_MAXIMUM"
+    IDENTITY_EXCEEDS_POLICY_MAXIMUM = "IDENTITY_EXCEEDS_POLICY_MAXIMUM"
+    GRANT_NOT_PROPOSED = "GRANT_NOT_PROPOSED"
+    DESTINATION_NOT_ALLOWED = "DESTINATION_NOT_ALLOWED"
+    PURPOSE_NOT_ALLOWED = "PURPOSE_NOT_ALLOWED"
+    EXPIRY_ALREADY_PASSED = "EXPIRY_ALREADY_PASSED"
+    NO_GRANTABLE_FACT = "NO_GRANTABLE_FACT"
+
+
+def policy_maximum_scope(fact_type: FactType, sensitivity: SensitivityCategory) -> DisclosureScope:
+    """Return the highest scope policy/v1 permits a contributor to grant for one fact.
+
+    Authorization is necessary but never sufficient: the compiler re-derives every one of these
+    rules at gates 14, 15, 18, and 19 and would exclude the fact anyway. Applying the ceiling
+    here means an over-broad grant is never *recorded* as an authorization -- the contributor is
+    never shown a permission the system would refuse to honour, and the stored mandate never
+    claims something policy would override.
+    """
+
+    if sensitivity in _HARD_INTERNAL_SENSITIVITIES:
+        return DisclosureScope.INTERNAL_ONLY
+    return _FACT_TYPE_CEILING[fact_type]
+
+
+def proposed_scope(fact_type: FactType, sensitivity: SensitivityCategory) -> DisclosureScope:
+    """Return the least-permissive useful scope a proposal offers for one fact."""
+
+    ceiling = policy_maximum_scope(fact_type, sensitivity)
+    offered = _PROPOSED_SCOPE.get(fact_type, DisclosureScope.INTERNAL_ONLY)
+    return offered if scope_permits(ceiling, offered) else DisclosureScope.INTERNAL_ONLY
+
+
+def identity_maximum_scope() -> DisclosureScope:
+    """Return the highest identity scope policy/v1 permits, independently of any content."""
+
+    return IDENTITY_CEILING
 
 
 def validate_compile_command_shape(command: CompileCommand) -> None:

@@ -94,6 +94,30 @@ Fields: `mandate_id`, `version`, `case_id`, `community_id`, `contributor_id`, `s
 
 `FactGrant` is `{fact_id, max_scope, allow_safe_transformation: bool}`. `IdentityGrant` is `{externally_shareable: bool, max_scope: ANONYMOUS_CASE|NAMED_CASE|EXTERNAL_ACTION}`. Every fact is owned by the contributor and same case. `INTERNAL_ONLY` is not a grant. Approval requires decision actor=contributor, `valid_from <= decision time < expires_at` when expiry exists, and canonical `terms_hash`. Adjust creates version N+1 with new terms and marks N `SUPERSEDED`; refuse/revoke create a new terminal version and current pointer. Historical versions never mutate. Entire records remain private; safe views hold opaque mandate ID/version/terms hash only.
 
+Version 1 is always `PROPOSED` and is created by the candidate-acceptance command in [ADR-013](../adr/ADR-013-mandate-proposal-endpoint.md), never by an agent and never by the contributor. It covers every `ACTIVE` fact the contributor owns in that case, and each grant carries the deterministic `proposed_scope` for that fact's type and sensitivity — the **least-permissive useful default**, never the ceiling. The policy/v1 maximum for the same fact is a separate value that caps what any later decision may say; the proposal sits at or below it and usually well below. A general incident fact whose ceiling is `EXTERNAL_ACTION` is proposed `ANONYMOUS_CASE`; a photo description with the same ceiling is proposed `INTERNAL_ONLY`, because exporting a photograph is a choice to be made rather than a default to be accepted. A contributor may narrow a proposal or raise it toward the ceiling, and both are `ADJUST` ([ADR-014](../adr/ADR-014-monitor-proposes-no-disclosure-terms.md)).
+
+`SUPERSEDED` is a **derived** status, not a stored one. A mandate version row is create-only, so "marks N `SUPERSEDED`" is expressed by the current pointer moving to N+1 and by N+1 recording `supersedes_version = N`. A stored version whose status is `PROPOSED` or `APPROVED` and which the current pointer no longer names reads as `SUPERSEDED` in the mandate thread. No historical row is ever rewritten.
+
+`EXPIRED` is likewise derived from the injected clock against the current version's `valid_from`/`expires_at`; equality at `expires_at` is expired.
+
+### Mandate decision edges
+
+Every edge not in this table is refused with `STATE_TRANSITION_ERROR` and mutates nothing.
+
+| Current status | `APPROVE` | `ADJUST` | `REFUSE` | `REVOKE` |
+|---|---|---|---|---|
+| `PROPOSED` | `APPROVED` | `APPROVED` (N+1, complete replacement terms) | `REFUSED` | refused — nothing has been granted |
+| `APPROVED` | refused — already approved | `APPROVED` (N+1) | refused — use `REVOKE` | `REVOKED` |
+| `REFUSED` | refused | refused | refused | refused |
+| `REVOKED` | refused | refused | refused | refused |
+| `EXPIRED` (derived) | refused | refused | refused | refused |
+
+`APPROVE` carries the proposed terms unchanged; any difference is refused rather than silently accepted. `ADJUST` supplies the **complete** replacement grants, never a partial patch.
+
+The cap on an adjustment is the deterministic policy/v1 ceiling for each fact, and never the scope the proposal happened to offer. A proposal offers the least-permissive *useful* default under that ceiling, so a contributor deliberately raising one — a photo description offered `INTERNAL_ONLY` and granted `EXTERNAL_ACTION` — is an ordinary adjustment, while the same move on a health detail or a unit label is refused because the ceiling itself is `INTERNAL_ONLY`. What an adjustment may never do is name a fact the proposal never contained.
+
+`REFUSE` and `REVOKE` carry no grants at all: a request that includes any is refused before a version is built. `allowed_destination_ids`, `allowed_purposes`, and `valid_from` are carried forward from the proposal and are not part of the decision request; the carried-forward destination is re-derived against the current registry on every decision, so a registry that moved on stops the mandate authorizing rather than being trusted from the record.
+
 ### CommunityCase
 
 Purpose: aggregate root for investigation and lifecycle.
@@ -273,7 +297,7 @@ Every transition command supplies `case_id`, `expected_version`, `transition`, `
 |---|---|---|---|
 | create `CANDIDATE` | at least 2 potentially related report proposals, not necessarily corroborated | intake service | retryable before persist; no case on failure |
 | Monitor links a report into an existing case | case state is Monitor-linkable *and* the case version the agent saw is still current | intake service | case unchanged; typed stale/ineligible failure |
-| `CANDIDATE→AWAITING_MANDATES` | human/demo accepts candidate; proposals exist for every participating owner | application/human | remains candidate |
+| `CANDIDATE→AWAITING_MANDATES` | human/demo accepts candidate; proposals exist for every participating owner, created in the same transaction ([ADR-013](../adr/ADR-013-mandate-proposal-endpoint.md)) | `POST /v1/cases/{case_id}/mandates` | remains candidate |
 | `AWAITING_MANDATES→INVESTIGATING` | at least one non-proposed decision or timeout/refusal recorded | application | remains awaiting |
 | `INVESTIGATING→READY_FOR_ACTION` | validated assessment; `independent_source_count>=2`; no material unresolved different-issue finding; a compile preflight finds eligible facts | application | remains investigating |
 | `READY_FOR_ACTION→ACTION_PROPOSED` | current allowed view and valid proposal hashes | application | remains ready; stale view triggers recompile |
