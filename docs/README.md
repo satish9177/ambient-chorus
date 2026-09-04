@@ -22,7 +22,8 @@ Keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. If two a
 - The Action runtime receives only an immutable `ShareableCaseView` and has zero database, S3, compiler, SES, and private-data access.
 - Deterministic mandate/privacy compiler as a dedicated Lambda and the sole creator of safe views.
 - Deterministic proposal validator, renderer, SES sender, and commitment watcher.
-- Evidence corroboration is two independent sources; aggregate privacy is three distinct contributors. They are never interchangeable.
+- Evidence corroboration is two independent sources; aggregate privacy is three distinct contributors. They are never interchangeable. Case-level corroboration and a fact's `CORROBORATED` status are also never interchangeable.
+- Evidence status is deterministically recomputed, never transitioned. `policy/v1` has no allowed verification source, so `VERIFIED` is unreachable and a model that claims it is downgraded and audited. An agent may lower a fact's status and may never raise it.
 - Three DynamoDB tables (`core`, `shareable`, `audit`) and two S3 buckets (`private-evidence`, `export-evidence`).
 - Python 3.12, FastAPI, Pydantic v2, Strands Agents, Amazon Bedrock Nova 2 Lite, AgentCore Runtime, Lambda, API Gateway HTTP API, DynamoDB, S3, SES, EventBridge Scheduler, CloudWatch, and CDK v2.
 - React, TypeScript strict mode, Vite, TanStack Query, native `fetch`, CSS Modules, `npm`.
@@ -67,6 +68,9 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-012](adr/ADR-012-candidate-grouping-invariant.md) | Candidate grouping only under an issue type that names a subject |
 | [ADR-013](adr/ADR-013-mandate-proposal-endpoint.md) | Candidate acceptance is the command that creates mandate proposals |
 | [ADR-014](adr/ADR-014-monitor-proposes-no-disclosure-terms.md) | The Monitor proposes no disclosure terms; `mandate_suggestions` removed |
+| [ADR-015](adr/ADR-015-evidence-status-and-verification.md) | Deterministic evidence status, an empty verified-source set, and contradiction materiality |
+| [ADR-016](adr/ADR-016-agent-operation-handover-identity.md) | Kind-agnostic agent operation handover identity |
+| [ADR-017](adr/ADR-017-evidence-root-id-locator.md) | Immutable root-ID locator for `EvidenceRoot` ancestry |
 
 ## Implementation control
 

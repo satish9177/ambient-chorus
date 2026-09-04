@@ -1,8 +1,9 @@
-"""The FastAPI composition root for the Phase 3 and Phase 4 surfaces.
+"""The FastAPI composition root for the Phase 3, Phase 4, and Phase 5 surfaces.
 
-The routes are the discovery surface -- ingest a batch, read the ambient feed -- and the private
-mandate surface: accept a candidate, read one contributor's thread, record one decision. Each
-is the transport half of an application use case that holds all of the policy.
+The routes are the discovery surface -- ingest a batch, read the ambient feed -- the private
+mandate surface -- accept a candidate, read one contributor's thread, record one decision --
+and the investigation surface, which starts one skeptical review of one case. Each is the
+transport half of an application use case that holds all of the policy.
 
 The application is built, not discovered. :func:`build_app` takes a fully constructed
 container, so there is no import-time global, no environment read inside a route, and no path
@@ -22,11 +23,11 @@ from chorus_api.problem_details import (
     register_problem_handlers,
     register_transport_handlers,
 )
-from chorus_api.routes import feed, ingest, mandates
+from chorus_api.routes import feed, ingest, investigations, mandates
 
 API_PREFIX = "/v1"
 API_TITLE = "Ambient CHORUS"
-API_VERSION = "0.4.0"
+API_VERSION = "0.5.0"
 
 
 def build_app(container: ApiContainer) -> FastAPI:
@@ -60,6 +61,7 @@ def build_app(container: ApiContainer) -> FastAPI:
     app.include_router(ingest.router, prefix=API_PREFIX)
     app.include_router(feed.router, prefix=API_PREFIX)
     app.include_router(mandates.router, prefix=API_PREFIX)
+    app.include_router(investigations.router, prefix=API_PREFIX)
     return app
 
 

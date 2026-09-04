@@ -124,6 +124,14 @@ def _cases() -> tuple[Case, ...]:
             world.evidence_root(),
         ),
         (
+            "EVIDENCE_ROOT_LOCATOR",
+            lambda w: codec_core.encode_evidence_root_locator(
+                community_scope, w.evidence_root_locator()
+            ),
+            codec_core.decode_evidence_root_locator,
+            world.evidence_root_locator(),
+        ),
+        (
             "COMMUNITY_CASE",
             lambda w: codec_core.encode_case(case_scope, w.case()),
             codec_core.decode_case,

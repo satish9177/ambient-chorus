@@ -102,15 +102,17 @@ The Monitor contributes nothing to a mandate. It has no field in which to name a
 
 **Files/modules:** `src/chorus/contracts/investigation.py`, investigation use case/validators, `runtimes/investigator`, API operation, tests/evaluation.
 
-**Tasks:** bounded private case projection; evidence root collapse; prompt/data separation; structured output; cited ID/ownership validation; recompute independent source count; evidence status rules including verified-source rule; contradictions/alternatives; assessment persistence; case transition guards; proposed commitment schema (persistence deferred to Phase 9).
+**Tasks:** bounded private case projection; evidence root collapse through the root-ID locator of [ADR-017](../adr/ADR-017-evidence-root-id-locator.md); prompt/data separation; structured output; cited ID/ownership validation; recompute the case-level independent source count and write it to `CommunityCase.corroboration_source_count`; evidence status rules including the verified-source rule of [ADR-015](../adr/ADR-015-evidence-status-and-verification.md); contradictions/alternatives persisted structurally as `investigation-assessment/v2`; assessment persistence in one transaction; case transition guards using the deterministic readiness predicate; the kind-agnostic operation handover of [ADR-016](../adr/ADR-016-agent-operation-handover-identity.md); proposed commitment schema and citation check only (persistence deferred to Phase 9).
 
-**Tests:** scenarios 3–7, 13–14; duplicate roots/reporters; different issue; contradiction; malicious text; invented/foreign IDs; invalid `VERIFIED`; concurrent case version change; timeout/replay.
+Phase 5 **creates no facts**. Contradictions live in the `InvestigationAssessment`, and the apply sets `evidence_status=CONTRADICTED` on affected *existing* facts. The allowed verification source set is empty, so `VERIFIED` is unreachable and every model-proposed `VERIFIED` is downgraded and audited. Fact-level `CORROBORATED` is earned only by independent support for one exact canonical claim and is never inferred from the case-level count.
+
+**Tests:** scenarios 3–7, 13–14; duplicate roots/reporters; forwarded root ancestry through the locator; different issue; contradiction at each materiality; malicious text; invented/foreign IDs; model-proposed `VERIFIED` always downgraded; `proposed_status = CONTRADICTED` without a contradiction entry has no effect; a validated contradiction overrides any proposed status; case corroborated while a unique fact stays `REPORTED`; concurrent case version change proved twice over -- once stale before invocation, where no model is called at all, and once moved *after* the invocation begins, where the model is genuinely asked about version N and only the apply transaction's version condition can refuse the answer; a v1 assessment row's unrecorded contradiction materiality read as `HIGH`; timeout/replay; the compile preflight persists nothing.
 
 **Exit criteria:** case becomes ready only from deterministic sufficiency, contradiction is visible, injection remains data, no agent directly changes state.
 
 **Risks:** investigator overconfidence. Preserve `UNKNOWN/UNCERTAIN`, alternative explanations, and deterministic recalculation; human can close/reopen.
 
-**Do not implement:** knowledge graph/vector retrieval, autonomous case split, web research, commitment scheduling.
+**Do not implement:** knowledge graph/vector retrieval, autonomous case split, web research, commitment scheduling; a `FactType.CONTRADICTION` producer; a mandate re-proposal mechanism; a second current-assessment pointer; any Monitor-style plan or apply-progress snapshot machinery; any `EvidenceItem` provenance field or external-reply storage semantics; any allowed verification source; AgentCore server binding or live AWS evaluation, which stay in Phase 11.
 
 ## Phase 6 — Compiler Lambda, safe evidence, and ShareableCaseView
 
@@ -176,6 +178,8 @@ The Monitor contributes nothing to a mandate. It has no field in which to name a
 
 **Tasks:** ingest fixed RFC822 reply as private evidence; Investigator operation; validate obligor/action/due/citation/range/safety; commitment state; deterministic schedule/client token/config; response-loss reconciliation; due-event generation/idempotency; watcher DUE transition; fulfilled/missed human guard; case resolution/readiness; logical/actual clock mapping.
 
+Commitment validation needs to know which approved destination authored a reply, so this phase introduces the **immutable authenticated external-source binding**: the destination ID, registry version, and routing token as they stood at ingestion, recorded durably on the stored evidence. Management must not be modelled as a resident contributor; if the required-owner field cannot express a non-resident author, that field is what changes. Adding this binding does **not** make the source eligible to grant `EvidenceStatus.VERIFIED` — authentication answers who wrote something, verification answers what it may establish. Adding an allowed verification source is a separate explicit ADR that must state which claim the source may verify and where that permission stops ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md) § Revisit condition).
+
 **Tests:** malicious reply/date; duplicate root/commitment; schedule explicit/lost response; duplicate/stale generation; DLQ config; due twice; unauthorized verifier; actioned direct-to-resolved illegal; fulfilled/missed transitions; real schedule smoke plus demo clock path.
 
 **Exit criteria:** live reply creates one real future schedule; demo advance invokes same watcher; one verification request; missed returns ready, fulfilled alone resolves.
@@ -211,6 +215,8 @@ The Monitor contributes nothing to a mandate. It has no field in which to name a
 **Files/modules:** complete CDK stacks/config, deployment smoke scripts/CLI, dashboards/alarms, runbook additions.
 
 **Tasks:** isolated two-subnet VPC/no NAT and endpoint policies; data/KMS/S3; direct-code AgentCore runtimes/endpoints/profiles/MMDSv2; API/worker/compiler/sender/watcher; API token secret; SES/config events; scheduler/DLQ; CloudFront/S3 web; log/OTEL content filtering; budgets/tags; runtime version outputs; rollback aliases; IAM/network post-deploy canaries.
+
+Every agent runtime's **server binding, deployed resource, and live evaluation** belong here, including the Investigator's. Earlier phases build and unit-test a runtime artifact, its pinned prompt, its adapter, its local fake, its manifest, and its static CDK/IAM assertions; the deployed AgentCore resource and the gated live model evaluation are this phase's deliverable for all three agents alike.
 
 **Tests:** synth/assertions; clean-account deploy; smoke each endpoint/runtime; canaries; encryption/public access; model/profile lifecycle; CloudWatch dashboards; rollback exercise; no trace content.
 

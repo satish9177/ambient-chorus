@@ -9,7 +9,7 @@ Enums serialize by exact uppercase string value. UTC/hash/list rules follow [01-
 ## Core enums
 
 - `DisclosureScope`: `INTERNAL_ONLY`, `AGGREGATE_ONLY`, `ANONYMOUS_CASE`, `NAMED_CASE`, `EXTERNAL_ACTION` (ordered only by explicit policy table, never enum ordinal).
-- `EvidenceStatus`: `REPORTED`, `CORROBORATED`, `VERIFIED`, `CONTRADICTED`, `UNKNOWN`.
+- `EvidenceStatus`: `REPORTED`, `CORROBORATED`, `VERIFIED`, `CONTRADICTED`, `UNKNOWN`. Classification is deterministic recomputation, not a transition; there is no edge set. `CORROBORATED` is a **fact-level** label earned by independent support for one exact canonical claim, and is not the case-level corroboration count. `VERIFIED` is unreachable in policy/v1 because the allowed verification source set is empty, and `UNKNOWN` is never produced by deterministic computation — it is reachable only when the Investigator lowers a computed status through the downgrade-only ladder. Semantics are normative in [ADR-015](../adr/ADR-015-evidence-status-and-verification.md).
 - `CaseState`: `CANDIDATE`, `AWAITING_MANDATES`, `INVESTIGATING`, `READY_FOR_ACTION`, `ACTION_PROPOSED`, `ACTIONED`, `VERIFYING`, `RESOLVED`, `CLOSED_UNRESOLVED`.
 - `MandateStatus`: `PROPOSED`, `APPROVED`, `REFUSED`, `REVOKED`, `EXPIRED`, `SUPERSEDED`.
 - `ActionExecutionState`: `DRAFT`, `APPROVED`, `SENDING`, `SENT`, `FAILED`, `SEND_UNKNOWN`.
@@ -124,11 +124,17 @@ Purpose: aggregate root for investigation and lifecycle.
 
 Fields: `case_id`, `community_id`, `title: str[1..160]`, `issue_type`, `state`, `report_ids`, `fact_ids`, `assessment_id?`, `current_view_id?`, `current_action_id?`, `corroboration_source_count: int>=0`, `state_reason_code`, `version`, timestamps, `resolved_at?`, `closed_at?`. IDs/community are immutable. Lists are unique and same case. State changes only through the transition service. Title is private until transformed into safe summary. Owned by application/domain.
 
+`corroboration_source_count` is the **case-level** independent-source count over every `ACTIVE` case fact. Intake creates a case with `0`; the investigation apply writes the deterministically recomputed value in the same transaction that appends the assessment. It is not a fact's `evidence_status`, and a corroborated case may contain facts that remain `REPORTED` ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md)). `assessment_id` is the current-assessment pointer; there is no separate pointer item, so the pointer and the case version can never disagree.
+
 ### InvestigationAssessment
 
 Purpose: validated snapshot of skeptical reasoning, kept separate from agent draft.
 
-Fields: `assessment_id`, `case_id`, `based_on_case_version`, `agent_invocation_id`, `linkage_decision`, `findings: tuple[EvidenceFinding,...]`, `contradictions`, `alternative_explanations`, `independent_source_count`, `is_corroborated`, `recommended_disposition`, `assessment_hash`, `created_at`, `schema_version`. Immutable. Every citation is same case and existed in invocation input. Private-zone only.
+Fields: `assessment_id`, `case_id`, `based_on_case_version`, `agent_invocation_id`, `linkage_decision`, `findings: tuple[EvidenceFinding,...]`, `contradictions: tuple[AssessmentContradiction,...]`, `alternative_explanations: tuple[AssessmentAlternative,...]`, `independent_source_count`, `is_corroborated`, `recommended_disposition`, `assessment_hash`, `created_at`, `schema_version`. Immutable. Every citation is same case and existed in invocation input. Private-zone only.
+
+`AssessmentContradiction` is `{statement_fact_ids: tuple[FactId, 2..10], description: str<=500, materiality: LOW|MEDIUM|HIGH}`. `AssessmentAlternative` is `{description: str<=500, cited_report_ids, cited_fact_ids, cited_evidence_ids}`. Both are structured deliberately: an earlier shape flattened contradictions into a single fact-ID tuple and reduced alternatives to bare strings, which lost which facts belonged to which contradiction, lost the materiality the readiness guard depends on, and lost the citations [03-agent-architecture.md](03-agent-architecture.md) requires on every alternative explanation. The schema version is `investigation-assessment/v2`; readers accept v1 and v2, writers emit v2. Because a v1 row recorded no materiality at all, a v1 row's cited facts are read as one contradiction at `HIGH` under the fixed description code `LEGACY_V1_CONTRADICTION_MATERIALITY_UNRECORDED` (fewer than two cited facts carries forward nothing). That is a fail-closed *compatibility interpretation* fixed by [ADR-015](../adr/ADR-015-evidence-status-and-verification.md) §7: it blocks readiness rather than guessing a permissive value, reconstructs no historical text or materiality, and rewrites no stored row.
+
+`independent_source_count` is always the deterministically recomputed case-level value and never the number the agent returned. `is_corroborated` equals `independent_source_count >= 2`, and the entity refuses a row where the two disagree. `recommended_disposition` is recorded advice and is never read by a transition guard.
 
 ### ShareableFact
 
@@ -186,24 +192,34 @@ An ordinary audit event uses a UUIDv4 identifier. A **replay-bound Monitor apply
 
 ### ApplicationOperation
 
-Purpose: durable status for work that may outlive an HTTP request. Fields: `operation_id`, `kind: MONITOR|INVESTIGATE|PROPOSE_ACTION|SEND_ACTION|DEMO_DUE`, `namespace`, `actor_id_hash`, `case_id?`, `request_hash`, `status: PENDING|RUNNING|SUCCEEDED|FAILED`, `result_refs`, `error_code?`, `monitor_invocation_id?`, `monitor_locator_hash?`, timestamps, `version`, `expires_at_epoch`. It is mutable by guarded worker transitions, contains no raw command/agent content, and is private unless its result is safe. It is an application projection, not a case state or authorization artifact.
+Purpose: durable status for work that may outlive an HTTP request. Fields: `operation_id`, `kind: MONITOR|INVESTIGATE|PROPOSE_ACTION|SEND_ACTION|DEMO_DUE`, `namespace`, `actor_id_hash`, `case_id?`, `request_hash`, `status: PENDING|RUNNING|SUCCEEDED|FAILED`, `result_refs`, `error_code?`, `agent_invocation_id?`, `agent_binding_hash?`, timestamps, `version`, `expires_at_epoch`. It is mutable by guarded worker transitions, contains no raw command/agent content, and is private unless its result is safe. It is an application projection, not a case state or authorization artifact. The schema version is `application-operation/v2`; readers accept v1's `monitor_invocation_id`/`monitor_locator_hash` attributes into the same two fields, writers emit v2 ([ADR-016](../adr/ADR-016-agent-operation-handover-identity.md)).
 
-#### The Monitor handover identity
+#### The agent handover identity
 
-`monitor_invocation_id` and `monitor_locator_hash` are the durable statement of **which agent invocation this operation authorizes, and over exactly which new messages**. They exist because a worker delivery is data on a queue and a queue can be wrong, while the operation row cannot be: without them, the *first* delivery for an operation had no durable record to disagree with, so any invocation identity and any subset of the delivered locators were accepted on trust — and a caller retaining a valid `request_hash` could still change what the Monitor was given.
+`agent_invocation_id` and `agent_binding_hash` are the durable statement of **which agent invocation this operation authorizes, and over exactly which work**. They exist because a worker delivery is data on a queue and a queue can be wrong, while the operation row cannot be: without them, the *first* delivery for an operation had no durable record to disagree with, so any invocation identity and any subset of the delivered work were accepted on trust — and a caller retaining a valid `request_hash` could still change what the agent was given.
+
+The pair was originally `MONITOR`-only. [ADR-016](../adr/ADR-016-agent-operation-handover-identity.md) generalized it, because an unbound `INVESTIGATE` job could present a fresh invocation identity, find no durable invocation record, and spend a second model pass over the same private case — the same harm, arriving through the command families that had been left out.
 
 | Rule | Statement |
 |---|---|
-| Presence | required for `kind = MONITOR` before dispatch; `null` for every other kind |
+| Presence | required for every agent-invoking kind — `MONITOR`, `INVESTIGATE`, `PROPOSE_ACTION` — before dispatch; `null` for `SEND_ACTION` and `DEMO_DUE`, which invoke no agent |
 | Pairing | both are set or neither is; an operation is never half-bound |
-| Content | identifiers and digests only — never a locator list, never message text |
+| Content | identifiers and digests only — never a locator list, never message text, never a view body |
 | Mutability | immutable for the operation's lifetime; every status transition copies them forward |
 | Creation | written by the same transaction that creates the operation and completes its command-idempotency record, so the two can never disagree |
 | API exposure | not part of the public operation status response; a poller learns status, not handover identity |
 
-`monitor_locator_hash` is the digest of the canonical, **sorted** set of `{message_id, sent_at}` locators the run may treat as its new messages. It is sorted because the endpoint takes a batch and Monitor processing canonicalizes its order anyway, so two deliveries of the same messages in a different order are the same work. `sent_at` is inside the digest because the earliest new message anchors the recent-context window: moving one instant would change what the model reads without changing which messages it was given.
+`agent_binding_hash` names the exact work per kind:
 
-Before claiming an operation a worker must prove `job.operation_id`, `job.namespace`, `operation.kind = MONITOR`, `job.actor_id_hash`, `job.request_hash`, `job.invocation_id = operation.monitor_invocation_id`, and `hash(job.message_locators) = operation.monitor_locator_hash`. Any mismatch claims nothing, invokes nothing, mutates nothing, and leaves the operation's status and version untouched.
+| Kind | Binding hash content |
+|---|---|
+| `MONITOR` | the digest of the canonical, **sorted** set of `{message_id, sent_at}` locators the run may treat as its new messages |
+| `INVESTIGATE` | the canonical digest of `{case_id, expected_case_version, reason}` |
+| `PROPOSE_ACTION` | the canonical digest of `{case_id, view_id, view_hash}` |
+
+The Monitor locator digest is unchanged in content and computation. It is sorted because the endpoint takes a batch and Monitor processing canonicalizes its order anyway, so two deliveries of the same messages in a different order are the same work. `sent_at` is inside the digest because the earliest new message anchors the recent-context window: moving one instant would change what the model reads without changing which messages it was given.
+
+Before claiming an operation a worker must prove `job.operation_id`, `job.namespace`, the expected `operation.kind`, `job.actor_id_hash`, `job.request_hash`, `job.invocation_id = operation.agent_invocation_id`, and `binding_hash(job) = operation.agent_binding_hash`. Any mismatch claims nothing, invokes nothing, mutates nothing, and leaves the operation's status and version untouched. All seven checks are preserved exactly as the Monitor worker performs them today; only the field names changed.
 
 #### Operation transitions
 
@@ -214,6 +230,8 @@ Before claiming an operation a worker must prove `job.operation_id`, `job.namesp
 | `RUNNING→SUCCEEDED` | expected version | the worker finished and recorded its result refs |
 | `RUNNING→FAILED` | expected version | the attempt is over, and the outcome is a verdict |
 | `RUNNING→PENDING` | expected version; **MONITOR only**, and only under the four conditions below | the attempt was interrupted, and the operation is eligible to resume |
+
+The investigation apply is a single transaction, so an `INVESTIGATE` operation has nothing to resume, no frozen-plan snapshot, and no apply-progress record; it settles `SUCCEEDED` or `FAILED`.
 
 `RUNNING→PENDING` is deliberately narrow, and it exists because a Monitor operation with a persisted validated-plan snapshot is *finishable*: the model has already answered, the answer is frozen, and the only work left is bounded deterministic writes. Marking such an operation `FAILED` would abandon durable, valid, committed state and make the remainder unreachable except by a human minting a new invocation — which would mean a second pass over private text for work already paid for.
 
@@ -299,7 +317,7 @@ Every transition command supplies `case_id`, `expected_version`, `transition`, `
 | Monitor links a report into an existing case | case state is Monitor-linkable *and* the case version the agent saw is still current | intake service | case unchanged; typed stale/ineligible failure |
 | `CANDIDATE→AWAITING_MANDATES` | human/demo accepts candidate; proposals exist for every participating owner, created in the same transaction ([ADR-013](../adr/ADR-013-mandate-proposal-endpoint.md)) | `POST /v1/cases/{case_id}/mandates` | remains candidate |
 | `AWAITING_MANDATES→INVESTIGATING` | at least one non-proposed decision or timeout/refusal recorded | application | remains awaiting |
-| `INVESTIGATING→READY_FOR_ACTION` | validated assessment; `independent_source_count>=2`; no material unresolved different-issue finding; a compile preflight finds eligible facts | application | remains investigating |
+| `INVESTIGATING→READY_FOR_ACTION` | validated assessment bound to the current case version; recomputed `independent_source_count>=2`; no material unresolved different-issue finding; a compile preflight finds eligible facts | application | remains investigating |
 | `READY_FOR_ACTION→ACTION_PROPOSED` | current allowed view and valid proposal hashes | application | remains ready; stale view triggers recompile |
 | `ACTION_PROPOSED→ACTIONED` | execution reaches `SENT`; matching approval consumed | sender/application projection | `FAILED`/`SEND_UNKNOWN` leaves case `ACTION_PROPOSED` with execution banner |
 | `ACTIONED→VERIFYING` | valid commitment or explicit verification request | application | remains actioned if schedule creation fails; retry scheduling |
@@ -307,6 +325,21 @@ Every transition command supplies `case_id`, `expected_version`, `transition`, `
 | `VERIFYING→READY_FOR_ACTION` | affected contributor records `MISSED`/not fulfilled | human/application | same verification replay is no-op |
 | any allowed → `CLOSED_UNRESOLVED` | human reason from fixed enum; no active `SENDING` execution | human | source state retained on conflict |
 | terminal reopen | new report/evidence and explicit human/demo command | human/application | terminal state retained on failure |
+
+### The readiness predicate
+
+`INVESTIGATING→READY_FOR_ACTION` is entirely deterministic, and every term is spelled out here so no part of it can be settled by an implementation judgement.
+
+1. **Validated assessment.** An assessment exists for this case whose `based_on_case_version` equals the case version being transitioned.
+2. **Recomputed corroboration.** The case-level `independent_source_count` over every `ACTIVE` case fact is at least `CORROBORATION_MIN`, which is 2. The number the agent returned is never used.
+3. **No material unresolved different-issue finding.** This is two conditions, both drawn from the validated assessment:
+   - `linkage_decision` is `SAME_ISSUE`. `DIFFERENT_ISSUES` blocks, and `UNCERTAIN` blocks as well — an ambiguous linkage is a missing authorization, and the fail-closed rule in [01-principles-and-invariants.md](01-principles-and-invariants.md) applies;
+   - no validated contradiction carries materiality `MEDIUM` or `HIGH`. A `LOW` contradiction is nonfatal and may coexist with readiness; its affected facts still carry `evidence_status=CONTRADICTED` outward, and the obligation to caveat them falls on the Action proposal validator ([07-action-ses-and-commitments.md](07-action-ses-and-commitments.md)).
+4. **A compilable purpose.** A preflight run of the deterministic privacy compiler over the strongly loaded case returns `ALLOW` with at least one included fact. The preflight persists nothing — no view, no current pointer, no history row, no compile audit event, and no evidence derivative.
+
+`recommended_case_disposition` is **not** a term. A model recommending `READY_FOR_ACTION` never makes a case ready, and a model recommending `CONTINUE_INVESTIGATION` never prevents one. The only model-originated values the predicate reads are `linkage_decision` and contradiction `materiality`, both consumed through fixed tables and both able only to block.
+
+The failing term supplies the `state_reason_code`, evaluated in the order above: `CORROBORATION_MIN_NOT_MET`, `DIFFERENT_ISSUE_UNRESOLVED`, `CONTRADICTION_UNRESOLVED`, `NO_COMPILABLE_PURPOSE`.
 
 ### Monitor linkage eligibility
 

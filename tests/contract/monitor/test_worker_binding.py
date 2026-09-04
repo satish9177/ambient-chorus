@@ -62,8 +62,8 @@ async def _bound(
     locators = await harness.ingest_feed()
     operation, job = await harness.dispatched(locators)
     assert operation.status is ApplicationOperationStatus.PENDING
-    assert operation.monitor_invocation_id is not None
-    assert operation.monitor_locator_hash is not None
+    assert operation.agent_invocation_id is not None
+    assert operation.agent_binding_hash is not None
     return operation, job, locators
 
 
@@ -223,7 +223,7 @@ async def test_a_job_for_a_propose_action_operation_is_refused(
     await harness.seed()
     locators = await harness.ingest_feed()
     foreign = await harness.bound_operation(locators, kind=ApplicationOperationKind.PROPOSE_ACTION)
-    assert foreign.monitor_invocation_id is None
+    assert foreign.agent_invocation_id is None
 
     await _assert_refused(harness, foreign, harness.job_for(foreign, locators))
 

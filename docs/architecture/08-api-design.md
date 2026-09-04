@@ -24,7 +24,7 @@ For a route that **mutates before it can create the operation** — `POST /v1/in
 2. **reserve** the command key: a create-only `IN_PROGRESS` record binding that hash;
 3. a record with a *different* hash → `IDEMPOTENCY_CONFLICT` (409) with **zero** mutations;
 4. ingest the messages replay-safely;
-5. create the `ApplicationOperation` — carrying its Monitor handover identity — and complete the reservation, in one transaction with a commit proof;
+5. create the `ApplicationOperation` — carrying its agent handover identity — and complete the reservation, in one transaction with a commit proof;
 6. dispatch.
 
 The reservation is `IN_PROGRESS` rather than `COMPLETED` so a crash between steps 2 and 5 stays finishable. An `IN_PROGRESS` record under the same key **and the same hash** is this request's own unfinished attempt and is *resumed*, never refused: step 4 is replay-safe by construction, and step 5 is a single transaction, so a key can never name two operations. Refusing an `IN_PROGRESS` record would strand a caller's own identical retry for having once been interrupted.
@@ -33,9 +33,9 @@ Because the reservation record already exists before step 5 runs, its mere prese
 
 Lambda async delivery may repeat; the operation/input hash and underlying command idempotency make repeats safe. A same-key retry that finds a **`PENDING`** operation dispatches the same job identity again, because dispatch itself can fail after the record was written and an undispatched operation would otherwise be stranded forever. Duplicate dispatch is explicitly acceptable: the worker's conditional `PENDING→RUNNING` claim is the duplicate-execution boundary, so however many deliveries arrive, exactly one of them invokes the model. A retry never mints a new `operation_id` or a new `invocation_id`, and a completed operation is never dispatched again.
 
-`ApplicationOperation` fields: `operation_id`, `kind`, `namespace`, `actor_id_hash`, `case_id?`, `request_hash`, `status: PENDING|RUNNING|SUCCEEDED|FAILED`, `result_refs[]`, `error_code?`, `monitor_invocation_id?`, `monitor_locator_hash?`, `created_at`, `started_at?`, `completed_at?`, `version`, `expires_at_epoch`. It contains no raw input. The immutable command payload is stored in the appropriate private/safe item referenced by ID. Operation TTL is seven days in demo.
+`ApplicationOperation` fields: `operation_id`, `kind`, `namespace`, `actor_id_hash`, `case_id?`, `request_hash`, `status: PENDING|RUNNING|SUCCEEDED|FAILED`, `result_refs[]`, `error_code?`, `agent_invocation_id?`, `agent_binding_hash?`, `created_at`, `started_at?`, `completed_at?`, `version`, `expires_at_epoch`. It contains no raw input. The immutable command payload is stored in the appropriate private/safe item referenced by ID. Operation TTL is seven days in demo.
 
-`monitor_invocation_id` and `monitor_locator_hash` are the Monitor handover identity described in [04](04-domain-state-and-events.md#the-monitor-handover-identity): required for `kind = MONITOR` before dispatch, `null` otherwise, immutable for the operation's lifetime, and identifiers and digests only. They are **not** part of the public operation status response — a poller is told status and result references, not what the worker binds against.
+`agent_invocation_id` and `agent_binding_hash` are the agent handover identity described in [04](04-domain-state-and-events.md#the-agent-handover-identity): required together for every agent-invoking kind — `MONITOR`, `INVESTIGATE`, and `PROPOSE_ACTION` — before dispatch, `null` together for `SEND_ACTION` and `DEMO_DUE`, immutable for the operation's lifetime, and identifiers and digests only ([ADR-016](../adr/ADR-016-agent-operation-handover-identity.md)). They are **not** part of the public operation status response — a poller is told status and result references, not what the worker binds against.
 
 ```json
 {
@@ -129,7 +129,7 @@ commitments: [CommitmentSafeProjection]
 privacy_counts: {included,excluded,denied_by_reason}
 ```
 
-For `case_approver`, private title/fact labels and privacy exclusion reasons are omitted; only view/action-safe fields remain. `GET .../investigation` returns reports, private facts, contradictions, root/independence groups, assessment, and per-fact compile inclusion/exclusion explanations to presenter admin. It never returns contributor contact or private S3 URI; private evidence uses a separate controlled preview reference.
+For `case_approver`, private title/fact labels and privacy exclusion reasons are omitted; only view/action-safe fields remain. `GET .../investigation` returns reports, private facts, contradictions, root/independence groups, assessment, and per-fact compile inclusion/exclusion explanations to presenter admin. Contradictions are returned structured, each with its cited fact IDs, description, and `materiality`; alternative explanations are returned with their citations; each fact carries its resolved `evidence_status`. It never returns contributor contact or private S3 URI; private evidence uses a separate controlled preview reference.
 
 ### Mandate thread and decision
 
@@ -156,7 +156,7 @@ Current mandate response contains proposed/current terms rendered from fact-safe
 
 ### Investigation
 
-`POST /v1/cases/{case_id}/investigations` body `{expected_case_version, reason: INITIAL|NEW_EVIDENCE|REOPEN}`. Returns 202. The worker validates agent output and returns an assessment reference and resulting case state through the operation. An agent recommendation never directly determines the response state.
+`POST /v1/cases/{case_id}/investigations` body `{expected_case_version, reason: INITIAL|NEW_EVIDENCE|REOPEN}`. Returns 202 with an operation to poll. A stale `expected_case_version` is 409 with nothing written. The worker validates agent output and returns an assessment reference and resulting case state through the operation. An agent recommendation never directly determines the response state; readiness is decided by the deterministic predicate in [04](04-domain-state-and-events.md#the-readiness-predicate).
 
 ### Compile view
 

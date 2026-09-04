@@ -17,7 +17,7 @@ from typing import Protocol
 from uuid import UUID
 
 from chorus.domain.entities import ApplicationOperation
-from chorus.domain.ids import CommunityId, Namespace, OperationId, Sha256Digest
+from chorus.domain.ids import CaseId, CommunityId, Namespace, OperationId, Sha256Digest
 from chorus.ports.records import MessageFeedEntry
 
 
@@ -54,6 +54,40 @@ class MonitorOperationJob:
             raise ValueError("a Monitor job names each message once")
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InvestigationOperationJob:
+    """One investigation of one case, addressed by identity and version.
+
+    It names a case and the version of it the request was made against, and nothing else. There
+    is deliberately no field for which facts, reports, or evidence the run may read: the payload
+    is a pure function of the case at that version, assembled by the use case from storage, so
+    neither a queue message nor an HTTP caller can steer what the Investigator is shown.
+
+    ``request_hash`` is carried so the worker can *bind* the job to the durable operation before
+    it claims anything, and ``reason`` is carried because it is part of the binding digest: an
+    initial run and a later ``REOPEN`` of one case at one version are the same request shape and
+    must not share an invocation identity.
+    """
+
+    operation_id: OperationId
+    namespace: Namespace
+    community_id: CommunityId
+    case_id: CaseId
+    invocation_id: UUID
+    correlation_id: UUID
+    actor_id_hash: Sha256Digest
+    request_hash: Sha256Digest
+    expected_case_version: int
+    reason: str
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        if self.expected_case_version < 1:
+            raise ValueError("an investigation job names a positive case version")
+        if not self.reason:
+            raise ValueError("an investigation job names why it was asked for")
+
+
 class OperationDispatchPort(Protocol):
     """Hand one job to whatever executes work outside the caller's request."""
 
@@ -63,6 +97,21 @@ class OperationDispatchPort(Protocol):
         At-least-once is the contract on purpose: the durable operation record and the derived
         entity identity make a repeated delivery a no-op, so a dispatcher never has to promise
         exactly-once semantics it cannot actually provide.
+        """
+
+    async def dispatch_investigation(self, job: InvestigationOperationJob) -> None:
+        """Deliver the investigation job at least once, with the same guarantees."""
+
+
+class InvestigationJobRunner(Protocol):
+    """Execute one investigation job to a terminal operation status."""
+
+    async def execute(self, job: InvestigationOperationJob) -> ApplicationOperation:
+        """Run the job and return the operation as it now stands.
+
+        Implementations record failure on the operation rather than raising, for the same
+        reason the Monitor runner does: an at-least-once dispatcher must never be told to retry
+        an agent invocation implicitly.
         """
 
 

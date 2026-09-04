@@ -105,14 +105,18 @@ The Investigator may receive malicious evidence text and private facts because i
 - `case_id`, `based_on_case_version`;
 - `linkage_decision: SAME_ISSUE | DIFFERENT_ISSUES | UNCERTAIN`;
 - `linkage_reasons[]` and `alternative_explanations[]`, each citing report/fact/evidence IDs;
-- `evidence_findings[]: {fact_id, proposed_status: REPORTED|CORROBORATED|VERIFIED|CONTRADICTED|UNKNOWN, supporting_evidence_ids[], opposing_evidence_ids[], independent_source_groups[], rationale}`;
-- `contradictions[]: {statement_fact_ids[], description, materiality: LOW|MEDIUM|HIGH}`;
+- `evidence_findings[]: {fact_id, proposed_status: REPORTED|CORROBORATED|VERIFIED|CONTRADICTED|UNKNOWN, supporting_evidence_ids[], opposing_evidence_ids[], independent_source_groups[], rationale}`. `proposed_status` is **advisory and downgrade-only**: it is honoured only when it is weaker than the deterministically computed status on the confidence ladder `VERIFIED > CORROBORATED > REPORTED > UNKNOWN`. A `proposed_status` of `CONTRADICTED` carries **no authority at all** and never changes a fact's status — it cites no facts, so there is nothing for a validator to check; `contradictions[]` is the only path to `CONTRADICTED` ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md));
+- `contradictions[]: {statement_fact_ids[], description, materiality: LOW|MEDIUM|HIGH}`. This is validated model judgement with a deterministic, fail-safe consequence: validation proves the cited facts exist, belong to this case, and satisfy the cardinality and schema rules, and application code then resolves every cited fact to `CONTRADICTED`. `materiality` is advisory and **block-only** — `MEDIUM` and `HIGH` block readiness, `LOW` does not. An accepted contradiction can only make the system more conservative; it never grants readiness, `VERIFIED`, a scope, an identity, a destination, or any other authority;
 - `duplicate_evidence_groups[]: {root_id, evidence_ids[], reason}`;
 - `proposed_commitments[]: {source_evidence_id, obligor, action_text, due_at, verification_method}`;
 - `sufficiency: {independent_source_count, is_corroborated, gaps[]}`;
 - `recommended_case_disposition: CONTINUE_INVESTIGATION | READY_FOR_ACTION | SPLIT_CANDIDATE | CLOSE_UNRESOLVED`.
 
-Deterministic validation recomputes root/contributor independence, validates all citations, forbids a `VERIFIED` status without an allowed verification source, and computes final sufficiency. The LLM cannot choose state, create a case split, or create a commitment directly; it submits a cited proposal to application rules/human review.
+Deterministic validation recomputes root/contributor independence, validates all citations, recomputes every evidence status, and computes final sufficiency. The LLM cannot choose state, create a case split, or create a commitment directly; it submits a cited proposal to application rules/human review.
+
+Evidence status is a deterministic recomputation, never a transition, and the model resolves against it rather than setting it ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md)). The **allowed verification source set is empty in policy/v1**, so a computed `VERIFIED` is unreachable and a model-proposed `VERIFIED` is always downgraded to the computed status and audited; it never rejects the assessment. `CORROBORATED` is a **fact-level** label earned only by independent support for one exact canonical claim, and it is not the case-level corroboration count that drives readiness and compiler gate 17.
+
+`proposed_commitments[]` is a schema and a citation check, not a commitment. Version 1 validates `source_evidence_id` for existence and same-case membership; the requirement that it be an authenticated external reply is checked where the commitment is actually created, alongside the destination binding that makes it checkable ([07-action-ses-and-commitments.md](07-action-ses-and-commitments.md)). Nothing about a proposed commitment is persisted by the investigation.
 
 ## Action Coordinator Agent
 

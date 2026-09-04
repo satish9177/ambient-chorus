@@ -1,23 +1,29 @@
-"""Phase 3 agent resources: the Monitor runtime identity and its boundary.
+"""Agent resources: each runtime's identity and its boundary.
 
-What this stack creates is one IAM role and one log group. That is the whole Phase 3 surface,
-and it is the part that matters for the security argument: the Monitor's isolation is an
-identity property, not a code property, so it can be asserted from the synthesized template
-long before a runtime is deployed.
+What this stack creates is one IAM role and one log group **per agent runtime**. That is the
+part that matters for the security argument: an agent's isolation is an identity property, not
+a code property, so it can be asserted from the synthesized template long before a runtime is
+deployed.
 
-The role's allow list is three things -- invoke exactly one inference profile, write to its own
+Phase 5 adds the Investigator beside the Monitor. The two roles are built by the same helper
+from the same denied-action lists, because "the Investigator is isolated like the Monitor" has
+to be a fact about one construction rather than a resemblance between two hand-written blocks.
+The Investigator's allow list is narrower in exactly one respect and wider in none: it invokes
+its own inference profile, not the Monitor's.
+
+Each role's allow list is three things -- invoke exactly one inference profile, write to its own
 log group, read its own artifact -- and its deny list is everything the frozen trust matrix
-marks ``D``. The denies are defence in depth: none of them is reachable through an allow, and
-an explicit deny cannot be overridden by a later grant, so a future change that accidentally
-attaches a data policy to this role still fails closed.
+marks ``D``.
 
-The AgentCore runtime resource itself is deliberately not created here. The frozen network
+Neither AgentCore runtime resource is created here. The frozen network
 design requires VPC mode in two isolated subnets with no NAT route, and that VPC belongs to
 the deployment stack. Creating a public-mode runtime now to have something to point at would
 contradict the design it is supposed to satisfy.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from aws_cdk import Stack, Tags
 from aws_cdk import aws_iam as iam
@@ -43,11 +49,13 @@ DENIED_DATA_PLANE_ACTIONS = (
     "s3:DeleteObject",
     "s3:ListBucket",
 )
-"""Storage the Monitor must never touch.
+"""Storage no agent runtime may ever touch.
 
-The Monitor is inside the private investigation zone and is deliberately *given* private text
-in its payload. That is exactly why it may not also read the stores: a compromised runtime
-should be limited to the one batch it was handed, not to the corpus.
+Both agents are inside the private zone and are deliberately *given* private text in their
+payloads. That is exactly why neither may also read the stores: a compromised runtime should be
+limited to the one payload it was handed, not to the corpus. The point is sharper for the
+Investigator, whose payload is one whole case -- reading the tables would turn a single case's
+exposure into every case's.
 """
 
 DENIED_SIDE_EFFECT_ACTIONS = (
@@ -71,8 +79,45 @@ is what keeps "agents never call one another" an IAM fact rather than a coding c
 """
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RuntimeStatementIds:
+    """The policy statement identifiers one runtime's boundary is written under.
+
+    Carried as data because a statement ID is part of a *deployed* policy's identity:
+    renaming the Monitor's for symmetry with a later agent would rewrite a deployed
+    artifact for no security gain. So the Monitor keeps the identifiers it already has,
+    the Investigator gets its own, and the construction that produces both is shared.
+    """
+
+    invoke_profile: str
+    write_logs: str
+    emit_traces: str
+    read_artifact: str
+    deny_data: str
+    deny_effects: str
+
+
+MONITOR_STATEMENT_IDS = RuntimeStatementIds(
+    invoke_profile="InvokeMonitorInferenceProfileOnly",
+    write_logs="WriteOwnLogsOnly",
+    emit_traces="EmitOwnTraces",
+    read_artifact="ReadOwnDirectCodeArtifact",
+    deny_data="DenyEveryDataStore",
+    deny_effects="DenyEveryExternalEffect",
+)
+
+INVESTIGATOR_STATEMENT_IDS = RuntimeStatementIds(
+    invoke_profile="InvokeInvestigatorInferenceProfileOnly",
+    write_logs="WriteOwnInvestigatorLogsOnly",
+    emit_traces="EmitOwnInvestigatorTraces",
+    read_artifact="ReadOwnInvestigatorArtifact",
+    deny_data="DenyEveryDataStoreForInvestigator",
+    deny_effects="DenyEveryExternalEffectForInvestigator",
+)
+
+
 class ChorusAgentStack(Stack):
-    """Creates the Monitor runtime execution role and its dedicated log group."""
+    """Creates each agent runtime's execution role and its dedicated log group."""
 
     def __init__(
         self,
@@ -81,6 +126,7 @@ class ChorusAgentStack(Stack):
         *,
         config: CdkBuildConfig,
         monitor_model_profile_arn: str | None = None,
+        investigator_model_profile_arn: str | None = None,
         artifact_bucket_arn: str | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
@@ -95,7 +141,6 @@ class ChorusAgentStack(Stack):
             log_group_name=f"/aws/bedrock-agentcore/chorus-monitor-{config.environment}",
             retention=logs.RetentionDays.TWO_WEEKS,
         )
-
         self.monitor_role = iam.Role(
             self,
             "MonitorRuntimeRole",
@@ -103,59 +148,113 @@ class ChorusAgentStack(Stack):
             assumed_by=iam.ServicePrincipal(AGENTCORE_SERVICE_PRINCIPAL),
             description="Monitor AgentCore runtime: model invocation and own telemetry only.",
         )
-
-        profile_arn = monitor_model_profile_arn or (
-            f"arn:aws:bedrock:{self.region}:{self.account}"
-            f":application-inference-profile/chorus-monitor-{config.environment}"
+        self._grant_runtime_boundary(
+            role=self.monitor_role,
+            log_group=self.monitor_log_group,
+            profile_arn=monitor_model_profile_arn
+            or self._default_profile_arn("monitor", config.environment),
+            artifact_bucket_arn=artifact_bucket_arn,
+            artifact_prefix="monitor",
+            sids=MONITOR_STATEMENT_IDS,
         )
-        self.monitor_role.add_to_policy(
+
+        self.investigator_log_group = logs.LogGroup(
+            self,
+            "InvestigatorRuntimeLogGroup",
+            log_group_name=f"/aws/bedrock-agentcore/chorus-investigator-{config.environment}",
+            retention=logs.RetentionDays.TWO_WEEKS,
+        )
+        self.investigator_role = iam.Role(
+            self,
+            "InvestigatorRuntimeRole",
+            role_name=f"chorus-investigator-runtime-{config.environment}",
+            assumed_by=iam.ServicePrincipal(AGENTCORE_SERVICE_PRINCIPAL),
+            description=(
+                "Investigator AgentCore runtime: model invocation and own telemetry only."
+            ),
+        )
+        self._grant_runtime_boundary(
+            role=self.investigator_role,
+            log_group=self.investigator_log_group,
+            profile_arn=investigator_model_profile_arn
+            or self._default_profile_arn("investigator", config.environment),
+            artifact_bucket_arn=artifact_bucket_arn,
+            artifact_prefix="investigator",
+            sids=INVESTIGATOR_STATEMENT_IDS,
+        )
+
+    def _default_profile_arn(self, agent: str, environment: str) -> str:
+        return (
+            f"arn:aws:bedrock:{self.region}:{self.account}"
+            f":application-inference-profile/chorus-{agent}-{environment}"
+        )
+
+    def _grant_runtime_boundary(
+        self,
+        *,
+        role: iam.Role,
+        log_group: logs.LogGroup,
+        profile_arn: str,
+        artifact_bucket_arn: str | None,
+        artifact_prefix: str,
+        sids: RuntimeStatementIds,
+    ) -> None:
+        """Attach one agent runtime's complete allow list and its two explicit denies.
+
+        One helper for every agent, so the boundary is a property of one construction rather
+        than of two blocks that happen to look alike today. The denies are defence in depth:
+        none of them is reachable through an allow, and an explicit deny cannot be overridden by
+        a later grant, so a future change that accidentally attaches a data policy to one of
+        these roles still fails closed.
+        """
+
+        role.add_to_policy(
             iam.PolicyStatement(
-                sid="InvokeMonitorInferenceProfileOnly",
+                sid=sids.invoke_profile,
                 effect=iam.Effect.ALLOW,
                 actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
                 resources=[profile_arn],
             )
         )
-        self.monitor_role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
-                sid="WriteOwnLogsOnly",
+                sid=sids.write_logs,
                 effect=iam.Effect.ALLOW,
                 actions=["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
                 resources=[
-                    self.monitor_log_group.log_group_arn,
-                    f"{self.monitor_log_group.log_group_arn}:log-stream:*",
+                    log_group.log_group_arn,
+                    f"{log_group.log_group_arn}:log-stream:*",
                 ],
             )
         )
-        self.monitor_role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
-                sid="EmitOwnTraces",
+                sid=sids.emit_traces,
                 effect=iam.Effect.ALLOW,
                 actions=["xray:PutTraceSegments", "xray:PutTelemetryRecords"],
                 resources=["*"],
             )
         )
         if artifact_bucket_arn is not None:
-            self.monitor_role.add_to_policy(
+            role.add_to_policy(
                 iam.PolicyStatement(
-                    sid="ReadOwnDirectCodeArtifact",
+                    sid=sids.read_artifact,
                     effect=iam.Effect.ALLOW,
                     actions=["s3:GetObject"],
-                    resources=[f"{artifact_bucket_arn}/monitor/*"],
+                    resources=[f"{artifact_bucket_arn}/{artifact_prefix}/*"],
                 )
             )
-
-        self.monitor_role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
-                sid="DenyEveryDataStore",
+                sid=sids.deny_data,
                 effect=iam.Effect.DENY,
                 actions=list(DENIED_DATA_PLANE_ACTIONS),
                 resources=["*"],
             )
         )
-        self.monitor_role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
-                sid="DenyEveryExternalEffect",
+                sid=sids.deny_effects,
                 effect=iam.Effect.DENY,
                 actions=list(DENIED_SIDE_EFFECT_ACTIONS),
                 resources=["*"],

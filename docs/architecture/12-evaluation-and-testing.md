@@ -21,9 +21,9 @@ Dataset `demo/evaluation/elevator-v1/` contains exact inputs and expected struct
 |---:|---|---|
 | 1 | valid recurring elevator case | six incidents link to one case; >=2 independent contributors; authorized safe view/action possible |
 | 2 | unrelated package/parking/plumbing/chatter | no unrelated message becomes a report/fact in elevator case; no false candidate from noise |
-| 3 | duplicate reporter | repeated A/B reports remain evidence but contributor independence count does not inflate |
+| 3 | duplicate reporter | repeated A/B reports remain evidence but contributor independence count does not inflate, and no fact of that reporter's becomes `CORROBORATED` on the strength of their own repetition |
 | 4 | duplicated/forwarded evidence | copies collapse to one EvidenceRoot and one evidence source |
-| 5 | contradiction | “nobody else reported” is cited and marked contradicted/caveated; not discarded |
+| 5 | contradiction | “nobody else reported” is cited, the structured contradiction is recorded in the assessment with its materiality, and the cited facts resolve to `CONTRADICTED`; that status travels outward on `ShareableFact.evidence_status` so the Action can caveat it. V1 exports no separate contradiction fact and discards nothing |
 | 6 | two similar but different problems | elevator failure and unrelated garage-gate/other equipment issue remain separate/uncertain, not falsely linked |
 | 7 | insufficient corroboration | one contributor/multiple reports stays `INVESTIGATING`, never ready |
 | 8 | mandate refused | refused contributor facts are absent; required refusal denies or optional excludes |
@@ -44,7 +44,7 @@ Additional parameterized variants cover mandate expiry equality, identity false/
 | pattern-linking recall | expected elevator reports linked / all expected elevator reports | >=0.90 on evaluation corpus |
 | pattern-linking precision | correct elevator links / all elevator-case links | >=0.95 |
 | false-link rate | unrelated messages/reports linked / unrelated inputs | <=0.05; zero in fixed demo |
-| evidence-status accuracy | exact expected status or allowed set / evaluated facts | >=0.90 |
+| evidence-status accuracy | exact expected status or allowed set / evaluated facts, scored against the deterministic classification in [ADR-015](../adr/ADR-015-evidence-status-and-verification.md) | >=0.90; `VERIFIED` expected **0** times in V1, and a non-zero count is a defect rather than a quality miss |
 | privacy violations | private value/token present in any safe artifact/log/action | **0** |
 | unauthorized exported facts | included source fact without current valid grant/policy necessity | **0** |
 | cross-case violations | foreign source/citation accepted | **0** |
@@ -134,6 +134,17 @@ Playwright covers exactly three surfaces: discovery, Resident B adjust/revoke, p
 13. `test_actioned_cannot_transition_directly_to_resolved`
 14. `test_demo_reset_refuses_non_demo_manifest_target`
 15. `test_same_compile_inputs_produce_rfc8785_golden_hash`
+16. `test_model_verified_is_always_downgraded_in_v1`
+17. `test_model_may_lower_but_never_raise_evidence_status`
+18. `test_proposed_status_contradicted_without_contradiction_entry_has_no_effect`
+19. `test_validated_contradiction_overrides_any_proposed_status`
+20. `test_case_corroborated_while_unique_fact_stays_reported`
+21. `test_two_independent_reporters_of_identical_canonical_fact_corroborate`
+22. `test_forwarded_root_chain_resolves_through_locator`
+23. `test_readiness_ignores_recommended_disposition`
+24. `test_compile_preflight_persists_nothing`
+25. `test_case_version_change_after_invocation_starts_applies_nothing` — the case moves to N+1 *while the model is answering about N*, so the request-time check and the envelope's case version both pass and only the apply transaction's version condition can refuse. Distinct from the cheaper `test_case_already_moved_before_invocation_applies_nothing`, where no model is called at all.
+26. `test_a_v1_row_decodes_and_its_unrecorded_materiality_reads_conservatively` — an `investigation-assessment/v1` row's unrecorded contradiction materiality reads as `HIGH` under a fixed description code, per [ADR-015](../adr/ADR-015-evidence-status-and-verification.md) §7.
 
 ## CI gates
 

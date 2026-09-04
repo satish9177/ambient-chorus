@@ -27,7 +27,14 @@ from contextvars import ContextVar
 from typing import Final
 from uuid import UUID
 
-from chorus.domain.ids import CaseId, CommunityId, Namespace, OperationId, Sha256Digest
+from chorus.domain.ids import (
+    CaseId,
+    CommunityId,
+    FactId,
+    Namespace,
+    OperationId,
+    Sha256Digest,
+)
 
 LOGGER_NAME: Final = "chorus.application"
 
@@ -96,6 +103,11 @@ class EventName:
     MANDATE_DECIDED: Final = "mandate.decided"
     MANDATE_DENIED: Final = "mandate.denied"
 
+    INVESTIGATION_APPLIED: Final = "investigation.applied"
+    EVIDENCE_INDEPENDENCE_COMPUTED: Final = "evidence.independence.computed"
+    CONTRADICTION_RECORDED: Final = "contradiction.recorded"
+    EVIDENCE_STATUS_DOWNGRADED: Final = "evidence.status.downgraded"
+
     PROMPT_INJECTION_OBSERVED: Final = "prompt_injection.observed"
 
 
@@ -111,6 +123,8 @@ def _emit(
     case_version: int | None = None,
     operation_id: OperationId | None = None,
     invocation_id: UUID | None = None,
+    entity_type: str | None = None,
+    entity_id: UUID | None = None,
     actor_id_hash: Sha256Digest | None = None,
     input_hash: Sha256Digest | None = None,
     output_hash: Sha256Digest | None = None,
@@ -139,6 +153,8 @@ def _emit(
         "case_version": case_version,
         "operation_id": operation_id,
         "invocation_id": invocation_id,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
         "actor_id_hash": None if actor_id_hash is None else actor_id_hash.value,
         "input_hash": None if input_hash is None else input_hash.value,
         "output_hash": None if output_hash is None else output_hash.value,
@@ -221,7 +237,8 @@ def agent_invocation_started(
     *,
     namespace: Namespace,
     community_id: CommunityId,
-    operation_id: OperationId,
+    operation_id: OperationId | None = None,
+    case_id: CaseId | None = None,
     invocation_id: UUID,
     correlation_id: UUID,
     input_hash: Sha256Digest,
@@ -283,7 +300,8 @@ def agent_invocation_failed(
     *,
     namespace: Namespace,
     community_id: CommunityId,
-    operation_id: OperationId,
+    operation_id: OperationId | None = None,
+    case_id: CaseId | None = None,
     invocation_id: UUID,
     correlation_id: UUID,
     input_hash: Sha256Digest,
@@ -317,7 +335,8 @@ def agent_contract_denied(
     *,
     namespace: Namespace,
     community_id: CommunityId,
-    operation_id: OperationId,
+    operation_id: OperationId | None = None,
+    case_id: CaseId | None = None,
     invocation_id: UUID,
     correlation_id: UUID,
     input_hash: Sha256Digest,
@@ -336,6 +355,115 @@ def agent_contract_denied(
         input_hash=input_hash,
         outcome="DENIED",
         reason_codes=reason_codes,
+    )
+
+
+def investigation_applied(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    case_version: int,
+    correlation_id: UUID,
+    reason_code: str,
+    status_counts: Mapping[str, int],
+) -> None:
+    """Record that one validated assessment was applied, and what it resolved to.
+
+    ``status_counts`` is per-status and nothing else: how many facts ended ``REPORTED``,
+    ``CORROBORATED``, ``CONTRADICTED``, ``UNKNOWN``, and -- always zero in policy/v1 --
+    ``VERIFIED``. A non-zero ``VERIFIED`` count is a defect rather than a quality miss, which
+    is exactly why it is counted rather than assumed.
+    """
+
+    _emit(
+        EventName.INVESTIGATION_APPLIED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        outcome="SUCCEEDED",
+        reason_codes=(reason_code,),
+        counts=status_counts,
+    )
+
+
+def evidence_independence_computed(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID,
+    independent_source_count: int,
+) -> None:
+    """Record the authoritative case-level count, so a corroboration claim is auditable."""
+
+    _emit(
+        EventName.EVIDENCE_INDEPENDENCE_COMPUTED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        counts={"independent_sources": independent_source_count},
+    )
+
+
+def contradiction_recorded(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID,
+    materiality: str,
+    cited_fact_count: int,
+) -> None:
+    """Record that a validated contradiction was accepted, at what cost and over how many facts.
+
+    The description the model wrote is deliberately absent. It is private reasoning about
+    private facts, it lives on the assessment row in the private zone, and an audit trail with
+    a wider read audience is not where it belongs.
+    """
+
+    _emit(
+        EventName.CONTRADICTION_RECORDED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        reason_codes=(materiality,),
+        counts={"cited_facts": cited_fact_count},
+    )
+
+
+def evidence_status_downgraded(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID,
+    fact_id: FactId,
+    computed_status: str,
+    proposed_status: str,
+) -> None:
+    """Record that a model proposed a status stronger than the computed one, and lost.
+
+    Identifiers and codes only: the fact, the status deterministic code computed, and the
+    status the model asked for. Never the rationale that argued for it -- SEC-21 is about which
+    value won, and the argument is not evidence for anything a log needs to hold.
+    """
+
+    _emit(
+        EventName.EVIDENCE_STATUS_DOWNGRADED,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="FACT",
+        entity_id=fact_id.value,
+        outcome="DENIED",
+        reason_codes=(f"COMPUTED_{computed_status}", f"PROPOSED_{proposed_status}"),
     )
 
 

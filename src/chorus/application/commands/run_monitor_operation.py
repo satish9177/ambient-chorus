@@ -228,14 +228,14 @@ class MonitorOperationWorker:
             # The operation is not this job's, so its private records are not this job's to
             # read either.
             return tuple(failures)
-        if operation.monitor_invocation_id is None or operation.monitor_locator_hash is None:
+        if operation.agent_invocation_id is None or operation.agent_binding_hash is None:
             # A MONITOR operation without a handover identity cannot authorize anything. It is
             # refused rather than trusted: the alternative is exactly the gap this field pair
             # was added to close.
             return (JobBinding.UNBOUND,)
-        if job.invocation_id != operation.monitor_invocation_id:
+        if job.invocation_id != operation.agent_invocation_id:
             failures.append(JobBinding.INVOCATION)
-        if monitor_locator_hash(job.message_locators) != operation.monitor_locator_hash:
+        if monitor_locator_hash(job.message_locators) != operation.agent_binding_hash:
             failures.append(JobBinding.LOCATORS)
         if failures:
             return tuple(failures)

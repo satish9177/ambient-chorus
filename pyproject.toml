@@ -217,6 +217,33 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "The Investigator runtime imports only its own public contract"
+type = "forbidden"
+source_modules = ["runtimes.investigator"]
+# `chorus.domain` is deliberately absent for the same reason it is for the Monitor: the
+# investigation contract reuses the frozen domain enums -- fact types, sensitivity categories,
+# case states, contradiction materiality -- and that module imports nothing but the standard
+# library, so reaching them through the contract adds no capability.
+#
+# The same single `botocore.config` exception applies: the runtime must pin its Bedrock client
+# to one attempt, Strands accepts that only as a `botocore.config.Config`, and that object
+# constructs no client, holds no credential, and reaches no service. A unit test asserts that
+# no other `boto3` or `botocore` module appears in the runtime source.
+ignore_imports = ["runtimes.investigator.agent -> botocore"]
+unmatched_ignore_imports_alerting = "none"
+forbidden_modules = [
+  "boto3",
+  "botocore",
+  "fastapi",
+  "aws_cdk",
+  "chorus.privacy",
+  "chorus.ports",
+  "chorus.application",
+  "chorus.infrastructure",
+  "chorus_api",
+]
+
+[[tool.importlinter.contracts]]
 name = "Infrastructure implements ports without reaching into the privacy compiler"
 type = "forbidden"
 source_modules = ["chorus.infrastructure"]

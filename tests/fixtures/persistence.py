@@ -28,6 +28,7 @@ from chorus.domain.entities import (
     ApplicationOperationStatus,
     Approval,
     ApprovalDecision,
+    AssessmentAlternative,
     AuditDecision,
     AuditDetails,
     AuditEntityRef,
@@ -119,6 +120,7 @@ from chorus.ports.records import (
     ChannelUniquenessLock,
     CurrentActionPointer,
     CurrentViewPointer,
+    EvidenceRootLocator,
     FactMandateAssociation,
     FeedSignalProjection,
     MonitorApplyProgress,
@@ -467,8 +469,8 @@ class World:
             version=version,
             created_at=NOW - timedelta(minutes=10),
             updated_at=NOW - timedelta(minutes=10) + timedelta(minutes=version),
-            monitor_invocation_id=self.uuid("monitor-invocation"),
-            monitor_locator_hash=digest(f"monitor-locators:{self.seed}"),
+            agent_invocation_id=self.uuid("monitor-invocation"),
+            agent_binding_hash=digest(f"monitor-locators:{self.seed}"),
         )
 
     def evidence_root(self) -> EvidenceRoot:
@@ -551,6 +553,15 @@ class World:
             updated_at=NOW - timedelta(days=2) + timedelta(minutes=version),
         )
 
+    def evidence_root_locator(self) -> EvidenceRootLocator:
+        return EvidenceRootLocator(
+            namespace=self.namespace,
+            community_id=self.community_id,
+            root_id=self.evidence_root_id,
+            root_sha256=digest(f"root:{self.seed}"),
+            created_at=NOW - timedelta(days=1),
+        )
+
     def evidence_item(self, *, version: int = 1) -> EvidenceItem:
         return EvidenceItem(
             evidence_id=self.evidence_id,
@@ -589,8 +600,15 @@ class World:
                     reason_code="MULTIPLE_INDEPENDENT_SOURCES",
                 ),
             ),
-            contradiction_fact_ids=(),
-            alternative_explanations=("Scheduled maintenance",),
+            contradictions=(),
+            alternative_explanations=(
+                AssessmentAlternative(
+                    description="Scheduled maintenance",
+                    cited_report_ids=(self.report_id,),
+                    cited_fact_ids=(),
+                    cited_evidence_ids=(),
+                ),
+            ),
             independent_source_count=4,
             is_corroborated=True,
             recommended_disposition="READY_FOR_ACTION",

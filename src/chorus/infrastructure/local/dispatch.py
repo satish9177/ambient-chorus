@@ -25,7 +25,12 @@ import asyncio
 import threading
 from dataclasses import dataclass, field
 
-from chorus.ports.operations import MonitorJobRunner, MonitorOperationJob
+from chorus.ports.operations import (
+    InvestigationJobRunner,
+    InvestigationOperationJob,
+    MonitorJobRunner,
+    MonitorOperationJob,
+)
 
 
 class DispatchFailedError(RuntimeError):
@@ -47,6 +52,7 @@ class RecordingOperationDispatcher:
     """
 
     jobs: list[MonitorOperationJob] = field(default_factory=list)
+    investigations: list[InvestigationOperationJob] = field(default_factory=list)
     failures: int = 0
 
     async def dispatch_monitor(self, job: MonitorOperationJob) -> None:
@@ -55,18 +61,35 @@ class RecordingOperationDispatcher:
             raise DispatchFailedError("the job was not handed over")
         self.jobs.append(job)
 
+    async def dispatch_investigation(self, job: InvestigationOperationJob) -> None:
+        if self.failures > 0:
+            self.failures -= 1
+            raise DispatchFailedError("the job was not handed over")
+        self.investigations.append(job)
+
 
 @dataclass(slots=True)
 class InProcessOperationDispatcher:
     """Execute the worker as a background task in this process."""
 
     worker: MonitorJobRunner
+    investigator: InvestigationJobRunner | None = None
     _tasks: set[asyncio.Task[object]] = field(default_factory=set, init=False)
     _pending: set[threading.Event] = field(default_factory=set, init=False)
 
     async def dispatch_monitor(self, job: MonitorOperationJob) -> None:
+        self._run(self.worker.execute(job))
+
+    async def dispatch_investigation(self, job: InvestigationOperationJob) -> None:
+        if self.investigator is None:
+            # An undispatched operation is stranded forever, so a dispatcher asked to hand over
+            # work it was never wired for says so rather than dropping the job silently.
+            raise DispatchFailedError("no investigation runner is wired to this dispatcher")
+        self._run(self.investigator.execute(job))
+
+    def _run(self, coroutine: object) -> None:
         finished = threading.Event()
-        task: asyncio.Task[object] = asyncio.create_task(self.worker.execute(job))
+        task: asyncio.Task[object] = asyncio.create_task(coroutine)  # type: ignore[arg-type]
         self._tasks.add(task)
         self._pending.add(finished)
 

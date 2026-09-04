@@ -26,9 +26,11 @@ from chorus.domain.entities import (
 from chorus.domain.errors import IntegrityError
 from chorus.domain.facts import Fact, Report
 from chorus.domain.ids import (
+    AssessmentId,
     CommunityId,
     ContributorId,
     EvidenceItemId,
+    EvidenceRootId,
     ExecutionId,
     FactId,
     MandateId,
@@ -65,6 +67,7 @@ from chorus.ports.pagination import Page, PageCursor, PageRequest, QueryBinding
 from chorus.ports.records import (
     AgentInvocationResult,
     ChannelUniquenessLock,
+    EvidenceRootLocator,
     FactMandateAssociation,
     FeedSignalProjection,
     MandatePointerExpectation,
@@ -260,6 +263,91 @@ class CoreRepository:
         require_same(root.community_id, scope.community_id, "EVIDENCE_ROOT")
         require_same(root.root_sha256, root_sha256, "EVIDENCE_ROOT")
         return root
+
+    async def load_evidence_roots_by_id(
+        self, scope: CommunityScope, root_ids: tuple[EvidenceRootId, ...]
+    ) -> tuple[EvidenceRoot, ...]:
+        """Resolve roots by identifier with two direct-key batch gets and nothing else.
+
+        The first batch reads exactly the ID locators asked for; the second reads exactly the
+        canonical rows those locators name. Both are ``BatchGetItem`` on keys this method
+        constructed, so the no-scan and no-GSI guarantees hold by construction rather than by
+        review. Anything the pair cannot resolve -- an absent locator, a locator whose root is
+        gone, a row that decodes into another community -- is an ``IntegrityError`` that quotes
+        nothing, because an ancestry chain that cannot be completed must never be answered with
+        a shorter one.
+        """
+
+        if len(set(root_ids)) != len(root_ids):
+            raise ValueError("requested evidence root IDs must be unique")
+        if len(root_ids) > BATCH_GET_MAX_KEYS:
+            raise ModelLimitExceededError("EVIDENCE_ROOT_BATCH")
+        if not root_ids:
+            return ()
+
+        locator_keys = {
+            codec_core.evidence_root_locator_key(scope, root_id).sort_key: root_id
+            for root_id in root_ids
+        }
+        locator_items = await self.driver.batch_get_items(
+            tuple(codec_core.evidence_root_locator_key(scope, root_id) for root_id in root_ids),
+            consistent=True,
+        )
+        by_root_id: dict[EvidenceRootId, Sha256Digest] = {}
+        for item in locator_items:
+            decoded, locator = codec_core.decode_evidence_root_locator(item)
+            key = codec_core.evidence_root_locator_key(scope, locator.root_id)
+            validate_scope(
+                decoded,
+                key=key,
+                entity_ref="EVIDENCE_ROOT_LOCATOR",
+                namespace=scope.namespace,
+                community_id=scope.community_id,
+                case_id=None,
+            )
+            require_same(locator.community_id, scope.community_id, "EVIDENCE_ROOT_LOCATOR")
+            if key.sort_key not in locator_keys:
+                raise CrossCaseViolationError("EVIDENCE_ROOT_LOCATOR")
+            by_root_id[locator.root_id] = locator.root_sha256
+        if any(root_id not in by_root_id for root_id in root_ids):
+            # A root whose locator is absent cannot be addressed at all, and an ancestry
+            # answer built without it would be an under-count wearing the shape of a result.
+            raise IntegrityError("EVIDENCE_ROOT_LOCATOR")
+
+        digests = {by_root_id[root_id] for root_id in root_ids}
+        root_keys = {codec_core.evidence_root_key(scope, digest).sort_key for digest in digests}
+        root_items = await self.driver.batch_get_items(
+            tuple(
+                codec_core.evidence_root_key(scope, digest) for digest in sorted(digests, key=str)
+            ),
+            consistent=True,
+        )
+        roots: dict[EvidenceRootId, EvidenceRoot] = {}
+        for item in root_items:
+            decoded, root = codec_core.decode_evidence_root(item)
+            key = codec_core.evidence_root_key(scope, root.root_sha256)
+            validate_scope(
+                decoded,
+                key=key,
+                entity_ref="EVIDENCE_ROOT",
+                namespace=scope.namespace,
+                community_id=scope.community_id,
+                case_id=None,
+            )
+            require_same(root.community_id, scope.community_id, "EVIDENCE_ROOT")
+            if key.sort_key not in root_keys:
+                raise CrossCaseViolationError("EVIDENCE_ROOT")
+            roots[root.root_id] = root
+        ordered: list[EvidenceRoot] = []
+        for root_id in root_ids:
+            resolved = roots.get(root_id)
+            if resolved is None or resolved.root_sha256 != by_root_id[root_id]:
+                # The locator named a row that is missing, or one that turned out to be a
+                # different root's content. Either way the pair disagrees, and a disagreement
+                # between two immutable create-only items is an integrity failure.
+                raise IntegrityError("EVIDENCE_ROOT")
+            ordered.append(resolved)
+        return tuple(ordered)
 
     async def _case(self, scope: CaseScope, *, consistent: bool) -> CommunityCase:
         key = codec_core.case_key(scope)
@@ -909,6 +997,48 @@ class CoreRepository:
             entity_ref="REPORT",
         )
 
+    async def load_current_assessment(
+        self, scope: CaseScope, assessment_id: AssessmentId
+    ) -> InvestigationAssessment | None:
+        """Strongly read the newest assessment and prove the case actually points at it.
+
+        A bounded descending query with ``limit=1`` on the case's own ``ASSESSMENT#`` prefix.
+        The sort key leads with the creation instant, so the newest row is the last one --
+        which is why this reads descending rather than paging the prefix forward.
+
+        The identity check is the point of the method. Assessments are append-only and the
+        case's ``assessment_id`` is the only current pointer, so a newest row that the case
+        does not name means an append committed beside the case update this caller read. That
+        is a stale read, not a current assessment, and it answers ``None``.
+        """
+
+        result = await self.driver.query(
+            QueryRequest(
+                table=TableName.CORE,
+                partition_key=keys.case_partition(scope.namespace, scope.case_id),
+                sort_key=SortKeyBeginsWith(keys.ASSESSMENT_SORT_KEY_PREFIX),
+                consistent=True,
+                limit=1,
+                ascending=False,
+            )
+        )
+        if not result.items:
+            return None
+        decoded, assessment = codec_case.decode_assessment(result.items[0])
+        key = codec_case.assessment_key(scope, assessment)
+        validate_scope(
+            decoded,
+            key=key,
+            entity_ref="INVESTIGATION_ASSESSMENT",
+            namespace=scope.namespace,
+            community_id=scope.community_id,
+            case_id=scope.case_id,
+        )
+        require_same(assessment.case_id, scope.case_id, "INVESTIGATION_ASSESSMENT")
+        if assessment.assessment_id != assessment_id:
+            return None
+        return assessment
+
     async def read_case_assessments(
         self, scope: CaseScope, request: PageRequest
     ) -> Page[InvestigationAssessment]:
@@ -1107,6 +1237,14 @@ class CoreRepository:
             codec_core.encode_operation(scope, operation),
             expected_version=expected_version,
             new_version=operation.version,
+        )
+
+    def stage_create_evidence_root_locator(
+        self, scope: CommunityScope, locator: EvidenceRootLocator
+    ) -> PutItem:
+        return create_operation(
+            codec_core.evidence_root_locator_key(scope, locator.root_id),
+            codec_core.encode_evidence_root_locator(scope, locator),
         )
 
     def stage_create_evidence_root(self, scope: CommunityScope, root: EvidenceRoot) -> PutItem:

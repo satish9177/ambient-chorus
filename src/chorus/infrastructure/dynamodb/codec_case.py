@@ -5,6 +5,11 @@ from __future__ import annotations
 from typing import Final
 
 from chorus.domain.entities import (
+    ASSESSMENT_SCHEMA_VERSION_V1,
+    ASSESSMENT_SCHEMA_VERSION_V2,
+    AssessmentAlternative,
+    AssessmentContradiction,
+    ContradictionMateriality,
     EvidenceFinding,
     EvidenceItem,
     EvidenceStatus,
@@ -70,7 +75,19 @@ _CORE: Final = TableName.CORE
 REPORT_SCHEMA_VERSIONS: Final = frozenset({"report/v1"})
 FACT_SCHEMA_VERSIONS: Final = frozenset({"fact/v1"})
 EVIDENCE_ITEM_SCHEMA_VERSIONS: Final = frozenset({"evidence-item/v1"})
-ASSESSMENT_SCHEMA_VERSIONS: Final = frozenset({"investigation-assessment/v1"})
+ASSESSMENT_SCHEMA_VERSIONS: Final = frozenset(
+    {ASSESSMENT_SCHEMA_VERSION_V1, ASSESSMENT_SCHEMA_VERSION_V2}
+)
+"""Readers accept v1 and v2; writers emit v2 (ADR-015 / 04-domain-state-and-events).
+
+A v1 row flattened contradictions into one ``contradiction_fact_ids`` tuple and reduced
+alternatives to bare strings, so it records *no* materiality and *no* per-contradiction
+grouping. Those are not values a decoder may invent, and materiality is read by the readiness
+guard -- so a v1 row's cited facts are reconstructed as one contradiction at ``HIGH``, the
+reading that can only block. The description is a fixed code, never recovered text.
+"""
+
+V1_CONTRADICTION_DESCRIPTION: Final = "LEGACY_V1_CONTRADICTION_MATERIALITY_UNRECORDED"
 
 
 def report_key(scope: CaseScope, report_id: ReportId) -> ItemKey:
@@ -453,7 +470,9 @@ def encode_assessment(scope: CaseScope, assessment: InvestigationAssessment) -> 
     key = assessment_key(scope, assessment)
     item: dict[str, StoredValue] = envelope(
         entity_type=EntityType.INVESTIGATION_ASSESSMENT,
-        schema_version=assessment.schema_version,
+        # Writers emit v2 unconditionally: a value decoded from a v1 row is already the v2
+        # shape in memory, and writing it back under the old name would misdescribe it.
+        schema_version=ASSESSMENT_SCHEMA_VERSION_V2,
         key=key,
         namespace=scope.namespace,
         community_id=scope.community_id,
@@ -473,8 +492,23 @@ def encode_assessment(scope: CaseScope, assessment: InvestigationAssessment) -> 
                 }
                 for finding in assessment.findings
             ),
-            "contradiction_fact_ids": identifiers(assessment.contradiction_fact_ids),
-            "alternative_explanations": tuple(assessment.alternative_explanations),
+            "contradictions": tuple(
+                {
+                    "statement_fact_ids": identifiers(contradiction.statement_fact_ids),
+                    "description": contradiction.description,
+                    "materiality": contradiction.materiality.value,
+                }
+                for contradiction in assessment.contradictions
+            ),
+            "alternative_explanations": tuple(
+                {
+                    "description": alternative.description,
+                    "cited_report_ids": identifiers(alternative.cited_report_ids),
+                    "cited_fact_ids": identifiers(alternative.cited_fact_ids),
+                    "cited_evidence_ids": identifiers(alternative.cited_evidence_ids),
+                }
+                for alternative in assessment.alternative_explanations
+            ),
             "independent_source_count": assessment.independent_source_count,
             "is_corroborated": assessment.is_corroborated,
             "recommended_disposition": assessment.recommended_disposition,
@@ -515,14 +549,76 @@ def decode_assessment(item: StoredItem) -> tuple[DecodedScope, InvestigationAsse
         agent_invocation_id=reader.uuid("agent_invocation_id"),
         linkage_decision=reader.text("linkage_decision"),
         findings=tuple(findings),
-        contradiction_fact_ids=reader.identifiers("contradiction_fact_ids", FactId),
-        alternative_explanations=reader.texts("alternative_explanations"),
+        contradictions=_decode_contradictions(reader, schema_version),
+        alternative_explanations=_decode_alternatives(reader, schema_version),
         independent_source_count=reader.number("independent_source_count"),
         is_corroborated=reader.flag("is_corroborated"),
         recommended_disposition=reader.text("recommended_disposition"),
         assessment_hash=reader.digest("assessment_hash"),
         created_at=reader.instant("created_at"),
-        schema_version=schema_version,
+        schema_version=ASSESSMENT_SCHEMA_VERSION_V2,
     )
     reader.finish()
     return scope, assessment
+
+
+def _decode_contradictions(
+    reader: ItemReader, schema_version: str
+) -> tuple[AssessmentContradiction, ...]:
+    """Read structured contradictions, upgrading a v1 row at its most conservative."""
+
+    if schema_version == ASSESSMENT_SCHEMA_VERSION_V1:
+        cited = reader.identifiers("contradiction_fact_ids", FactId)
+        if len(cited) < 2:
+            # Fewer than two cited facts names no conflict, so there is nothing to carry
+            # forward. A v1 row could hold one, because the flat tuple had no cardinality rule.
+            return ()
+        return (
+            AssessmentContradiction(
+                statement_fact_ids=cited[:10],
+                description=V1_CONTRADICTION_DESCRIPTION,
+                materiality=ContradictionMateriality.HIGH,
+            ),
+        )
+    contradictions: list[AssessmentContradiction] = []
+    for index, raw in enumerate(reader.mappings("contradictions")):
+        child = reader.child(raw, f"contradictions[{index}]")
+        contradiction = build_entity(
+            child.entity_ref,
+            AssessmentContradiction,
+            statement_fact_ids=child.identifiers("statement_fact_ids", FactId),
+            description=child.text("description"),
+            materiality=child.enum("materiality", ContradictionMateriality),
+        )
+        child.finish()
+        contradictions.append(contradiction)
+    return tuple(contradictions)
+
+
+def _decode_alternatives(
+    reader: ItemReader, schema_version: str
+) -> tuple[AssessmentAlternative, ...]:
+    if schema_version == ASSESSMENT_SCHEMA_VERSION_V1:
+        return tuple(
+            AssessmentAlternative(
+                description=description,
+                cited_report_ids=(),
+                cited_fact_ids=(),
+                cited_evidence_ids=(),
+            )
+            for description in reader.texts("alternative_explanations")
+        )
+    alternatives: list[AssessmentAlternative] = []
+    for index, raw in enumerate(reader.mappings("alternative_explanations")):
+        child = reader.child(raw, f"alternative_explanations[{index}]")
+        alternative = build_entity(
+            child.entity_ref,
+            AssessmentAlternative,
+            description=child.text("description"),
+            cited_report_ids=child.identifiers("cited_report_ids", ReportId),
+            cited_fact_ids=child.identifiers("cited_fact_ids", FactId),
+            cited_evidence_ids=child.identifiers("cited_evidence_ids", EvidenceItemId),
+        )
+        child.finish()
+        alternatives.append(alternative)
+    return tuple(alternatives)

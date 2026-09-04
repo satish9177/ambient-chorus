@@ -39,10 +39,12 @@ from chorus.domain.entities import (
 from chorus.domain.facts import Fact, Report
 from chorus.domain.ids import (
     ApprovalId,
+    AssessmentId,
     CommitmentId,
     CommunityId,
     ContributorId,
     EvidenceItemId,
+    EvidenceRootId,
     ExecutionId,
     FactId,
     MandateId,
@@ -67,6 +69,7 @@ from chorus.ports.records import (
     ChannelUniquenessLock,
     CurrentActionPointer,
     CurrentViewPointer,
+    EvidenceRootLocator,
     FactMandateAssociation,
     FeedSignalProjection,
     MandatePointerExpectation,
@@ -127,6 +130,19 @@ class CoreRepositoryPort(Protocol):
         self, scope: CommunityScope, root_sha256: Sha256Digest
     ) -> EvidenceRoot | None:
         """Strongly read the content-addressed evidence root for a community."""
+
+    async def load_evidence_roots_by_id(
+        self, scope: CommunityScope, root_ids: tuple[EvidenceRootId, ...]
+    ) -> tuple[EvidenceRoot, ...]:
+        """Strongly read evidence roots by identifier through their ID locators (ADR-017).
+
+        Two direct-key ``BatchGetItem`` calls and nothing else: the exact
+        ``EVIDENCE_ROOT_ID#{root_id}`` locator keys, then the exact
+        ``EVIDENCE_ROOT#{root_sha256}`` keys those locators name. No scan, no GSI, no prefix
+        walk. A missing locator or a locator naming a missing root raises ``IntegrityError``
+        and quotes nothing -- failing closed, because the alternative is a silently
+        under-counted corroboration input.
+        """
 
     async def load_case(self, scope: CaseScope) -> CommunityCase:
         """Strongly read the case aggregate before any guarded mutation."""
@@ -244,6 +260,19 @@ class CoreRepositoryPort(Protocol):
     ) -> Page[InvestigationAssessment]:
         """Eventually page immutable investigation assessments for display."""
 
+    async def load_current_assessment(
+        self, scope: CaseScope, assessment_id: AssessmentId
+    ) -> InvestigationAssessment | None:
+        """Strongly read the newest assessment and prove it is the one the case points at.
+
+        A bounded descending query on the case's ``ASSESSMENT#`` prefix with limit 1, then an
+        identity check against ``CommunityCase.assessment_id``. The pointer lives on the case
+        itself, so there is no second pointer item that could disagree with it -- but the
+        newest *row* and the pointed-at row can still differ under a concurrent append, and a
+        readiness decision must never be made against an assessment the case does not name.
+        A newest row whose identifier disagrees returns ``None`` rather than a near-miss.
+        """
+
     def stage_create_community(self, scope: NamespaceScope, community: Community) -> PutItem: ...
 
     def stage_update_community(
@@ -325,6 +354,11 @@ class CoreRepositoryPort(Protocol):
         """
 
     def stage_create_evidence_root(self, scope: CommunityScope, root: EvidenceRoot) -> PutItem: ...
+
+    def stage_create_evidence_root_locator(
+        self, scope: CommunityScope, locator: EvidenceRootLocator
+    ) -> PutItem:
+        """Stage the create-only ID locator that belongs in the root's own transaction."""
 
     def stage_create_case(self, scope: CaseScope, case: CommunityCase) -> PutItem: ...
 
