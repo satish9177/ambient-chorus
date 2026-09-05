@@ -56,7 +56,15 @@
       "byte_length": 631,
       "sha256": "sha256:25cf0f0ce42f8acd9ea6facc223f54105c7fd0cce63fb7bb5d83e6600100acbd",
       "safe_caption": "A photograph of the lift control panel showing an error code.",
-      "ingested_with_feed": true
+      "ingested_with_feed": true,
+      "review": {
+        "no_face": true,
+        "no_unit": true,
+        "no_name": true,
+        "no_health": true,
+        "reviewed_by": "fixture-curation:elevator-v1",
+        "reviewed_at": "2030-01-14T09:00:00.000000Z"
+      }
     },
     {
       "fixture_id": "injection-notice",
@@ -66,7 +74,8 @@
       "byte_length": 406,
       "sha256": "sha256:aebe6d5b9b2c681905be2ebe8f070d6f73200aba86b94d83e72a01b61718cd90",
       "safe_caption": null,
-      "ingested_with_feed": true
+      "ingested_with_feed": true,
+      "review": null
     },
     {
       "fixture_id": "management-reply",
@@ -76,7 +85,8 @@
       "byte_length": 222,
       "sha256": "sha256:ace2d0cf382c14eb81010c855e28024fac0756860eeea8167cf68077db4701b0",
       "safe_caption": null,
-      "ingested_with_feed": false
+      "ingested_with_feed": false,
+      "review": null
     }
   ]
 }

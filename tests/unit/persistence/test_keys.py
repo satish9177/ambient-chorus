@@ -35,6 +35,7 @@ def test_partition_grammar_matches_the_frozen_table() -> None:
     assert keys.namespace_partition(NAMESPACE) == "NS#TEST_KEYS"
     assert keys.community_partition(NAMESPACE, community_id) == f"NS#TEST_KEYS#COMM#{community_id}"
     assert keys.case_partition(NAMESPACE, case_id) == f"NS#TEST_KEYS#CASE#{case_id}"
+    assert keys.fence_partition(NAMESPACE, case_id) == f"NS#TEST_KEYS#FENCE#{case_id}"
     assert (
         keys.operation_partition(NAMESPACE, operation_id)
         == f"NS#TEST_KEYS#OPERATION#{operation_id}"
@@ -127,3 +128,31 @@ def test_prefixes_match_the_sort_keys_they_scan() -> None:
         keys.MANDATE_CURRENT_SORT_KEY_PREFIX
     )
     assert keys.message_sort_key(INSTANT, world.message_id).startswith(keys.MESSAGE_SORT_KEY_PREFIX)
+
+
+def test_the_send_fence_is_not_in_the_case_partition() -> None:
+    """ADR-019. The separation is the security control, so it is asserted, not assumed.
+
+    ``dynamodb:LeadingKeys`` constrains the partition key and nothing constrains the sort key,
+    so a fence sharing the case partition cannot be granted without granting the case row too.
+    If these two ever became equal again, the compiler's Core write boundary would silently
+    widen from one item to the whole case.
+    """
+
+    case_id = CaseId(UUID("22222222-2222-4222-8222-222222222222"))
+
+    fence = keys.fence_partition(NAMESPACE, case_id)
+    case = keys.case_partition(NAMESPACE, case_id)
+
+    assert fence != case
+    assert not fence.startswith(case)
+    assert not case.startswith(fence)
+    # And the fence prefix must not be reachable by a LeadingKeys pattern written for cases.
+    assert not fence.startswith("NS#TEST_KEYS#CASE#")
+
+
+def test_the_fence_partition_carries_no_user_text() -> None:
+    case_id = CaseId(UUID("22222222-2222-4222-8222-222222222222"))
+
+    assert keys.fence_partition(NAMESPACE, case_id).count("#") == 3
+    assert str(case_id) in keys.fence_partition(NAMESPACE, case_id)

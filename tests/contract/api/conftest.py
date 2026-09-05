@@ -14,7 +14,7 @@ agrees with itself.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 from chorus_api.dependencies import ApiContainer, DemoActor
@@ -55,6 +55,25 @@ class ApiHarness:
         headers.update(extra)
         return headers
 
+    def bind_compile(self, compile_harness: object) -> None:
+        """Point the running application at a seeded compile world.
+
+        The compile fixture owns its own namespace, community, and destination registry
+        entry, and the route resolves all three from the container rather than from the
+        request -- which is the property under test. Rebinding here is how a transport test
+        exercises the real route against real state without the route learning anything
+        from the caller that it is supposed to decide for itself.
+        """
+
+        container = self.app.state.container
+        self.app.state.container = replace(
+            container,
+            namespace=compile_harness.scope.namespace,  # type: ignore[attr-defined]
+            community_id=compile_harness.scope.community_id,  # type: ignore[attr-defined]
+            destination=compile_harness.stored_destination(),  # type: ignore[attr-defined]
+            compile_view=compile_harness.compile_view(),  # type: ignore[attr-defined]
+        )
+
 
 def build_harness(
     driver: StorageDriver,
@@ -90,6 +109,7 @@ def build_harness(
         namespace=harness.namespace,
         community_id=harness.community_id,
         destination_id=DESTINATION_ID,
+        destination=harness.stored_destination,
         contributor_by_actor={
             DemoActor(actor): contributor_id
             for actor, contributor_id in harness.contributor_by_actor.items()
@@ -100,6 +120,7 @@ def build_harness(
         propose_mandates=harness.propose_mandates,
         decide_mandate=harness.decide_mandate,
         read_mandate_thread=harness.read_mandate_thread,
+        compile_view=harness.compile_view,
         dispatcher=dispatcher,
     )
     app = build_app(container)

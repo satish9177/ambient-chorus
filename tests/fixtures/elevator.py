@@ -68,6 +68,7 @@ from chorus.domain.mandates import (
     FactGrant,
     IdentityGrant,
 )
+from chorus.ports.objects import private_evidence_key
 from chorus.privacy.canonical import hash_mandate_terms
 from chorus.privacy.compiler import CompileContext
 from chorus.privacy.policy import SafeDestination, SafeEvidenceCandidate
@@ -348,7 +349,14 @@ def build_elevator_fixture() -> ElevatorFixture:
             namespace=NAMESPACE,
             submitted_by_contributor_id=contributor,
             source_message_id=None,
-            private_object_key=SensitiveStr(f"private/{evidence_id}"),
+            private_object_key=SensitiveStr(
+                private_evidence_key(
+                    namespace=NAMESPACE,
+                    community_id=community_id,
+                    case_id=case_id,
+                    evidence_id=evidence_id,
+                )
+            ),
             media_type=media_type,
             byte_length=2_048,
             sha256=_digest(str(evidence_id)),

@@ -1268,6 +1268,23 @@ class CoreRepository:
             new_version=case.version,
         )
 
+    def stage_require_case_version(self, scope: CaseScope, *, expected_version: int) -> CheckItem:
+        """Condition on the case standing at exactly this version, writing nothing.
+
+        The compile transaction's authorization guard. It is a ``CheckItem`` rather than a
+        guarded update for two independent reasons, and either alone would be enough: the
+        compiler's only Core write is the send fence, and a compile that bumped the case
+        version would stale its own freshly written view against the exact-version check the
+        proposal validator performs.
+        """
+
+        if expected_version < 1:
+            raise ValueError("an expected case version must be positive")
+        return CheckItem(
+            key=codec_core.case_key(scope),
+            condition=AttributeEqualsNumber(name=ATTR_VERSION, value=expected_version),
+        )
+
     @staticmethod
     def _require_case_capacity(case: CommunityCase) -> None:
         if len(case.fact_ids) > MAX_ACTIVE_FACTS_PER_CASE:

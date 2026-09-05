@@ -54,7 +54,7 @@ Trust is directional. Data moving right is re-modeled into narrower types, not p
 | FastAPI/application | RW | RW* | W | RW | R | I | I | I | I | I | W | D |
 | Monitor runtime | D | D | — | D | D | — | — | — | D | D | D | D |
 | Investigator runtime | D | D | — | D | D | — | — | — | D | D | D | D |
-| Compiler Lambda | R(all)/W(fence only) | R(all safe)/W(view only) | W | R | W | — | — | — | — | D | D | D |
+| Compiler Lambda | R(all)/W(`FENCE` partition only) | R(all safe)/W(view only) | W | R | W | — | — | — | — | D | D | D |
 | Action runtime | D | D | — | D | D | — | — | — | D | D | D | D |
 | Sender Lambda | D | R(view/proposal/approval)/W(execution only) | W | D | D | — | — | — | I(fence API only) | — | D | S |
 | Commitment watcher | D | R/W(commitment/case projection) | W | D | D | — | — | — | D | D | D | D |
@@ -90,7 +90,7 @@ They have no general network tool and no persistent AgentCore filesystem or Memo
 ## Principal-specific constraints
 
 - **Application:** its broad private access is why it never receives an SES permission. It invokes the sender with an action ID, never a rendered body or recipient address.
-- **Compiler:** accepts IDs and intent, then performs its own strongly consistent reads. It has no Bedrock permission, so policy cannot become probabilistic. Its only Core write is the short-lived send-authorization fence.
+- **Compiler:** accepts IDs and intent, then performs its own strongly consistent reads. It has no Bedrock permission, so policy cannot become probabilistic. Its only Core write is the short-lived send-authorization fence, and that is an IAM fact rather than a code convention: the fence has its own `NS#n#FENCE#k` partition ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md)), so `dynamodb:LeadingKeys` can scope the write to it. The case-version guard the compile transaction stages is `dynamodb:ConditionCheckItem` — read-only transactional authority — and case-partition writes are additionally denied outright. No `dynamodb:UpdateItem` is granted anywhere, and no blanket `dynamodb:TransactWriteItems` action is granted, because AWS authorizes a transaction through the permission each participant needs.
 - **Action runtime:** has no tools registered in Strands. Network configuration permits only the Bedrock model path required by AgentCore; IAM remains the authoritative boundary.
 - **Sender:** resolves the recipient from an allowlisted destination registry in configuration. It cannot read Core, so even compromised rendering cannot fetch private details. It can invoke only the compiler's typed acquire/release fence operation and receives no private result.
 - **Watcher:** accepts only `CommitmentDueEvent`, does not invoke an LLM, and cannot send external messages.

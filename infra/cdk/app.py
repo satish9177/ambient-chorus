@@ -5,7 +5,14 @@ from __future__ import annotations
 from aws_cdk import App
 
 from infra.cdk.config import CdkBuildConfig
-from infra.cdk.stacks import ChorusAgentStack, ChorusDataStack, ChorusFoundationStack
+from infra.cdk.stacks import (
+    ChorusAgentStack,
+    ChorusCompilerStack,
+    ChorusDataStack,
+    ChorusFoundationStack,
+    CompilerBuckets,
+    CompilerTables,
+)
 
 
 def build_app() -> App:
@@ -23,7 +30,7 @@ def build_app() -> App:
         "AmbientChorusFoundation",
         config=config,
     )
-    ChorusDataStack(
+    data = ChorusDataStack(
         app,
         "AmbientChorusData",
         config=config,
@@ -32,6 +39,22 @@ def build_app() -> App:
         app,
         "AmbientChorusAgents",
         config=config,
+    )
+    ChorusCompilerStack(
+        app,
+        "AmbientChorusCompiler",
+        config=config,
+        tables=CompilerTables(
+            core=data.core_table,
+            shareable=data.shareable_table,
+            audit=data.audit_table,
+        ),
+        buckets=CompilerBuckets(
+            private=data.private_evidence_bucket,
+            export=data.export_evidence_bucket,
+            private_key=data.private_evidence_key,
+            export_key=data.export_evidence_key,
+        ),
     )
     return app
 

@@ -67,6 +67,7 @@ from chorus.ports.records import (
     ActionPointerExpectation,
     AgentInvocationResult,
     ChannelUniquenessLock,
+    CompilerAuditProjection,
     CurrentActionPointer,
     CurrentViewPointer,
     EvidenceRootLocator,
@@ -408,6 +409,21 @@ class CoreRepositoryPort(Protocol):
         self, scope: CaseScope, result: AgentInvocationResult
     ) -> PutItem: ...
 
+    def stage_require_case_version(self, scope: CaseScope, *, expected_version: int) -> CheckItem:
+        """Assert the case still stands at exactly this version, writing nothing.
+
+        Deliberately a ``CheckItem`` and not a guarded update. The compiler's only Core write is
+        the send fence, so it has no grant to touch the case row at all -- and a compile that
+        bumped the case version would immediately stale the very view it had just produced
+        against the exact-version check the Action proposal validator performs.
+
+        One participant is enough to cover every mutable authorization input a compile read.
+        Every authorization-sensitive mutation -- a fact's value, status, or evidence status, a
+        report's linkage, a mandate decision, an adjustment, a revocation -- bumps the case
+        version in the same transaction that makes it, so a per-fact or per-mandate condition
+        would re-check what this one already refuses.
+        """
+
     def stage_require_no_live_send_fence(self, scope: CaseScope, *, now: datetime) -> CheckItem:
         """Condition-check participant asserting no unexpired fence blocks this mutation."""
 
@@ -487,8 +503,15 @@ class ShareableRepositoryPort(Protocol):
     def stage_append_approval(self, scope: ActionScope, approval: Approval) -> PutItem: ...
 
     def stage_consume_approval(
-        self, scope: ActionScope, approval: Approval, *, expected_version: int
-    ) -> PutItem: ...
+        self, scope: ActionScope, approval: Approval, *, expected: Approval
+    ) -> PutItem:
+        """Record one-time consumption without rewriting the decision.
+
+        The caller supplies the record it loaded rather than only its version, because a
+        whole-item put could otherwise carry a different proposal hash, view hash, decision,
+        approver, or expiry alongside the consumption. The adapter compares every other
+        field against ``expected``; the version alone could not detect that.
+        """
 
     def stage_create_execution(self, scope: ActionScope, execution: ActionExecution) -> PutItem: ...
 
@@ -521,6 +544,16 @@ class AuditRepositoryPort(Protocol):
     def stage_append_case_event(self, scope: CaseScope, event: AuditEvent) -> PutItem: ...
 
     def stage_append_namespace_event(self, scope: NamespaceScope, event: AuditEvent) -> PutItem: ...
+
+    def stage_append_compile_projection(
+        self, scope: CaseScope, projection: CompilerAuditProjection
+    ) -> PutItem:
+        """Append one compile's immutable private lineage, allowed or denied."""
+
+    async def load_compile_projection(
+        self, scope: CaseScope, compile_id: UUID
+    ) -> CompilerAuditProjection | None:
+        """Strongly read one compile's private lineage, or ``None`` when it is absent."""
 
     async def read_case_events(self, scope: CaseScope, request: PageRequest) -> Page[AuditEvent]:
         """Eventually page case audit events in occurrence order."""

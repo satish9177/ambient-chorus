@@ -126,6 +126,8 @@ Fields: `case_id`, `community_id`, `title: str[1..160]`, `issue_type`, `state`, 
 
 `corroboration_source_count` is the **case-level** independent-source count over every `ACTIVE` case fact. Intake creates a case with `0`; the investigation apply writes the deterministically recomputed value in the same transaction that appends the assessment. It is not a fact's `evidence_status`, and a corroborated case may contain facts that remain `REPORTED` ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md)). `assessment_id` is the current-assessment pointer; there is no separate pointer item, so the pointer and the case version can never disagree.
 
+`current_view_id` is **unused in V1 and remains `None`**. The sole current-view authority is the Shareable table's `VIEW_CURRENT` pointer. The compiler never writes the Core case row, never sets this field, and never bumps `CommunityCase.version` — its only Core write is the send fence, and a compile that bumped the case version would immediately stale the very view it had just produced against the exact-version check the Action proposal validator performs. The field is left in place rather than removed during Phase 6; a later cleanup ADR may drop it. `current_action_id` is subject to the same rule under its own `ACTION_CURRENT` pointer.
+
 ### InvestigationAssessment
 
 Purpose: validated snapshot of skeptical reasoning, kept separate from agent draft.
@@ -140,13 +142,15 @@ Fields: `assessment_id`, `case_id`, `based_on_case_version`, `agent_invocation_i
 
 Purpose: external-safe transformed fact within a compiled view.
 
-Fields: `export_fact_id`, `fact_type`, `safe_text: str[1..500]`, `effective_scope`, `evidence_status`, `contributor_count: int>=1`, `transformation: DIRECT|ANONYMIZED|AGGREGATED|GENERALIZED`, `transformation_rule_id`, `safe_evidence_ref_ids`, `content_hash`. Immutable and serializable to the Action zone. Source-fact lineage is stored in the private compiler audit projection, not in this model. No owner/source/contact/private location/private URI fields.
+Fields: `export_fact_id`, `fact_type`, `safe_text: str[1..500]`, `effective_scope`, `evidence_status`, `contributor_count: int>=1`, `transformation: DIRECT|ANONYMIZED|AGGREGATED|GENERALIZED`, `transformation_rule_id`, `safe_evidence_ref_ids`, `content_hash`. Immutable and serializable to the Action zone. Source-fact lineage is stored in the compiler audit projection defined in [06-persistence-and-evidence.md](06-persistence-and-evidence.md) § The compiler audit projection, not in this model. No owner/source/contact/private location/private URI fields.
 
 ### ShareableEvidenceRef
 
 Purpose: reference an independently created external-safe derivative.
 
-Fields: `safe_evidence_ref_id`, `media_type`, `export_handle_id` (opaque UUID, not a URI/key), `sha256`, `caption: str<=300`, `created_by_rule_id`, `content_hash`. Immutable. Source-evidence lineage is private compiler audit data. The sender/UI resolves the handle to a time-limited URL through a shareable-zone adapter; the Action Agent never receives a private bucket key.
+Fields: `safe_evidence_ref_id`, `media_type`, `export_handle_id` (opaque UUID, not a URI/key), `sha256`, `caption: str<=300`, `created_by_rule_id`, `content_hash`. Immutable. Source-evidence lineage is recorded in the compiler audit projection defined in [06-persistence-and-evidence.md](06-persistence-and-evidence.md), not in this model. The sender/UI resolves the handle to a time-limited URL through a shareable-zone adapter; the Action Agent never receives a private bucket key.
+
+The reference describes **the derivative, not the private source object**. Because every accepted image is re-encoded to PNG, `media_type` is the constant `image/png` even when the source `EvidenceItem.media_type` is `image/jpeg`, and `sha256` is the SHA-256 of the emitted PNG bytes ([ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md)). The source media type stays private audit input. A reference advertising the source's type for the derivative's bytes would misdescribe the one artifact the external side can actually fetch.
 
 ### ShareableCaseView
 

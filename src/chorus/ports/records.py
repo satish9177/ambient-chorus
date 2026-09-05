@@ -34,6 +34,7 @@ from chorus.domain.ids import (
     CommunityId,
     ContributorId,
     DestinationId,
+    EvidenceItemId,
     EvidenceRootId,
     ExecutionId,
     ExportFactId,
@@ -50,9 +51,28 @@ from chorus.domain.ids import (
 from chorus.domain.mandates import CurrentMandatePointer
 from chorus.domain.time import epoch_micros, epoch_seconds_ceiling, require_utc
 from chorus.ports.idempotency import EntityRef
+from chorus.ports.limits import (
+    MAX_COMPILE_REQUESTED_EVIDENCE,
+    MAX_COMPILE_REQUESTED_FACTS,
+    MAX_COMPILER_GATES,
+)
 
 _SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 """Closed shape every safe code persisted by these records must satisfy."""
+
+
+def _require_safe_codes(codes: tuple[str, ...], label: str) -> None:
+    """Reject anything that is not a closed uppercase code, and reject repeats.
+
+    The shape is the point. A field that accepts arbitrary text is a field a rationale,
+    a quoted value, or a model sentence eventually lands in, and these records are read
+    by a private surface precisely because they are supposed to hold neither.
+    """
+
+    if any(not _SAFE_CODE.fullmatch(code) for code in codes):
+        raise ValueError(f"{label} contain a value that is not a safe closed code")
+    if len(set(codes)) != len(codes):
+        raise ValueError(f"{label} must be unique")
 
 
 class AgentName(StrEnum):
@@ -747,3 +767,191 @@ class MessageFeedEntry:
 
     def __post_init__(self) -> None:
         require_utc(self.sent_at)
+
+
+class CompileDecisionOutcome(StrEnum):
+    """What the compiler decided about the whole request."""
+
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+
+
+class CompileItemOutcome(StrEnum):
+    """What the compiler decided about one requested fact or evidence item."""
+
+    INCLUDED = "INCLUDED"
+    EXCLUDED = "EXCLUDED"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompilerGateRecord:
+    """One gate of the frozen ordered pipeline, and what it did.
+
+    ``gate`` is the gate's frozen ordinal and ``gate_name`` its frozen name. Both are recorded
+    because the ordinal is what makes the sequence readable in storage order and the name is
+    what makes it readable at all; neither is derived from the other at read time, so a renamed
+    gate is visible rather than silently renumbered.
+    """
+
+    gate: int
+    gate_name: str
+    outcome: str
+    reason_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.gate <= MAX_COMPILER_GATES:
+            raise ValueError("gate ordinal is outside the frozen pipeline")
+        if not _SAFE_CODE.fullmatch(self.gate_name):
+            raise ValueError("gate name is not a safe closed code")
+        if not _SAFE_CODE.fullmatch(self.outcome):
+            raise ValueError("gate outcome is not a safe closed code")
+        _require_safe_codes(self.reason_codes, "gate reason codes")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompiledFactRecord:
+    """The private lineage of one requested fact: what was asked, and what became of it.
+
+    This is the record ``ShareableFact`` deliberately does not carry. The safe artifact holds
+    an ``export_fact_id`` and no source, and the join between the two lives here, in the
+    private zone, where a reader must already be authorized to see the fact identifier at all.
+    """
+
+    fact_id: FactId
+    necessity: str
+    intended_usage: str
+    granted_scope: DisclosureScope | None
+    outcome: CompileItemOutcome
+    reason_codes: tuple[str, ...] = ()
+    export_fact_ids: tuple[ExportFactId, ...] = ()
+    transformation_rule_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _SAFE_CODE.fullmatch(self.necessity):
+            raise ValueError("necessity is not a safe closed code")
+        if not _SAFE_CODE.fullmatch(self.intended_usage):
+            raise ValueError("intended usage is not a safe closed code")
+        _require_safe_codes(self.reason_codes, "fact reason codes")
+        if len(set(self.export_fact_ids)) != len(self.export_fact_ids):
+            raise ValueError("export fact identifiers must be unique")
+        if self.outcome is CompileItemOutcome.EXCLUDED and self.export_fact_ids:
+            raise ValueError("an excluded fact cannot have produced an exported fact")
+        if self.outcome is CompileItemOutcome.INCLUDED and not self.export_fact_ids:
+            raise ValueError("an included fact names the exported fact it produced")
+        rule = self.transformation_rule_id
+        if rule is not None and not 1 <= len(rule) <= 64:
+            raise ValueError("transformation rule identifier length is invalid")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompiledEvidenceRecord:
+    """The private lineage of one requested evidence item and its safe derivative.
+
+    ``derivative_sha256`` is what ties this row to an object in the export bucket, because the
+    export key *is* that digest. The bucket name and the key itself are absent: the digest plus
+    the case scope is enough for an authorized private reader to address the object, and a
+    stored key would be a locator this row has no reason to carry.
+    """
+
+    source_evidence_id: EvidenceItemId
+    outcome: CompileItemOutcome
+    reason_codes: tuple[str, ...] = ()
+    safe_evidence_ref_id: SafeEvidenceRefId | None = None
+    export_handle_id: UUID | None = None
+    derivative_sha256: Sha256Digest | None = None
+
+    def __post_init__(self) -> None:
+        _require_safe_codes(self.reason_codes, "evidence reason codes")
+        described = (
+            self.safe_evidence_ref_id is not None
+            and self.export_handle_id is not None
+            and self.derivative_sha256 is not None
+        )
+        absent = (
+            self.safe_evidence_ref_id is None
+            and self.export_handle_id is None
+            and self.derivative_sha256 is None
+        )
+        if not described and not absent:
+            raise ValueError("a safe derivative is described completely or not at all")
+        if self.outcome is CompileItemOutcome.INCLUDED and not described:
+            raise ValueError("an included evidence item names its safe derivative")
+        if self.outcome is CompileItemOutcome.EXCLUDED and described:
+            raise ValueError("an excluded evidence item exports no derivative")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompilerAuditProjection:
+    """The immutable private record of one compile, allowed or denied.
+
+    One row per compile, addressed by ``compile_id``, written by the compile transaction into
+    the Audit table. It is the only place private identifiers are written outside Core, and the
+    Audit table is the only table that can hold it: the compiler's Core grant is the send fence
+    alone, and the Shareable zone forbids private identifiers in externally bound items.
+
+    It carries identifiers, codes, versions and digests. It carries no raw private text, no
+    fact value, no report summary, no evidence bytes, no prompt, and no completion -- the
+    ``_SAFE_CODE`` shape required of every code field is what stops a free-text rationale from
+    being added later without the type refusing it.
+
+    A ``DENY`` writes this row too. A denial that left no durable trace would let a redelivery
+    re-run the compile and append a second record of one decision.
+    """
+
+    namespace: Namespace
+    community_id: CommunityId
+    case_id: CaseId
+    compile_id: UUID
+    audit_event_id: UUID
+    requested_at: datetime
+    created_at: datetime
+    based_on_case_version: int
+    compiler_version: str
+    policy_version: str
+    destination_id: DestinationId
+    destination_registry_version: int
+    destination_routing_token: UUID
+    purpose: Purpose
+    decision: CompileDecisionOutcome
+    reason_codes: tuple[str, ...] = ()
+    gates: tuple[CompilerGateRecord, ...] = ()
+    facts: tuple[CompiledFactRecord, ...] = ()
+    evidence: tuple[CompiledEvidenceRecord, ...] = ()
+    view_id: ViewId | None = None
+    view_hash: Sha256Digest | None = None
+    schema_version: str = "compiler-audit-projection/v1"
+
+    def __post_init__(self) -> None:
+        require_utc(self.requested_at)
+        require_utc(self.created_at)
+        if self.based_on_case_version < 1:
+            raise ValueError("compile case version must be positive")
+        if self.destination_registry_version < 1:
+            raise ValueError("destination registry version must be positive")
+        if not 1 <= len(self.compiler_version) <= 64:
+            raise ValueError("compiler version length is invalid")
+        if not 1 <= len(self.policy_version) <= 64:
+            raise ValueError("policy version length is invalid")
+        _require_safe_codes(self.reason_codes, "compile reason codes")
+        if len(self.gates) > MAX_COMPILER_GATES:
+            raise ValueError("more gates than the frozen pipeline has")
+        if len({record.gate for record in self.gates}) != len(self.gates):
+            raise ValueError("a gate is recorded twice")
+        if len(self.facts) > MAX_COMPILE_REQUESTED_FACTS:
+            raise ValueError("more compiled facts than the frozen request bound")
+        if len({record.fact_id for record in self.facts}) != len(self.facts):
+            raise ValueError("a fact is recorded twice")
+        if len(self.evidence) > MAX_COMPILE_REQUESTED_EVIDENCE:
+            raise ValueError("more compiled evidence than the frozen request bound")
+        if len({record.source_evidence_id for record in self.evidence}) != len(self.evidence):
+            raise ValueError("an evidence item is recorded twice")
+        allowed = self.decision is CompileDecisionOutcome.ALLOW
+        described = self.view_id is not None and self.view_hash is not None
+        if allowed != described:
+            # An allowed compile names the artifact it produced, and a denied one has no
+            # artifact to name. A half-filled pair would describe a view nobody can load.
+            raise ValueError("a view is named exactly when the compile was allowed")
+        if not allowed and any(
+            record.outcome is CompileItemOutcome.INCLUDED for record in self.facts
+        ):
+            raise ValueError("a denied compile included nothing")

@@ -252,6 +252,14 @@ def _cases() -> tuple[Case, ...]:
             world.commitment(),
         ),
         (
+            "COMPILER_AUDIT_PROJECTION",
+            lambda w: codec_audit.encode_compile_projection(
+                case_scope, w.compile_projection(), retention=DEMO_RETENTION
+            ),
+            codec_audit.decode_compile_projection,
+            world.compile_projection(),
+        ),
+        (
             "AUDIT_EVENT",
             lambda w: codec_audit.encode_case_event(
                 case_scope, w.audit_event(), retention=DEMO_RETENTION
@@ -264,6 +272,9 @@ def _cases() -> tuple[Case, ...]:
 
 CASES = _cases()
 CASE_IDS = tuple(case[0] for case in CASES)
+
+AUDIT_TABLE_CASES = frozenset({"AUDIT_EVENT", "COMPILER_AUDIT_PROJECTION"})
+"""Shapes whose TTL attribute is a deployment retention choice rather than a field."""
 
 
 def test_every_entity_type_has_a_round_trip_case() -> None:
@@ -324,10 +335,11 @@ def test_a_missing_attribute_fails_closed(
     expected: object,
 ) -> None:
     item = dict(encode(PRIMARY))
-    # ``expires_at_epoch`` on an audit item is written only by a deployment whose retention
-    # policy expires audit events, so a durable environment legitimately omits it. Its own
-    # presence/absence contract is asserted in the audit retention tests.
-    optional_by_policy = {ATTR_EXPIRES_AT_EPOCH} if name == "AUDIT_EVENT" else set()
+    # ``expires_at_epoch`` on an audit-table item is written only by a deployment whose
+    # retention policy expires audit records, so a durable environment legitimately omits
+    # it. Its own presence/absence contract is asserted in the audit retention tests. The
+    # exemption belongs to the table, not to one shape, so every audit item shares it.
+    optional_by_policy = {ATTR_EXPIRES_AT_EPOCH} if name in AUDIT_TABLE_CASES else set()
     removable = [key for key in item if key not in {"PK", "SK"} | optional_by_policy]
     for attribute in removable:
         partial = {key: value for key, value in item.items() if key != attribute}

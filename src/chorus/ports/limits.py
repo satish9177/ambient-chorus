@@ -23,6 +23,17 @@ transaction is a genuinely new request, and only the plan's own conditions still
 from applying twice.
 """
 
+MAX_COMPILE_REQUESTED_FACTS = 100
+MAX_COMPILE_REQUESTED_EVIDENCE = 20
+MAX_COMPILER_GATES = 22
+"""Bounds the compiler audit projection is sized against.
+
+Restated here rather than imported because ports must not depend on the privacy package, and
+asserted equal to ``chorus.privacy.policy``'s own constants by test. They exist so the largest
+legal projection is a number this module can be reasoned about with, which is what makes the
+400 KiB item-size proof a calculation rather than a hope.
+"""
+
 ORDINARY_IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 SEND_IDEMPOTENCY_TTL_SECONDS = 7 * 24 * 60 * 60
 AUDIT_TTL_SECONDS = 90 * 24 * 60 * 60

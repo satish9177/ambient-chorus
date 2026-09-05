@@ -49,6 +49,10 @@ def _partition_key(partition: IdempotencyPartition) -> str:
             if partition.case_id is None:  # pragma: no cover - guarded by the record
                 raise ValueError("case partition requires a case")
             return keys.case_partition(partition.namespace, partition.case_id)
+        case IdempotencyPartitionKind.VIEW_CURRENT:
+            if partition.case_id is None:  # pragma: no cover - guarded by the record
+                raise ValueError("view-current partition requires a case")
+            return keys.view_current_partition(partition.namespace, partition.case_id)
         case IdempotencyPartitionKind.ACTION:
             if partition.action_id is None:  # pragma: no cover - guarded by the record
                 raise ValueError("action partition requires an action")

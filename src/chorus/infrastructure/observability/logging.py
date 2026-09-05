@@ -27,6 +27,7 @@ _SAFE_RECORD_FIELDS: Final[tuple[str, ...]] = (
     "entity_version",
     "input_hash",
     "output_hash",
+    "view_hash",
     "policy_version",
     "prompt_version",
     "outcome",
@@ -36,7 +37,8 @@ _SAFE_RECORD_FIELDS: Final[tuple[str, ...]] = (
     "attempt",
     "retryable",
 )
-"""The allowlist, extended for the agent-invocation events Phase 3 emits.
+"""The allowlist, extended for the agent-invocation events Phase 3 emits and the compile
+events Phase 6 adds.
 
 Every added field is an identifier, a digest, a version, or a count. There is deliberately no
 field for a message, a summary, a prompt, a completion, a quotation, or an exception message:

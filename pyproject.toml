@@ -15,6 +15,11 @@ dependencies = [
   "boto3>=1.40,<2",
   "botocore>=1.40,<2",
   "fastapi>=0.121,<1",
+  # Exact, not a range. ADR-018 freezes a sanitizer whose output bytes are hashed and pinned by
+  # a golden test, and PNG filter selection and deflate output belong to the encoder build
+  # rather than to the format -- so a floating version is a golden hash that changes without a
+  # review. It is also the one parser this system points at untrusted bytes.
+  "pillow==12.3.0",
   "pydantic>=2.12,<3",
   "pydantic-settings>=2.10,<3",
   "rfc8785>=0.1.4,<0.2",
@@ -53,7 +58,7 @@ cache-dir = ".tools/uv-cache"
 # library, so import-linter and mypy can see every package the boundary contracts name.
 # Deployment artifacts are built separately from an explicit per-runtime file allowlist, so
 # nothing here decides what ships to an agent runtime or a Lambda.
-packages = ["src/chorus", "apps/api/chorus_api", "runtimes"]
+packages = ["src/chorus", "apps/api/chorus_api", "runtimes", "functions"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers --showlocals"
@@ -89,7 +94,7 @@ module = ["rfc8785", "boto3", "botocore.*", "strands", "strands.*"]
 ignore_missing_imports = true
 
 [tool.importlinter]
-root_packages = ["chorus", "chorus_api", "runtimes"]
+root_packages = ["chorus", "chorus_api", "runtimes", "functions"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
@@ -270,4 +275,20 @@ forbidden_modules = [
   "aws_cdk",
   "chorus.ports",
   "chorus.infrastructure",
+]
+
+[[tool.importlinter.contracts]]
+name = "The compiler function composes adapters and never a model or a transport"
+type = "forbidden"
+source_modules = ["functions.compiler"]
+# A composition root is allowed to see infrastructure -- that is what it composes -- so this
+# contract names what it must never reach instead. Strands and the agent contracts are both
+# forbidden for the same reason: the compiler is where policy stops being probabilistic, and an
+# import is the first step back toward a model having an opinion about disclosure.
+forbidden_modules = [
+  "strands",
+  "aws_cdk",
+  "chorus.contracts",
+  "chorus_api",
+  "runtimes",
 ]

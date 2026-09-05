@@ -93,7 +93,23 @@ A gated live Bedrock evaluation runs all 15 scenarios three times per prompt/mod
 ### Persistence and AWS adapter tests
 
 - DynamoDB Local integration for cross-table transactions, version conditions, idempotency, current pointers, send fence/revocation order, and unknown-outcome reconciliation reads;
-- S3 adapter tests with botocore Stubber/local fake for key validation, hashes, encryption headers, pending derivatives, and private/export separation;
+- S3 adapter tests with botocore Stubber/local fake for content-addressed key validation, hashes, encryption headers, unknown-PUT `HEAD` resolution, orphan behaviour, and private/export separation;
+
+### Safe-evidence and compile-commit tests
+
+The sanitizer and the commit model are frozen in [ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md), so they are tested against that profile rather than against whatever the library happens to do:
+
+- every rejection in the frozen profile — unaccepted MIME, oversize source, multi-frame or animated input, the decoded pixel cap, the dimension cap, truncated and malformed bytes, and a decompression bomb — fails closed with a typed reason and quotes nothing;
+- EXIF orientation is applied before metadata is discarded, and the two orders are shown to differ;
+- alpha composites deterministically onto opaque white, and output mode is `RGB`;
+- no EXIF, ICC, XMP, comment, or text chunk survives into the emitted PNG;
+- sanitizing one source twice, in two separate processes, produces byte-identical output and the identical `derivative_sha256`;
+- `ShareableEvidenceRef.media_type` is `image/png` for a JPEG source;
+- the compile transaction's participant count is asserted arithmetically against the staged plan on both `ALLOW` and `DENY`, in the manner Phase 5 used for the investigation apply, so a silently added participant fails before storage;
+- a stale compile cannot roll the current pointer backwards, a denied compile leaves the pointer untouched, and a compile never mutates the Core case row or its version;
+- the largest legal `compiler-audit-projection/v1` row at the frozen per-case maxima stays safely inside the 400 KiB item limit.
+
+The committed elevator photo fixture is a 1×1-pixel JPEG carrying only a JFIF marker, so it **cannot** demonstrate EXIF or GPS stripping. Metadata-removal tests therefore construct their adversarial inputs in-test. No committed fixture gains real location data, and no test asserts metadata removal against a file that never had any.
 - SES Stubber tests for accepted, explicit error, timeout, and lost-response event reconciliation; assert call count=1;
 - EventBridge Scheduler Stubber tests for deterministic name/token, response loss/GetSchedule reconciliation, DLQ configuration, and duplicate generation;
 - AgentCore adapter tests for envelope/session IDs, IAM endpoint choice, timeout/retry, and schema errors;
@@ -105,7 +121,7 @@ Static policy tests are necessary but insufficient. Post-deploy canaries assume/
 
 - Action cannot `GetItem/Query/Scan` any table, `GetObject/ListBucket` either bucket, call SES, invoke compiler/sender, or invoke other agents;
 - Monitor/Investigator cannot access data stores or side effects;
-- compiler cannot invoke Bedrock/SES and can write only view/fence/audit prefixes;
+- compiler cannot invoke Bedrock/SES; it can write only the view prefixes, the audit table, and the `NS#*#FENCE#*` partition, and an attempt to put or delete any case-partition item must return `AccessDenied` ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md));
 - sender cannot read Core/private S3 and can send only through the configured identity/configuration set;
 - watcher cannot call agents/compiler/SES or private resources.
 
@@ -145,6 +161,14 @@ Playwright covers exactly three surfaces: discovery, Resident B adjust/revoke, p
 24. `test_compile_preflight_persists_nothing`
 25. `test_case_version_change_after_invocation_starts_applies_nothing` — the case moves to N+1 *while the model is answering about N*, so the request-time check and the envelope's case version both pass and only the apply transaction's version condition can refuse. Distinct from the cheaper `test_case_already_moved_before_invocation_applies_nothing`, where no model is called at all.
 26. `test_a_v1_row_decodes_and_its_unrecorded_materiality_reads_conservatively` — an `investigation-assessment/v1` row's unrecorded contradiction materiality reads as `HIGH` under a fixed description code, per [ADR-015](../adr/ADR-015-evidence-status-and-verification.md) §7.
+27. `test_sanitized_bytes_are_identical_across_two_processes`
+28. `test_orphan_export_object_is_unreferenced_and_confers_no_authority`
+29. `test_unknown_put_outcome_never_creates_a_second_key`
+30. `test_stale_compile_cannot_roll_the_current_pointer_backwards`
+31. `test_denied_compile_leaves_the_current_view_valid_and_current`
+32. `test_compile_never_mutates_the_core_case_or_its_version`
+33. `test_safe_evidence_ref_media_type_is_png_for_a_jpeg_source`
+34. `test_incomplete_fixture_review_fails_closed`
 
 ## CI gates
 

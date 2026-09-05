@@ -22,6 +22,18 @@ from chorus.privacy.policy import SafeEvidenceCandidate, TransformationKind
 
 _EMPTY_DIGEST = Sha256Digest("sha256:" + "0" * 64)
 
+SAFE_EVIDENCE_MEDIA_TYPE = "image/png"
+"""What a ``ShareableEvidenceRef`` always advertises, because it describes the derivative.
+
+Every accepted image leaves the sanitizer as PNG under the frozen ADR-018 profile, so this is a
+constant rather than something copied from the source item. Copying the source's media type
+would make the reference describe bytes nobody can fetch: the handle resolves to the
+derivative, and a JPEG label on a PNG object is a lie the external side would act on.
+
+The sanitizer states the same constant, because ``chorus.infrastructure`` may not import this
+package. A test asserts the two agree.
+"""
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ShareableFact:
@@ -207,13 +219,19 @@ def transform_facts(
 
 
 def build_safe_evidence_ref(
-    *, candidate: SafeEvidenceCandidate, safe_evidence_ref_id: SafeEvidenceRefId, media_type: str
+    *, candidate: SafeEvidenceCandidate, safe_evidence_ref_id: SafeEvidenceRefId
 ) -> ShareableEvidenceRef:
-    """Hash metadata for a reviewed derivative without exposing its source ID or locator."""
+    """Hash metadata for a reviewed derivative without exposing its source ID or locator.
+
+    There is no ``media_type`` parameter, and that is the point. The reference describes the
+    derivative, every derivative is PNG, and a parameter would be somewhere the source
+    item's own media type could be passed by mistake -- which is exactly the defect this
+    signature removes.
+    """
 
     draft = ShareableEvidenceRef(
         safe_evidence_ref_id=safe_evidence_ref_id,
-        media_type=media_type,
+        media_type=SAFE_EVIDENCE_MEDIA_TYPE,
         export_handle_id=candidate.export_handle_id,
         sha256=candidate.derivative_sha256,
         caption=candidate.caption,

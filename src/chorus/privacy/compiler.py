@@ -1399,14 +1399,12 @@ class PrivacyCompiler:
             )
             if candidate.fact.fact_type is FactType.EVIDENCE_DESCRIPTION and requested_evidence:
                 evidence_id = requested_evidence[0]
-                item = evidence_by_id[evidence_id]
                 safe_candidate = safe_candidates[evidence_id]
                 safe_ref = safe_refs_by_source.get(evidence_id)
                 if safe_ref is None:
                     safe_ref = build_safe_evidence_ref(
                         candidate=safe_candidate,
                         safe_evidence_ref_id=artifact_ids.safe_evidence_ref_id(),
-                        media_type=item.media_type,
                     )
                     safe_refs_by_source[evidence_id] = safe_ref
                     safe_refs.append(safe_ref)

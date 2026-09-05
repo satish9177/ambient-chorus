@@ -110,6 +110,16 @@ class EventName:
 
     PROMPT_INJECTION_OBSERVED: Final = "prompt_injection.observed"
 
+    COMPILE_STARTED: Final = "compile.started"
+    COMPILE_ALLOWED: Final = "compile.allowed"
+    COMPILE_DENIED: Final = "compile.denied"
+    VIEW_PERSISTED: Final = "view.persisted"
+    PRIVATE_URI_DENIED: Final = "private_uri.denied"
+
+    SEND_FENCE_ACQUIRED: Final = "send.fence.acquired"
+    SEND_FENCE_DENIED: Final = "send.fence.denied"
+    SEND_FENCE_RELEASED: Final = "send.fence.released"
+
 
 def _emit(
     event_name: str,
@@ -128,6 +138,7 @@ def _emit(
     actor_id_hash: Sha256Digest | None = None,
     input_hash: Sha256Digest | None = None,
     output_hash: Sha256Digest | None = None,
+    view_hash: Sha256Digest | None = None,
     prompt_version: str | None = None,
     outcome: str | None = None,
     reason_codes: tuple[str, ...] = (),
@@ -158,6 +169,7 @@ def _emit(
         "actor_id_hash": None if actor_id_hash is None else actor_id_hash.value,
         "input_hash": None if input_hash is None else input_hash.value,
         "output_hash": None if output_hash is None else output_hash.value,
+        "view_hash": None if view_hash is None else view_hash.value,
         "prompt_version": prompt_version,
         "outcome": outcome,
         "attempt": attempt,
@@ -843,4 +855,168 @@ def monitor_batch_noop(
         correlation_id=correlation_id,
         outcome="NOOP",
         reason_codes=(reason_code,),
+    )
+
+
+def compile_started(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    case_version: int,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    requested_facts: int,
+    requested_evidence: int,
+) -> None:
+    """Record that a compile was asked for, by whom, and how much it named.
+
+    Counts, never contents. Which facts were requested is private lineage and lives in the
+    compiler audit projection, where a reader has to be authorized to see a fact identifier at
+    all; a log line that named them would put that lineage in a second place with weaker access
+    control and a shorter memory.
+    """
+
+    _emit(
+        EventName.COMPILE_STARTED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        counts={"requested_facts": requested_facts, "requested_evidence": requested_evidence},
+    )
+
+
+def compile_allowed(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    case_version: int,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    view_id: UUID,
+    view_hash: Sha256Digest,
+    included: int,
+    excluded: int,
+    safe_evidence: int,
+    replayed: bool = False,
+) -> None:
+    """Record one persisted safe view by identifier and hash."""
+
+    _emit(
+        EventName.COMPILE_ALLOWED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        entity_type="SHAREABLE_VIEW",
+        entity_id=view_id,
+        view_hash=view_hash,
+        outcome="REPLAYED" if replayed else "SUCCEEDED",
+        counts={
+            "included_facts": included,
+            "excluded_facts": excluded,
+            "safe_evidence_refs": safe_evidence,
+        },
+    )
+
+
+def compile_denied(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    case_version: int,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record a deterministic refusal by its reason codes.
+
+    ``INFO``, not ``WARNING``: a policy denial is the compiler working, and logging it as a
+    problem would train an operator to treat the system's most important answer as noise.
+    """
+
+    _emit(
+        EventName.COMPILE_DENIED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        outcome="DENIED",
+        reason_codes=reason_codes,
+    )
+
+
+def send_fence_acquired(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    execution_id: UUID,
+    replayed: bool = False,
+) -> None:
+    """Record that one execution holds the case's send authorization."""
+
+    _emit(
+        EventName.SEND_FENCE_ACQUIRED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        entity_type="SEND_FENCE",
+        entity_id=execution_id,
+        outcome="REPLAYED" if replayed else "SUCCEEDED",
+    )
+
+
+def send_fence_release_denied(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    execution_id: UUID,
+) -> None:
+    """Record a release refused because the caller is not the holder.
+
+    ``WARNING``, because a process trying to clear somebody else's fence is either a stale
+    attempt that should have given up or a bug, and both are worth seeing.
+    """
+
+    _emit(
+        EventName.SEND_FENCE_DENIED,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        entity_type="SEND_FENCE",
+        entity_id=execution_id,
+        outcome="DENIED",
+        reason_codes=("FENCE_NOT_HELD",),
+    )
+
+
+def send_fence_released(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    execution_id: UUID,
+) -> None:
+    """Record that the case's send authorization was returned by its holder."""
+
+    _emit(
+        EventName.SEND_FENCE_RELEASED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        entity_type="SEND_FENCE",
+        entity_id=execution_id,
+        outcome="SUCCEEDED",
     )

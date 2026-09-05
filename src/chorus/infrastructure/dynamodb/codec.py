@@ -77,6 +77,7 @@ class EntityType(StrEnum):
     ACTION_HISTORY_LOCATOR = "ACTION_HISTORY_LOCATOR"
     COMMITMENT = "COMMITMENT"
     AUDIT_EVENT = "AUDIT_EVENT"
+    COMPILER_AUDIT_PROJECTION = "COMPILER_AUDIT_PROJECTION"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -230,6 +231,15 @@ class ItemReader:
 
     def enum(self, name: str, enum_type: type[EnumT]) -> EnumT:
         value = self.text(name)
+        try:
+            return enum_type(value)
+        except ValueError as error:
+            raise _fail(self._ref, f"enum:{name}") from error
+
+    def optional_enum(self, name: str, enum_type: type[EnumT]) -> EnumT | None:
+        value = self.optional_text(name)
+        if value is None:
+            return None
         try:
             return enum_type(value)
         except ValueError as error:

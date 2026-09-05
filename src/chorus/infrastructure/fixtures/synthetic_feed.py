@@ -14,6 +14,7 @@ rather than being replayed as if it were the frozen fixture.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -23,7 +24,7 @@ from uuid import UUID, uuid5
 
 from chorus.domain.errors import IntegrityError
 from chorus.domain.ids import CommunityId, ContributorId, EvidenceItemId, Sha256Digest
-from chorus.domain.time import parse_utc
+from chorus.domain.time import parse_utc, require_utc
 from chorus.ports.ambient import AmbientAttachment, AmbientContributorSeed, AmbientMessage
 
 CORPUS_SCHEMA_VERSION: Final = "ambient-corpus/v1"
@@ -113,6 +114,12 @@ class _Reader:
     def child(self, name: str) -> _Reader:
         return _Reader(self._value(name), ref=f"{self._ref}.{name}")
 
+    def optional_child(self, name: str, *, ref: str) -> _Reader | None:
+        """Consume a required key whose value is either an object or an explicit null."""
+
+        value = self._value(name)
+        return None if value is None else _Reader(value, ref=ref)
+
     def digest(self, name: str) -> Sha256Digest:
         try:
             return Sha256Digest(self.text(name))
@@ -141,6 +148,51 @@ class _Reader:
             raise _fail(f"unexpected:{self._ref}")
 
 
+_FORBIDDEN_CAPTION_LOCATOR = re.compile(r"(?i)(?:https?|s3)://")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EvidenceReview:
+    """The ADR-018 fixed review: curated fixture metadata, and nothing else.
+
+    In policy/v1 this is the *only* producer of a safe-evidence review. It is not an LLM
+    judgement, not visual inference, not a moderation service, and not a resident mandate.
+
+    ``reviewed_by`` is fixture-curation provenance. It is deliberately a plain string and not a
+    ``ContributorId``: recording a resident identifier here would write into the corpus the
+    falsehood that a person authorized an export review, which is the same category of mistake
+    ADR-015 refused when it declined to model management as a contributor. It confers no
+    authority of any kind, and in particular it is not a verification source.
+
+    ``safe_caption`` is read from the evidence entry that owns this review rather than being
+    restated inside it. One string in one place cannot disagree with itself, and the entry is
+    where the ingestion path already reads the caption from.
+    """
+
+    no_face: bool
+    no_unit: bool
+    no_name: bool
+    no_health: bool
+    safe_caption: str
+    reviewed_by: str
+    reviewed_at: datetime
+
+    def __post_init__(self) -> None:
+        require_utc(self.reviewed_at)
+        if not 1 <= len(self.reviewed_by) <= 120:
+            raise ValueError("reviewer provenance length is invalid")
+        if not 1 <= len(self.safe_caption) <= 300:
+            raise ValueError("safe caption length is invalid")
+        if "@" in self.safe_caption or _FORBIDDEN_CAPTION_LOCATOR.search(self.safe_caption):
+            raise ValueError("safe caption contains a forbidden locator")
+
+    @property
+    def cleared(self) -> bool:
+        """True only when every frozen clearance holds. Any false flag fails closed."""
+
+        return self.no_face and self.no_unit and self.no_name and self.no_health
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EvidenceFixture:
     """One checksum-verified evidence file declared by the manifest."""
@@ -153,6 +205,11 @@ class EvidenceFixture:
     sha256: Sha256Digest
     safe_caption: str | None
     ingested_with_feed: bool
+    review: EvidenceReview | None = None
+
+    def __post_init__(self) -> None:
+        if self.review is not None and self.review.safe_caption != self.safe_caption:
+            raise ValueError("a review must carry the caption of the entry that owns it")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -375,6 +432,36 @@ def _read_contributors(manifest: _Reader) -> tuple[ContributorSeed, ...]:
     return tuple(seeds)
 
 
+def _read_review(reader: _Reader, index: int, *, safe_caption: str | None) -> EvidenceReview | None:
+    """Read one entry's ADR-018 review, failing closed on anything incomplete.
+
+    ``review`` is a required key with an explicit ``null`` for the entries that have none, so
+    an omitted review is a manifest error rather than a silently unreviewed file. A review
+    without a caption is refused here: the caption is part of the record, and a cleared review
+    with nothing to export describes a decision nobody could have made.
+    """
+
+    child = reader.optional_child("review", ref=f"evidence[{index}].review")
+    if child is None:
+        return None
+    if safe_caption is None:
+        raise _fail(f"missing:evidence[{index}].safe_caption")
+    try:
+        review = EvidenceReview(
+            no_face=child.flag("no_face"),
+            no_unit=child.flag("no_unit"),
+            no_name=child.flag("no_name"),
+            no_health=child.flag("no_health"),
+            safe_caption=safe_caption,
+            reviewed_by=child.text("reviewed_by"),
+            reviewed_at=child.instant("reviewed_at"),
+        )
+    except ValueError as error:
+        raise _fail(f"invariant:evidence[{index}].review") from error
+    child.finish()
+    return review
+
+
 def _read_evidence(manifest: _Reader, fixture_root: Path) -> tuple[EvidenceFixture, ...]:
     fixtures: list[EvidenceFixture] = []
     for index, raw in enumerate(manifest.objects("evidence")):
@@ -382,16 +469,22 @@ def _read_evidence(manifest: _Reader, fixture_root: Path) -> tuple[EvidenceFixtu
         relative_path = reader.text("file")
         declared_length = reader.number("byte_length")
         declared_digest = reader.digest("sha256")
-        fixture = EvidenceFixture(
-            fixture_id=reader.text("fixture_id"),
-            evidence_id=EvidenceItemId(reader.uuid("evidence_id")),
-            relative_path=relative_path,
-            media_type=reader.text("media_type"),
-            byte_length=declared_length,
-            sha256=declared_digest,
-            safe_caption=reader.optional_text("safe_caption"),
-            ingested_with_feed=reader.flag("ingested_with_feed"),
-        )
+        safe_caption = reader.optional_text("safe_caption")
+        review = _read_review(reader, index, safe_caption=safe_caption)
+        try:
+            fixture = EvidenceFixture(
+                fixture_id=reader.text("fixture_id"),
+                evidence_id=EvidenceItemId(reader.uuid("evidence_id")),
+                relative_path=relative_path,
+                media_type=reader.text("media_type"),
+                byte_length=declared_length,
+                sha256=declared_digest,
+                safe_caption=safe_caption,
+                ingested_with_feed=reader.flag("ingested_with_feed"),
+                review=review,
+            )
+        except ValueError as error:
+            raise _fail(f"invariant:evidence[{index}]") from error
         reader.finish()
         raw_bytes = _read_bytes(_contained_path(fixture_root, relative_path))
         if len(raw_bytes) != declared_length or _digest_of(raw_bytes) != declared_digest:
