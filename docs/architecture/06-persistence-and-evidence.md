@@ -18,7 +18,10 @@ Key segments are uppercase ASCII and IDs are lowercase UUIDs. `namespace` is val
 NS#{namespace}
 NS#{namespace}#COMM#{community_id}
 NS#{namespace}#CASE#{case_id}
+NS#{namespace}#FENCE#{case_id}
 ```
+
+The fence partition is separate from the case partition on purpose ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md)). `dynamodb:LeadingKeys` constrains the partition key and nothing constrains the sort key, so a fence keyed inside the case partition could not be granted to the compiler without granting the case row, its facts, its reports, its evidence and its mandates along with it — which is the same reason the Shareable table uses entity-type partition prefixes.
 
 All application gets/queries include a namespace prefix. Repositories construct keys from typed IDs and verify the deserialized item's namespace/community/case again. A returned mismatch is `CROSS_CASE_VIOLATION`, not ignored.
 
@@ -50,7 +53,7 @@ All application gets/queries include a namespace prefix. Repositories construct 
 | Mandate current pointer | `NS#n#CASE#k` | `MANDATE_CURRENT#m` | version/status/terms hash/contributor |
 | Fact-to-mandate lookup | `NS#n#CASE#k` | `FACT_MANDATE#f#m` | immutable association |
 | Agent invocation result | `NS#n#CASE#k` | `AGENT_INVOCATION#i` | input/output hashes and result ref only |
-| Send authorization fence | `NS#n#CASE#k` | `SEND_FENCE` | execution ID, snapshot hash, expiry |
+| Send authorization fence | `NS#n#FENCE#k` | `SEND_FENCE` | execution ID, snapshot hash, expiry; its own partition so the compiler's Core write grant reaches one item type ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md)) |
 | Core idempotency record | contextual partition | `IDEMPOTENCY#{command}#{actor_hash}#{key_hash}` | request hash/result ref/TTL |
 
 Message SK timestamps use canonical UTC strings, allowing `Query PK AND BETWEEN MESSAGE#start AND MESSAGE#end`. Feed pagination returns an opaque base64url JSON cursor containing the last evaluated key, signed with an application HMAC secret; limit 100.
@@ -72,7 +75,9 @@ Entity-type partition prefixes deliberately support IAM `dynamodb:LeadingKeys`; 
 | Current action pointer | `NS#n#ACTION_CURRENT#k` | `CURRENT` | application conditional replace/invalidate |
 | Action history index | `NS#n#ACTION_CURRENT#k` | `HISTORY#{created_at}#{action_id}` | immutable application-written safe locator |
 | Commitment | `NS#n#CASE#k` | `COMMITMENT#c` | guarded state/version |
-| Share idempotency | contextual action/case partition | `IDEMPOTENCY#{command}#{actor_hash}#{key_hash}` | immutable request/result, TTL |
+| Share idempotency | contextual action partition, or `NS#n#VIEW_CURRENT#k` for a compile | `IDEMPOTENCY#{command}#{actor_hash}#{key_hash}` | immutable request/result, TTL |
+
+A compile's idempotency record is the one Shareable idempotency row that is *not* in an action partition, and its placement is a permission fact rather than a filing choice. The compiler's Shareable writes are restricted by `dynamodb:LeadingKeys` to the two view prefixes, so a record under `NS#n#CASE#k` would be a row that only the compiler needs to write and only the compiler is denied. `VIEW_CURRENT#{case_id}` *is* the case-scoped Shareable partition for view state, so the record sits beside the pointer and the history locators the same transaction writes, inside the grant that authorizes them. This is a statement about the compile command specifically; the idempotency layout is not generalized by it, and every other command keeps the contextual partition its own table mapping names.
 
 Every action/approval/execution endpoint is nested under `/cases/{case_id}` and carries the action ID; the direct action partition read then verifies the item's case ID. Current view/action pointers are direct gets derived from case ID. The scheduler payload carries case and commitment IDs, allowing a query/get in the case commitment partition. A query on the action partition retrieves its proposal/approval/execution lineage; view/action history is a safe locator query under each current-pointer partition. A case UI performs bounded direct pointer gets plus bounded history/action/commitment queries. No GSI is required. Hard limits are 100 active facts, 25 views, 10 actions, and 20 commitments per case; older safe artifacts remain directly addressable but the UI paginates.
 
@@ -82,6 +87,25 @@ Every action/approval/execution endpoint is nested under `/cases/{case_id}` and 
 |---|---|---|
 | case audit | `NS#n#CASE#k` | `EVENT#{occurred_at}#{audit_event_id}` |
 | namespace events without case (reset/config) | `NS#n` | `EVENT#{occurred_at}#{audit_event_id}` |
+| compiler audit projection | `NS#n#CASE#k` | `COMPILE#{compile_id}` |
+
+### The compiler audit projection
+
+`ShareableFact` and `ShareableEvidenceRef` deliberately carry no source lineage, so one row per compile records which private fact became which exported fact and why every other one did not. It is `compiler-audit-projection/v1`, **immutable and create-only**, and it is written by the compile transaction on both `ALLOW` and `DENY` ([ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md)).
+
+| Group | Fields |
+|---|---|
+| identity | `namespace`, `community_id`, `case_id`, `compile_id`, `requested_at`, `based_on_case_version` |
+| versions | `compiler_version`, `policy_version` |
+| request | destination ID with its registry version and routing token, `purpose` |
+| outcome | `decision: ALLOW\|DENY`, and `view_id`/`view_hash` when `ALLOW` |
+| gates | the ordered gate-by-gate `CompilerAuditDecision` records |
+| per source fact | `fact_id`, requested scope, outcome, reason codes, generated export fact IDs, transformation rule ID where one applied |
+| per source evidence | source evidence ID, safe evidence ref ID, opaque export handle ID, `derivative_sha256`, outcome and reason codes |
+
+It holds identifiers, codes, versions, and digests. It holds **no** raw private text, report summary, fact value, evidence bytes, prompt, or completion. This is the only place private identifiers are written outside Core, and the Audit table is the only table that can hold it: the compiler's Core grant is the send fence alone, and the Shareable zone forbids private identifiers in externally bound items.
+
+`AuditEvent` is unchanged. It stays the small append-only decision event and references this row through its existing entity references; `AuditDetails` is not widened to duplicate the projection, and there is no per-fact `AuditEvent` — a hundred requested facts is reachable at the frozen per-case limits, and a hundred audit participants would not fit in one transaction. A codec test asserts that the largest legal projection at those maxima stays safely inside the 400 KiB item limit.
 
 Audit cursors follow the feed scheme. Demo audit items have `expires_at_epoch` TTL 90 days after event; TTL is cleanup, never authorization. No raw data is stored. Cross-principal transactions write case mutation plus audit record atomically when both are DynamoDB operations.
 
@@ -116,9 +140,9 @@ An idempotency record contains `request_hash`, `status: IN_PROGRESS|COMPLETED|FA
 
 - **Ingest:** uniqueness lock, message, and idempotency item in one Core transaction. Exact duplicate returns existing message. Same channel ID/different content is an integrity conflict.
 - **Monitor apply:** the whole output is semantically validated *before any domain mutation*. Only then is it turned into a deterministic ordered list of bounded apply steps, each committed as its own transaction well under DynamoDB's 100-operation limit at the frozen Monitor maxima. Candidate case creation and that case's initial report linkage are always in one step, so a case never exists without the reports that justified it. Facts are committed in bounded chunks. A durable **apply progress** record under the operation partition advances transactionally with each step, so a retry after a partial delivery detects which steps already committed and resumes only the missing ones — no duplicate report, fact, signal, or audit event. The design permits partial durable *progress* caused by a storage failure; it never permits partial acceptance of an invalid model output, because nothing is written until the whole output has been accepted. An ambiguous transport outcome is resolved by the Phase-2 commit-proof semantics, never by a blind retry.
-- **Mandate decision:** append immutable version, update current pointer, bump case version, ensure no live send fence, and append Audit across Core/Audit in one transaction.
+- **Mandate decision:** append immutable version, update current pointer, bump case version, ensure no live send fence, and append Audit across Core/Audit in one transaction. The fence check addresses the case's fence partition; `TransactWriteItems` spans partitions within one account and Region, so the guard is unchanged by living elsewhere.
 - **Investigation:** one transaction containing the appended immutable assessment, the guarded fact-status updates, the case update carrying the new state, version, `corroboration_source_count`, and `assessment_id`, the successful agent-invocation record, one audit event, the no-live-send-fence condition, and the idempotency record. There is no plan snapshot and no apply-progress record: the whole apply is atomic, so a partially applied investigation does not exist. `MAX_INVESTIGATION_FACT_UPDATES` is **derived** from `TRANSACTION_MAX_OPERATIONS` minus the fixed participants the implementation actually stages, and is asserted by test rather than written as a number here; a validated output touching more facts than the derived bound is rejected before any mutation.
-- **Compile:** safe S3 derivatives are first written with `pending-compile-id`; then one cross-table transaction writes immutable view, current pointer with expected previous hash, idempotency, and audit. Orphan pending objects are lifecycle-deleted after 24 hours.
+- **Compile:** the sanitized derivative is written once to its content-addressed export key *before* the transaction, and confers no authority until one commits ([ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md)). One cross-table transaction is then the sole authorization commit point. On `ALLOW` its fixed participants are the immutable view, the current pointer conditioned on the exact previous pointer version and `view_hash`, the immutable view-history locator, the `compile.allowed` audit event, the immutable compiler audit projection, the completed idempotency record that is also the plan's commit proof, a condition that the case still stands at `expected_case_version`, and a condition that no live send fence holds the case. That is **eight operations, fixed and independent of how many facts or evidence items the request named**. On `DENY` the transaction writes no view, no history locator, no pointer change, and no safe-evidence reference; it writes the `compile.denied` audit event, the compiler audit projection, and the completed idempotency record carrying the deterministic denial response, so a redelivered denied command replays its answer instead of appending a second record of one decision. The compiler never writes the Core case row and never bumps the case version, so the case condition is a check-only participant. Per-fact and per-mandate conditions are deliberately absent: every authorization-sensitive mutation already bumps the case version, so one condition covers them all at one operation.
 - **Proposal:** immutable proposal plus its single execution record in `DRAFT`, current pointer, idempotency, and audit in one Share/Audit transaction.
 - **Approval:** immutable approval, guarded execution transition `DRAFT→APPROVED`, idempotency, and audit in one Share/Audit transaction.
 - **Begin send:** conditionally consume approval and transition execution `APPROVED→SENDING` in one transaction; then acquire Core fence. Stale fence denial transitions to `FAILED` with `STALE_AUTHORIZATION` and no SES call.
@@ -252,14 +276,20 @@ Metadata is allowlisted: `sha256`, `media-type`, `evidence-id`, `case-id`, `root
 `chorus-export-evidence-{account}-{region}-{environment}` stores compiler-created derivatives at:
 
 ```text
-ns/{namespace}/community/{community_id}/case/{case_id}/view/{view_id}/evidence/{safe_evidence_ref_id}/content
+ns/{namespace}/community/{community_id}/case/{case_id}/evidence/{derivative_sha256}/content
 ```
 
-It uses a separate KMS key, versioning, block-public-access, and a bucket policy allowing only compiler writes and application-controlled short-lived reads. The Action Agent receives an opaque ref and caption, never a key/URI or presigned URL. The UI requests a 60-second URL from an authorized API endpoint; external email V1 includes no direct attachment unless the safe-ref policy and human preview explicitly allow it.
+The key is **content-addressed on the SHA-256 of the exact emitted PNG bytes**, and the object is written **once**, before the compile transaction. There is no pending key, no second object state, and no finalization copy ([ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md)).
+
+An object that exists before its transaction commits **confers no authority**: no view references it, no current pointer names a view that does, and reachability runs through a view's opaque `export_handle_id` and an authorized shareable-zone adapter rather than through a key a caller could guess. If the transaction fails, the object is an unreferenced orphan, no current view may ever reference it, and the bucket's lifecycle backstop removes it. There is no compensating delete on the compile path, because a compensating write can fail and would turn a harmless orphan into a second ambiguous outcome.
+
+An **unknown PUT outcome** is resolved by reading, never by writing a second key: `HEAD` the exact key, and if it is present with the expected derivative hash, byte length, and allowlisted metadata the write is present; if it is absent, repeat the identical PUT; if it is present and inconsistent, raise `INTEGRITY_ERROR` quoting nothing. Content addressing is what makes the repeat safe — same key, same bytes, same write.
+
+It uses a separate KMS key, versioning, block-public-access, and a bucket policy allowing only compiler writes and application-controlled short-lived reads. The Action Agent receives an opaque ref and caption, never a key/URI or presigned URL. The UI requests a 60-second URL from an authorized API endpoint, which is Phase-10 work and not part of the compiler boundary; external email V1 includes no direct attachment unless the safe-ref policy and human preview explicitly allow it.
 
 ## Upload, provenance, and duplicate handling
 
-1. Ingestion validates adapter ID, declared size/MIME, magic bytes, and 10 MiB V1 limit before upload.
+1. Ingestion validates adapter ID, declared size/MIME, magic bytes, and the `10_000_000`-byte V1 limit before upload. That exact byte count, not a rounded mebibyte, is the frozen bound the compiler's evidence-safety gate already enforces.
 2. It streams while computing SHA-256; no user-controlled key segment is used.
 3. A community evidence-root conditional record on content hash detects exact duplicates. `derived_from`/forward markers collapse to the earliest known root. Duplicate items remain auditable but do not add independent evidence. The root's ID locator is created in the same transaction, so `parent_root_id` is addressable without a scan or a GSI; a missing locator raises `INTEGRITY_ERROR` rather than silently under-counting ([ADR-017](../adr/ADR-017-evidence-root-id-locator.md)).
 4. Upload is tagged `scan=pending`; evidence cannot support export while pending.
@@ -272,11 +302,49 @@ The one elevator-error photo follows a narrow, auditable process:
 
 - mandate scope must be `EXTERNAL_ACTION` for the photo;
 - fixture checksum/scan must be clean;
-- a deterministic image library decodes and re-encodes to PNG, strips EXIF/comments/profiles, caps dimensions, and recomputes SHA-256;
-- a fixed demo human review records `NO_FACE`, `NO_UNIT`, `NO_NAME`, `NO_HEALTH`, and a safe caption; review is an input artifact, not an LLM judgment;
-- compiler writes the derivative under the current view and includes only its opaque ref/caption.
+- the sanitizer decodes and re-encodes to PNG under the frozen profile below, discards all source metadata, caps dimensions, and recomputes SHA-256 over the emitted bytes;
+- a fixed demo review supplies `no_face`, `no_unit`, `no_name`, `no_health`, and a safe caption; review is an input artifact, not an LLM judgment;
+- the compiler writes the derivative to its content-addressed export key and includes only its opaque ref and caption in the view.
 
 Text documents and emails are not exportable evidence in V1. The malicious prompt-injection document remains private and is explicitly denied. A decode failure, decompression bomb, unexpected frame, hash mismatch, or review absence fails closed.
+
+### The frozen V1 sanitizer profile
+
+The decoder and encoder is **Pillow, pinned at exactly `12.3.0`** ([ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md)). Changing the pin is an ADR.
+
+| Property | Frozen V1 value |
+|---|---|
+| Accepted source media types | `image/jpeg`, `image/png`, and nothing else |
+| Maximum source bytes | `10_000_000` exactly |
+| Frames | exactly one; animated or multi-frame input rejected |
+| Decoded pixel cap | `16_000_000` pixels |
+| Maximum input dimension | `8192` on either axis |
+| Truncated or malformed input | rejected; Pillow truncated-image loading stays disabled |
+| Decompression bomb | fail closed; Pillow's bomb warning and error both handled as rejection |
+| Orientation | EXIF orientation applied deterministically **before** metadata is discarded |
+| Alpha | composited deterministically onto opaque white |
+| Working and output mode | `RGB` |
+| Resize | aspect ratio preserved; longest output edge at most `2048` |
+| Target format | PNG |
+| PNG writer | `optimize=False`, `compress_level=9` |
+| Carried through from the source | nothing: no EXIF, ICC, XMP, comment or text chunks, or other source metadata |
+| `derivative_sha256` | SHA-256 over the exact emitted PNG bytes |
+
+The two size caps bind independently: `8192 x 8192` far exceeds the pixel cap, and a `16_000_000`-pixel image can sit inside the dimension cap. Both are checked. Orientation is applied before metadata is dropped because the operations do not commute — dropping EXIF first would silently lose the rotation the photograph was taken with, and the derivative would be a correctly sanitized picture of the wrong thing.
+
+Determinism is claimed exactly and no further: for the same source bytes and settings, output is byte-identical **under the pinned CHORUS runtime and dependency set**. Bit identity across arbitrary future Pillow or zlib versions is not claimed, because PNG filter selection and deflate output belong to the encoder build rather than to the format. Golden sanitizer and view-hash tests pin the runtime and the fixture.
+
+There is no OCR, no general document conversion, and no visual model.
+
+### The fixed review record
+
+In policy/v1 the review is **immutable curated demo-fixture metadata** carried in the elevator manifest beside the evidence entry it describes. It is not an LLM judgement, not visual inference, not a moderation API, not a runtime service, and not a resident mandate. No other producer of a review exists.
+
+Its frozen fields are `no_face`, `no_unit`, `no_name`, `no_health`, `safe_caption`, `reviewed_by`, and `reviewed_at`. The record is bound to the evidence entry's existing exact source `sha256`, which the manifest already carries and the fixture loader already verifies.
+
+`human_reviewed` is true only when the manifest's source `sha256` equals the SHA-256 of the loaded source bytes, all four flags are true, `safe_caption` is present and passes caption validation, and the review metadata is complete. A missing, incomplete, or mismatched review fails closed.
+
+`reviewed_by` is fixture-curation provenance. It is not a `ContributorId` and asserts no resident or management authority; in particular it is not a verification source and does not affect the empty allowed set of [ADR-015](../adr/ADR-015-evidence-status-and-verification.md).
 
 ## Immutability, retention, and reset
 

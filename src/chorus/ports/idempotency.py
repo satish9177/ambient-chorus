@@ -87,11 +87,20 @@ class IdempotencyStatus(StrEnum):
 
 
 class IdempotencyPartitionKind(StrEnum):
-    """Contextual partition that owns an idempotency record."""
+    """Contextual partition that owns an idempotency record.
+
+    ``VIEW_CURRENT`` is the case-scoped *Shareable* partition, and it exists because the
+    compiler cannot write anywhere else in that table. The frozen trust matrix restricts
+    compiler Shareable writes by ``dynamodb:LeadingKeys`` to the two view prefixes, so a
+    compile record in ``NS#n#CASE#k`` would be a row the principal that must write it is
+    denied. It is still the contextual case partition the persistence document names -- for
+    a compile, the case partition of the Shareable table *is* the view-current one.
+    """
 
     NAMESPACE = "NAMESPACE"
     COMMUNITY = "COMMUNITY"
     CASE = "CASE"
+    VIEW_CURRENT = "VIEW_CURRENT"
     ACTION = "ACTION"
 
 
@@ -110,6 +119,7 @@ class IdempotencyPartition:
             IdempotencyPartitionKind.NAMESPACE: (),
             IdempotencyPartitionKind.COMMUNITY: ("community_id",),
             IdempotencyPartitionKind.CASE: ("case_id",),
+            IdempotencyPartitionKind.VIEW_CURRENT: ("case_id",),
             IdempotencyPartitionKind.ACTION: ("action_id",),
         }[self.kind]
         for name in ("community_id", "case_id", "action_id"):

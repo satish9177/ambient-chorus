@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cache
 from typing import Any
 
 import pytest
@@ -18,7 +19,16 @@ from chorus.settings import Environment, audit_retention_for
 TABLE_TYPE = "AWS::DynamoDB::Table"
 
 
+@cache
 def template(config: CdkBuildConfig) -> assertions.Template:
+    """Synthesize once per configuration.
+
+    Every call crosses the jsii bridge and leaves a construct tree alive in the Node process
+    for as long as the Python handle exists, so eighteen calls for three distinct configurations
+    was seventeen more synths than the assertions need. ``CdkBuildConfig`` is a frozen dataclass,
+    so it is hashable and the cache key is exactly the configuration under test.
+    """
+
     app = App()
     stack = ChorusDataStack(app, "TestData", config=config)
     return assertions.Template.from_stack(stack)
@@ -98,10 +108,47 @@ def test_no_secondary_index_stream_or_accelerator_is_created(table_name: str) ->
 
 
 def test_no_cache_cluster_or_extra_resource_type_is_created() -> None:
+    """The data stack holds storage and the keys that gate it, and nothing else.
+
+    Phase 6 adds the two evidence buckets, their two separate customer-managed keys with
+    aliases, and the bucket policies that carry the frozen denies. Anything beyond that set
+    -- a cache, an accelerator, a stream consumer, a compute resource -- fails here, which
+    is the point: a data stack that quietly grew a fourth kind of thing is a data stack
+    whose IAM story nobody re-read.
+    """
+
     resources = template(CdkBuildConfig()).to_json()["Resources"]
     created = {resource["Type"] for resource in resources.values()}
 
-    assert created == {TABLE_TYPE}
+    assert created == {
+        TABLE_TYPE,
+        "AWS::S3::Bucket",
+        "AWS::S3::BucketPolicy",
+        "AWS::KMS::Key",
+        "AWS::KMS::Alias",
+    }
+
+
+def test_exactly_two_evidence_buckets_and_two_keys_are_created() -> None:
+    """One key per bucket. A shared key would collapse two boundaries into one grant."""
+
+    built = template(CdkBuildConfig())
+
+    built.resource_count_is("AWS::S3::Bucket", 2)
+    built.resource_count_is("AWS::KMS::Key", 2)
+
+
+def test_bucket_names_follow_the_frozen_convention() -> None:
+    built = template(CdkBuildConfig(environment="development"))
+    names = {
+        resource["Properties"]["BucketName"]
+        for resource in built.find_resources("AWS::S3::Bucket").values()
+    }
+
+    assert names == {
+        "chorus-private-evidence-development",
+        "chorus-export-evidence-development",
+    }
 
 
 def test_a_durable_environment_protects_its_data() -> None:
@@ -144,6 +191,7 @@ def test_the_application_synthesizes_every_declared_stack() -> None:
         "AmbientChorusFoundation",
         "AmbientChorusData",
         "AmbientChorusAgents",
+        "AmbientChorusCompiler",
     }
 
 

@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import UUID, uuid4, uuid5
 
+from chorus.application.commands.compile_view import CompileView
 from chorus.application.commands.decide_mandate import DecideMandate
 from chorus.application.commands.ingest_messages import (
     IngestAttachment,
@@ -31,6 +32,7 @@ from chorus.application.operations import ApplicationOperations, monitor_locator
 from chorus.application.queries.feed import ReadAmbientFeed
 from chorus.application.queries.mandates import ReadMandateThread
 from chorus.application.services.monitor_snapshots import MonitorSnapshots
+from chorus.application.services.safe_evidence import PrepareSafeEvidence
 from chorus.domain.entities import (
     ApplicationOperation,
     ApplicationOperationKind,
@@ -38,6 +40,7 @@ from chorus.domain.entities import (
     CommunityStatus,
     Contributor,
     ContributorStatus,
+    DestinationKind,
 )
 from chorus.domain.ids import (
     CommunityId,
@@ -53,16 +56,22 @@ from chorus.infrastructure.dynamodb.audit import AuditRepository
 from chorus.infrastructure.dynamodb.core import CoreRepository
 from chorus.infrastructure.dynamodb.cursor import SignedCursorCodec
 from chorus.infrastructure.dynamodb.idempotency import IdempotencyRepository
+from chorus.infrastructure.dynamodb.shareable import ShareableRepository
 from chorus.infrastructure.dynamodb.unit_of_work import StorageUnitOfWork
+from chorus.infrastructure.fixtures.review_registry import FixtureEvidenceReviewRegistry
 from chorus.infrastructure.fixtures.synthetic_feed import SyntheticAmbientAdapter
+from chorus.infrastructure.imaging.sanitizer import sanitize_image
+from chorus.infrastructure.local.objects import InMemoryObjectStore
 from chorus.ports.agents import MonitorAgentPort
 from chorus.ports.ambient import AmbientMessage
+from chorus.ports.imaging import SafeImage
 from chorus.ports.operations import MonitorOperationJob
-from chorus.ports.records import MessageFeedEntry
+from chorus.ports.records import MessageFeedEntry, StoredSafeDestination
 from chorus.ports.retention import AuditRetention
 from chorus.ports.scopes import CommunityScope
 from chorus.ports.storage import StorageDriver, TableName
 from chorus.ports.unit_of_work import TransactionPlan
+from chorus.privacy.compiler import PrivacyCompiler
 
 NAMESPACE = Namespace("TEST_MONITOR")
 OTHER_NAMESPACE = Namespace("TEST_MONITOR_ALT")
@@ -106,6 +115,13 @@ class SteppableClock:
         self.instant += timedelta(seconds=seconds)
 
 
+class _Sanitizer:
+    """The real sanitizer behind the port, so the API path exercises production code."""
+
+    def sanitize(self, source: bytes, *, declared_media_type: str) -> SafeImage:
+        return sanitize_image(source, declared_media_type=declared_media_type)
+
+
 @dataclass(slots=True)
 class MonitorHarness:
     """One seeded community plus every Phase 3 use case wired over one storage driver."""
@@ -119,6 +135,8 @@ class MonitorHarness:
     idempotency: IdempotencyRepository = field(init=False)
     unit_of_work: StorageUnitOfWork = field(init=False)
     ids: Uuid5Generator = field(init=False)
+    objects: InMemoryObjectStore = field(default_factory=InMemoryObjectStore)
+    reviews: FixtureEvidenceReviewRegistry = field(init=False)
 
     def __post_init__(self) -> None:
         cursors = SignedCursorCodec(CURSOR_SECRET)
@@ -129,6 +147,7 @@ class MonitorHarness:
         self.idempotency = IdempotencyRepository(driver=self.driver, table=TableName.CORE)
         self.unit_of_work = StorageUnitOfWork(driver=self.driver)
         self.ids = Uuid5Generator(namespace=FIXTURE_ID_NAMESPACE, prefix=self.namespace.value)
+        self.reviews = FixtureEvidenceReviewRegistry.from_fixtures(self.adapter.evidence_fixtures)
 
     # -- identity ----------------------------------------------------------------------
 
@@ -265,6 +284,46 @@ class MonitorHarness:
     @property
     def read_mandate_thread(self) -> ReadMandateThread:
         return ReadMandateThread(core=self.core, clock=self.clock)
+
+    @property
+    def stored_destination(self) -> StoredSafeDestination:
+        """The deployment registry entry the compile route resolves server-side."""
+
+        return StoredSafeDestination(
+            destination_id=DESTINATION_ID,
+            kind=DestinationKind.PROPERTY_MANAGER,
+            registry_version=1,
+            routing_token=uuid5(
+                FIXTURE_ID_NAMESPACE, f"{self.namespace.value}:destination-routing-token"
+            ),
+            display_label="Property Management",
+        )
+
+    @property
+    def compile_view(self) -> CompileView:
+        """The Phase-6 compile, wired over the same driver as every other use case."""
+
+        return CompileView(
+            core=self.core,
+            shareable=ShareableRepository(
+                driver=self.driver, cursors=SignedCursorCodec(CURSOR_SECRET)
+            ),
+            audit=self.audit,
+            idempotency=IdempotencyRepository(driver=self.driver, table=TableName.SHAREABLE),
+            unit_of_work=self.unit_of_work,
+            compiler=PrivacyCompiler(
+                id_generator_factory=lambda compile_id: Uuid5Generator(
+                    namespace=compile_id, prefix="compile"
+                )
+            ),
+            evidence=PrepareSafeEvidence(
+                objects=self.objects, sanitizer=_Sanitizer(), ids=self.ids
+            ),
+            reviews=self.reviews,
+            clock=self.clock,
+            ids=self.ids,
+            community_public_label="Example Community Building",
+        )
 
     @property
     def contributor_by_actor(self) -> dict[str, ContributorId]:

@@ -15,12 +15,21 @@ from tests.fixtures.persistence import NOW, OTHER_CASE, PRIMARY, build_repositor
 
 from chorus.domain.ids import ExecutionId
 from chorus.domain.time import epoch_micros, epoch_seconds_ceiling
-from chorus.infrastructure.dynamodb import codec_fence
+from chorus.infrastructure.dynamodb import codec_fence, keys
 from chorus.infrastructure.dynamodb.codec import ATTR_EXPIRES_AT_EPOCH
+from chorus.infrastructure.dynamodb.unit_of_work import StorageUnitOfWork
 from chorus.ports.errors import PersistenceConflictError
 from chorus.ports.pagination import PageRequest
 from chorus.ports.records import SendFence
-from chorus.ports.storage import StorageDriver
+from chorus.ports.storage import (
+    CheckItem,
+    DeleteItem,
+    ItemKey,
+    KeyPresent,
+    QueryRequest,
+    StorageDriver,
+    TableName,
+)
 from chorus.ports.unit_of_work import TransactionPlan
 
 pytestmark = pytest.mark.anyio
@@ -303,3 +312,138 @@ async def test_the_ttl_field_is_never_what_authorization_compares(
     # The TTL value rounds up, so it never names an instant before the real deadline.
     assert stored[ATTR_EXPIRES_AT_EPOCH] == epoch_seconds_ceiling(expiry)
     assert stored[ATTR_EXPIRES_AT_EPOCH] != epoch_micros(expiry)
+
+
+# -- ADR-019: the fence has its own partition ---------------------------------------------
+
+
+async def test_the_fence_is_stored_outside_the_case_partition(storage: StorageDriver) -> None:
+    """The separation, proved against the item that actually lands in storage.
+
+    This is the security property ADR-019 exists for: ``dynamodb:LeadingKeys`` constrains the
+    partition key alone, so a fence sharing the case partition cannot be granted to the compiler
+    without granting the case row, its facts, its reports and its mandates with it.
+    """
+
+    repository = build_repositories(storage).core
+    scope = PRIMARY.case_scope
+    await repository.acquire_send_fence(scope, PRIMARY.send_fence())
+
+    key = codec_fence.send_fence_key(scope)
+    assert key.partition_key == keys.fence_partition(scope.namespace, scope.case_id)
+    assert key.partition_key != keys.case_partition(scope.namespace, scope.case_id)
+    assert key.sort_key == "SEND_FENCE"
+
+    stored = await storage.get_item(key, consistent=True)
+    assert stored is not None
+    assert stored["PK"] == f"NS#{scope.namespace.value}#FENCE#{scope.case_id}"
+
+
+async def test_a_fence_write_leaves_the_case_partition_untouched(
+    storage: StorageDriver,
+) -> None:
+    """Acquiring a fence must not add a row to the partition it used to live in."""
+
+    repository = build_repositories(storage).core
+    scope = PRIMARY.case_scope
+    case_partition = keys.case_partition(scope.namespace, scope.case_id)
+
+    await repository.acquire_send_fence(scope, PRIMARY.send_fence())
+
+    page = await storage.query(
+        QueryRequest(table=TableName.CORE, partition_key=case_partition, consistent=True)
+    )
+    assert [item["SK"] for item in page.items] == []
+
+
+async def test_a_transaction_can_check_the_case_and_the_fence_together(
+    storage: StorageDriver,
+) -> None:
+    """The two guards now live in different partitions, and that changes nothing.
+
+    ``TransactWriteItems`` spans partitions and tables within one account and Region, so the
+    compile transaction stages its case-version check and its no-live-fence check exactly as
+    before. The move is physical, not semantic.
+    """
+
+    repository = build_repositories(storage).core
+    unit_of_work = StorageUnitOfWork(driver=storage)
+    scope = PRIMARY.case_scope
+    case = PRIMARY.case()
+    await unit_of_work.commit(
+        TransactionPlan(
+            name="seed-case",
+            operations=(repository.stage_create_case(scope, case),),
+            audit_required=False,
+        )
+    )
+
+    plan = TransactionPlan(
+        name="two-partition-guards",
+        operations=(
+            repository.stage_require_case_version(scope, expected_version=case.version),
+            repository.stage_require_no_live_send_fence(scope, now=NOW),
+            repository.stage_create_report(scope, PRIMARY.report()),
+        ),
+        audit_required=False,
+    )
+    await unit_of_work.commit(plan)
+
+    checks = [operation for operation in plan.operations if isinstance(operation, CheckItem)]
+    assert {check.key.partition_key for check in checks} == {
+        keys.case_partition(scope.namespace, scope.case_id),
+        keys.fence_partition(scope.namespace, scope.case_id),
+    }
+
+
+async def test_clearing_the_fence_partition_leaves_the_case_and_permits_a_new_acquire(
+    storage: StorageDriver,
+) -> None:
+    """The reset regression, expressed against the partition a reset would target.
+
+    ``chorus-demo reset`` itself is Phase-11 work and does not exist yet, so what is proved here
+    is the property that command will rely on: the fence has its own partition root, deleting it
+    removes the fence and nothing else, and a later execution can acquire normally afterwards.
+    ADR-019 records that the reset manifest must include this root.
+    """
+
+    repository = build_repositories(storage).core
+    unit_of_work = StorageUnitOfWork(driver=storage)
+    scope = PRIMARY.case_scope
+    case = PRIMARY.case()
+    await unit_of_work.commit(
+        TransactionPlan(
+            name="seed-case",
+            operations=(repository.stage_create_case(scope, case),),
+            audit_required=False,
+        )
+    )
+    await repository.acquire_send_fence(scope, PRIMARY.send_fence())
+    assert await repository.load_send_fence(scope) is not None
+
+    # What a reset does to this root: delete every item under the fence partition.
+    fence_partition = keys.fence_partition(scope.namespace, scope.case_id)
+    page = await storage.query(
+        QueryRequest(table=TableName.CORE, partition_key=fence_partition, consistent=True)
+    )
+    for item in page.items:
+        await storage.write_item(
+            DeleteItem(
+                key=ItemKey(
+                    table=TableName.CORE,
+                    partition_key=fence_partition,
+                    sort_key=str(item["SK"]),
+                ),
+                condition=KeyPresent(),
+            )
+        )
+
+    assert await repository.load_send_fence(scope) is None
+    # The case survived the reset of the fence root.
+    assert (await repository.load_case(scope)).version == case.version
+    # And a different execution can acquire cleanly afterwards.
+    successor = replace(
+        PRIMARY.send_fence(), execution_id=ExecutionId(PRIMARY.uuid("execution:successor"))
+    )
+    acquired = await repository.acquire_send_fence(scope, successor)
+    assert acquired.execution_id == successor.execution_id

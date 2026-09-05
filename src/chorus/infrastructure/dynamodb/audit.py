@@ -7,6 +7,7 @@ unit of work requires before it will accept a plan as audited.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from uuid import UUID
 
 from chorus.domain.entities import AuditEvent
 from chorus.domain.ids import CaseId, CommunityId
@@ -15,10 +16,13 @@ from chorus.infrastructure.dynamodb.cursor import SignedCursorCodec
 from chorus.infrastructure.dynamodb.guards import (
     EntityIdentity,
     create_operation,
+    require_same,
     validate_page_scope,
+    validate_scope,
 )
 from chorus.ports.errors import CrossCaseViolationError
 from chorus.ports.pagination import Page, PageCursor, PageRequest, QueryBinding
+from chorus.ports.records import CompilerAuditProjection
 from chorus.ports.retention import AuditRetention
 from chorus.ports.scopes import CaseScope, NamespaceScope
 from chorus.ports.storage import (
@@ -47,6 +51,49 @@ class AuditRepository:
             codec_audit.case_event_key(scope, event),
             codec_audit.encode_case_event(scope, event, retention=self.retention),
         )
+
+    def stage_append_compile_projection(
+        self, scope: CaseScope, projection: CompilerAuditProjection
+    ) -> PutItem:
+        """Append the immutable private lineage of one compile, allowed or denied.
+
+        Create-only, like every other write to this table, so a redelivered compile that got
+        as far as the transaction cannot append a second record of one decision -- the
+        condition refuses it and the idempotency record answers the caller instead.
+        """
+
+        if (
+            projection.namespace != scope.namespace
+            or projection.case_id != scope.case_id
+            or projection.community_id != scope.community_id
+        ):
+            raise CrossCaseViolationError("COMPILER_AUDIT_PROJECTION")
+        return create_operation(
+            codec_audit.compile_projection_key(scope, projection.compile_id),
+            codec_audit.encode_compile_projection(scope, projection, retention=self.retention),
+        )
+
+    async def load_compile_projection(
+        self, scope: CaseScope, compile_id: UUID
+    ) -> CompilerAuditProjection | None:
+        """Strongly read one compile's private lineage for the authorized case surface."""
+
+        key = codec_audit.compile_projection_key(scope, compile_id)
+        item = await self.driver.get_item(key, consistent=True)
+        if item is None:
+            return None
+        decoded, projection = codec_audit.decode_compile_projection(item)
+        validate_scope(
+            decoded,
+            key=key,
+            entity_ref="COMPILER_AUDIT_PROJECTION",
+            namespace=scope.namespace,
+            community_id=scope.community_id,
+            case_id=scope.case_id,
+        )
+        require_same(projection.case_id, scope.case_id, "COMPILER_AUDIT_PROJECTION")
+        require_same(projection.community_id, scope.community_id, "COMPILER_AUDIT_PROJECTION")
+        return projection
 
     def stage_append_namespace_event(self, scope: NamespaceScope, event: AuditEvent) -> PutItem:
         """Append a namespace-level event, which owns no community and no case.

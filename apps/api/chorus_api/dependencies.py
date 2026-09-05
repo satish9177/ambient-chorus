@@ -24,6 +24,7 @@ from typing import Annotated
 
 from fastapi import Header, HTTPException, Request
 
+from chorus.application.commands.compile_view import CompileView
 from chorus.application.commands.decide_mandate import DecideMandate
 from chorus.application.commands.ingest_messages import IngestMessages
 from chorus.application.commands.propose_mandates import ProposeMandates
@@ -32,6 +33,7 @@ from chorus.application.queries.feed import ReadAmbientFeed
 from chorus.application.queries.mandates import ReadMandateThread
 from chorus.domain.ids import CommunityId, ContributorId, DestinationId, Namespace, Sha256Digest
 from chorus.ports.operations import OperationDispatchPort
+from chorus.ports.records import StoredSafeDestination
 
 ACTOR_HEADER = "X-Chorus-Demo-Actor"
 
@@ -71,6 +73,13 @@ class ApiContainer:
     namespace: Namespace
     community_id: CommunityId
     destination_id: DestinationId
+    destination: StoredSafeDestination
+    """The deployment's full safe registry entry.
+
+    A compile needs the version and routing token as well as the identifier, and a caller
+    must never be able to supply any of them: a request that could name its own destination
+    could compile toward one nobody approved.
+    """
     contributor_by_actor: Mapping[DemoActor, ContributorId]
     ingest_messages: IngestMessages
     read_feed: ReadAmbientFeed
@@ -78,6 +87,7 @@ class ApiContainer:
     propose_mandates: ProposeMandates
     decide_mandate: DecideMandate
     read_mandate_thread: ReadMandateThread
+    compile_view: CompileView
     dispatcher: OperationDispatchPort
 
 

@@ -242,6 +242,23 @@ def monitor_snapshot_chunk_sort_key(kind: str, invocation_id: UUID, index: int) 
     return _join(kind, str(invocation_id), "CHUNK", str(index).zfill(SNAPSHOT_CHUNK_INDEX_WIDTH))
 
 
+def fence_partition(namespace: Namespace, case_id: CaseId) -> str:
+    """``NS#{namespace}#FENCE#{case_id}`` -- the send fence's own partition.
+
+    The fence is deliberately *not* in the case partition, and the reason is IAM rather than
+    modelling. ``dynamodb:LeadingKeys`` constrains the partition key and nothing constrains the
+    sort key, so a principal permitted to write ``NS#n#CASE#k`` can write every item in it --
+    the case row, its facts, its reports, its evidence, its mandates. Keying the fence
+    separately is what makes the frozen "compiler Core write is the fence alone" a permission
+    AWS can actually express
+    ([ADR-019](../../../../docs/adr/ADR-019-send-fence-partition-isolation.md)).
+
+    It stays in the Core table: this is a partition change, not a new store.
+    """
+
+    return _join("NS", namespace.value, "FENCE", str(case_id))
+
+
 def send_fence_sort_key() -> str:
     return "SEND_FENCE"
 
@@ -280,6 +297,12 @@ def action_history_sort_key(created_at: datetime, action_id: ActionId) -> str:
 
 def commitment_sort_key(commitment_id: CommitmentId) -> str:
     return _join("COMMITMENT", str(commitment_id))
+
+
+def compile_audit_sort_key(compile_id: UUID) -> str:
+    """``COMPILE#{compile_id}`` -- one immutable projection per logical compile."""
+
+    return _join("COMPILE", str(compile_id))
 
 
 def audit_event_sort_key(occurred_at: datetime, audit_event_id: UUID) -> str:

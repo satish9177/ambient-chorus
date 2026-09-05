@@ -162,6 +162,12 @@ Current mandate response contains proposed/current terms rendered from fact-safe
 
 `POST /v1/cases/{case_id}/views` uses the exact `CompileCommand` minus path-derived namespace/case. An `ALLOW` returns 200 `{decision:'ALLOW',view,included,excluded,audit_event_id}`. A policy denial returns 422 Problem Details with `code=POLICY_DENIED` and structured `reasons`; cross-case returns 403/404 externally and a security audit, stale returns 409. An allowed view is persisted before response.
 
+Compile is **synchronous**. It creates no `ApplicationOperation`, and `ApplicationOperationKind` gains no `COMPILE` member.
+
+Compile idempotency uses the ordinary two-part identity, and `compile_id` does not replace it. The `Idempotency-Key` header together with the namespace, actor, and `COMPILE_VIEW` command family identifies the command record; the request hash is computed over the normalized `CompileCommand`, **including `compile_id`**. The same key with the same request hash replays the recorded result; the same key with a different request — a different `compile_id` among them — is `IDEMPOTENCY_CONFLICT` (409). `compile_id` binds the logical compile and addresses its audit projection.
+
+**A denial is a recorded outcome, not an absent one.** A `DENY` persists its audit event, its compiler audit projection, and a completed idempotency record carrying the deterministic denial response, atomically and in the same transaction. A redelivered denied command therefore replays its answer rather than re-running the compile and appending a second record of one decision. A conservative stale denial is safe to record because it grants no authority; a later attempt under changed circumstances is a new command under a new key. A completed logical compile, allowed or denied, is never regenerated on replay.
+
 ### Propose, approve, execute
 
 `POST /v1/cases/{case_id}/actions` body `{expected_case_version,view_id,view_hash}` returns 202 Action operation. The case must be `READY_FOR_ACTION`, and the pointer/hash/expiry must be current.

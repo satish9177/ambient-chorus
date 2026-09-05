@@ -118,6 +118,12 @@ from chorus.ports.records import (
     AgentInvocationResult,
     AgentName,
     ChannelUniquenessLock,
+    CompileDecisionOutcome,
+    CompiledEvidenceRecord,
+    CompiledFactRecord,
+    CompileItemOutcome,
+    CompilerAuditProjection,
+    CompilerGateRecord,
     CurrentActionPointer,
     CurrentViewPointer,
     EvidenceRootLocator,
@@ -784,7 +790,7 @@ class World:
             safe_evidence_refs=(
                 StoredSafeEvidenceRef(
                     safe_evidence_ref_id=ref_id,
-                    media_type="image/jpeg",
+                    media_type="image/png",
                     export_handle_id=self.uuid(f"export-handle:{index}"),
                     sha256=digest(f"derivative:{self.seed}:{index}"),
                     caption="A reviewed elevator out-of-service photo is available.",
@@ -794,6 +800,73 @@ class World:
             ),
             audit_refs=(self.uuid(f"audit-ref:{index}"),),
             view_hash=digest(f"view:{self.seed}:{index}"),
+        )
+
+    def compile_projection(
+        self, *, decision: CompileDecisionOutcome = CompileDecisionOutcome.ALLOW
+    ) -> CompilerAuditProjection:
+        """One compile's private lineage, in both the allowed and the denied shape."""
+
+        allowed = decision is CompileDecisionOutcome.ALLOW
+        item_outcome = CompileItemOutcome.INCLUDED if allowed else CompileItemOutcome.EXCLUDED
+        return CompilerAuditProjection(
+            namespace=self.namespace,
+            community_id=self.community_id,
+            case_id=self.case_id,
+            compile_id=self.uuid("compile"),
+            audit_event_id=self.uuid("compile-audit-event"),
+            requested_at=NOW,
+            created_at=NOW,
+            based_on_case_version=1,
+            compiler_version="compiler/1.1.0",
+            policy_version="policy/v1",
+            destination_id=DESTINATION_ID,
+            destination_registry_version=1,
+            destination_routing_token=self.uuid("routing-token"),
+            purpose=Purpose.REQUEST_ELEVATOR_REPAIR_AND_RESPONSE,
+            decision=decision,
+            reason_codes=() if allowed else ("STALE_CASE_VERSION",),
+            gates=(
+                CompilerGateRecord(
+                    gate=1,
+                    gate_name="REQUEST_SCHEMA",
+                    outcome="PASSED",
+                ),
+                CompilerGateRecord(
+                    gate=14,
+                    gate_name="DISCLOSURE_SCOPE",
+                    outcome="EXCLUDED",
+                    reason_codes=("INTERNAL_ONLY",),
+                ),
+            ),
+            facts=(
+                CompiledFactRecord(
+                    fact_id=self.fact_id,
+                    necessity="OPTIONAL",
+                    intended_usage="CLAIM",
+                    granted_scope=DisclosureScope.ANONYMOUS_CASE,
+                    outcome=item_outcome,
+                    reason_codes=() if allowed else ("INTERNAL_ONLY",),
+                    export_fact_ids=(
+                        (ExportFactId(self.uuid("export-fact:0")),) if allowed else ()
+                    ),
+                    transformation_rule_id="p1.incident.anonymous.v1" if allowed else None,
+                ),
+            ),
+            evidence=(
+                CompiledEvidenceRecord(
+                    source_evidence_id=self.evidence_id,
+                    outcome=item_outcome,
+                    reason_codes=() if allowed else ("UNSAFE_EVIDENCE",),
+                    safe_evidence_ref_id=(
+                        SafeEvidenceRefId(self.uuid("safe-evidence:0")) if allowed else None
+                    ),
+                    export_handle_id=self.uuid("export-handle:0") if allowed else None,
+                    derivative_sha256=(digest(f"derivative:{self.seed}:0") if allowed else None),
+                ),
+            ),
+            view_id=self.view_id if allowed else None,
+            view_hash=digest(f"view:{self.seed}:0") if allowed else None,
         )
 
     def view_pointer(self, *, version: int = 1, index: int = 0) -> CurrentViewPointer:

@@ -209,9 +209,17 @@ def decode_operation_agent_invocation(
 
 
 def send_fence_key(scope: CaseScope) -> ItemKey:
+    """The one address of a case's send fence.
+
+    Every fence path -- load, acquire, release, and the no-live-fence condition staged by
+    compile, mandate decisions, and investigation applies -- resolves its key here. One
+    authority, so the partition grammar cannot drift between the operation that writes a fence
+    and the condition that checks for one.
+    """
+
     return ItemKey(
         table=_CORE,
-        partition_key=keys.case_partition(scope.namespace, scope.case_id),
+        partition_key=keys.fence_partition(scope.namespace, scope.case_id),
         sort_key=keys.send_fence_sort_key(),
     )
 

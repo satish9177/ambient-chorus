@@ -17,7 +17,7 @@ Compiler functions accept domain objects through repository ports and are pure e
 
 | Field | Type | Rule |
 |---|---|---|
-| `compile_id` | UUID | idempotency identity |
+| `compile_id` | UUID | logical compile and audit identity; it addresses the compiler audit projection and is covered by the command request hash, and it does not replace the transport `Idempotency-Key` mechanism |
 | `namespace` | Namespace | caller cannot compile across namespace |
 | `case_id` | CaseId | authoritative case |
 | `expected_case_version` | positive int | stale caller denied; compiler still loads current |
@@ -72,7 +72,25 @@ Evaluation is stable and stops as specified. Reason codes are enums; no private 
 19. **Minimum necessity:** policy/v1 purpose allowlist selects only incident count/date range, common-area/elevator location, failure/impact category, evidence status, non-sensitive contradiction, requested repair/action, and approved safe evidence. Redundant facts are deterministically deduplicated. Permission alone does not cause inclusion.
 20. **Evidence safety:** source item must be same case, malware status `CLEAN`, allowed MIME/size, non-private for intended use, and backed by an approved `EXTERNAL_ACTION` grant. Unsafe, text-bearing prompt-injection, health/unit/name-bearing, or unscanned evidence is not exported.
 21. **Safe transformation and construction:** execute only versioned allowlisted transformation functions, build separate `ShareableFact`/`ShareableEvidenceRef` types, then run negative-field/secret/URI scanners. Any transformation error denies the whole compile.
-22. **Audit and hash:** canonicalize the complete view without `view_hash`, compute hash, conditionally persist view/current pointer and append audit decision. Persistence conflict returns typed conflict; it never returns an unpersisted ALLOW artifact.
+22. **Audit and hash:** canonicalize the complete view without `view_hash`, compute hash, conditionally persist view, current pointer, and history locator, and append the audit decision and the compiler audit projection. Persistence conflict returns typed conflict; it never returns an unpersisted ALLOW artifact.
+
+### What each decision persists
+
+The single DynamoDB transaction is the **sole authorization commit point** for a compile. A sanitized evidence derivative written to its content-addressed export key beforehand confers no authority until that transaction commits ([ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md)).
+
+An **ALLOW** writes eight fixed participants — the immutable view; the current-view pointer; the immutable view-history locator; the `compile.allowed` audit event; the immutable compiler audit projection; the completed idempotency record that is also the plan's commit proof, written to the case's `VIEW_CURRENT` partition because that is the case-scoped Shareable partition inside the compiler's `LeadingKeys` write grant; a check that the case still stands at `expected_case_version`; and a check that no live send fence holds the case. The count is fixed and independent of how many facts or evidence items the request named.
+
+A **DENY** writes no `ShareableCaseView`, no history locator, no safe-evidence reference, and makes **no change to the current pointer** — a denial never invalidates a view that is still valid. It does atomically persist the `compile.denied` audit event, the compiler audit projection, and the completed idempotency record carrying the deterministic denial response. Persisting the denial is what makes a redelivered command replay its answer instead of appending a second record of one decision, and a conservative stale denial is safe to record because it grants no authority. A later attempt under changed circumstances is a new command under a new idempotency key.
+
+The compiler never writes the Core case row and never bumps `CommunityCase.version`; the case participant is check-only. Per-fact and per-mandate conditions are deliberately absent, because every authorization-sensitive mutation already bumps the case version, so one condition covers all of them at one operation.
+
+### When the current-view pointer moves
+
+Every `ALLOW` replaces the current pointer, conditioned on the **exact** pointer row version and `view_hash` the compile loaded; an absent pointer is created rather than replaced. That condition is what makes pointer rollback impossible rather than merely unlikely: a compile that read pointer *N* and tries to commit after a newer compile installed *N+1* fails its transaction whole, so an older compile can never finish late and roll the current view backwards.
+
+The pointer is **case-scoped**, and that is sufficient *only because* policy/v1 has exactly one purpose and exactly one destination, so no two live compiles of a case can disagree about where their view was going. Adding a second purpose or a second destination requires its own ADR deciding how the pointer is re-keyed; it is not a configuration change.
+
+Historical views are immutable. A revocation arriving after a view was compiled neither rewrites nor deletes that view and does not clear the pointer: the artifact remains historical, and staleness is caught at proposal time and at fence acquisition through `authorization_snapshot_hash` and `case_version`.
 
 An integrity, structural, cross-case, stale, transformation, or persistence problem denies the whole compile. Policy ineligibility can exclude only `OPTIONAL` inputs. `CompileDecision` includes `included` and `excluded` entries by opaque IDs/reason codes for the private UI; exclusion details are not part of the Action Agent input.
 
@@ -104,7 +122,7 @@ The compiler registry is a Python mapping keyed by `(policy_version, purpose, fa
 | `p1.impact.aggregate.v1` | approved aggregate-only impacts | count + generalized category | contributor count >=3; no narrative |
 | `p1.impact.anonymous.v1` | approved anonymous impact | generalized impact sentence | strips relationship/health/identity |
 | `p1.contradiction.safe.v1` | management statement + contradictory incident facts | neutral contradiction statement | cites safe facts; no private quote unless explicitly safe; **reserved — see below** |
-| `p1.evidence.photo.v1` | approved clean elevator photo | re-encoded image derivative + caption | strips EXIF, OCR gate, no faces/unit/name; human review required in V1 |
+| `p1.evidence.photo.v1` | approved clean elevator photo | re-encoded **PNG** derivative + caption | strips all source metadata, no faces/unit/name; fixed review required in V1; the emitted `ShareableEvidenceRef.media_type` is always `image/png` |
 | `p1.identity.named.v1` | approved identity fact + identity grant | display name | never contact/unit; off by default in demo |
 
 `p1.contradiction.safe.v1` and `FactType.CONTRADICTION` are **reserved and currently unreachable in V1**: no component creates a contradiction fact. The Investigator records contradictions in its `InvestigationAssessment` and the investigation apply sets `evidence_status=CONTRADICTED` on the affected *existing* facts, which is what travels outward — `ShareableFact` already carries `evidence_status`, so an externally eligible contradicted fact can be caveated by the Action proposal without a separate contradiction fact existing. A future producer requires its own ADR ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md)).
@@ -150,7 +168,11 @@ ShareableCaseView
 4. Set `view_hash` absent, serialize with RFC 8785 JCS as UTF-8, and compute SHA-256.
 5. Store `view_hash="sha256:" + lowercase_hex`. Add it to the persisted/returned model. Verification removes only `view_hash`, recomputes, and constant-time compares.
 
-`view_id` and `generated_at` are compile inputs, so identical inputs including those values yield identical bytes/hash. An idempotent replay of `compile_id` returns the existing artifact. A new compile intentionally produces a new view/hash even when safe fact content is unchanged.
+**The determinism claim is exact.** Given the same complete compile inputs, the same injected `Clock` value, the same injected ID sequence, and the same compiler, policy, and canonicalization versions, the output bytes and hash are deterministic. `view_id` and `generated_at` therefore behave as compile inputs even though the compiler mints the first through its injected `IdGenerator`.
+
+A **distinct logical compile** may carry a different `compile_id`, `view_id`, and `generated_at`, and so may produce a different `view_hash` even when the underlying case data is byte-for-byte unchanged. That is intended and is not a determinism failure: two compiles are two authorization artifacts. Nothing in the design claims that two distinct semantic compiles hash alike.
+
+An idempotent **replay** of a completed compile returns the persisted result. It mints no new identifiers, recomputes no view, and re-runs no gate. Golden view-hash tests pin the compile ID, the clock, and the ID sequence explicitly; a golden hash is a statement about fixed inputs, never about a repeated command.
 
 Authorization-sensitive changes that must increment case version and/or snapshot are: active fact/value/status/evidence-status changes; report linkage; evidence root/safety changes; mandate current version/decision/revocation/expiry correction; destination routing token/version or purpose registry change; policy/compiler version; and safe transformation review result. Presentation-only UI changes do not.
 
@@ -174,7 +196,7 @@ The compiler:
 1. strongly reloads current Core state and policy;
 2. verifies the persisted view/proposal/approval hashes from Shareable via passed values and compiler-readable safe records;
 3. repeats case, policy, destination, purpose, expiry, current mandate/version/revocation, and snapshot checks;
-4. conditionally creates `SEND_FENCE#case_id` with the execution ID and expiry `min(requested_at + 60 seconds, view expiry, approval expiry, earliest relied-on mandate expiry)`; fewer than five seconds of remaining authority denies instead of racing.
+4. conditionally creates the case's fence item — `NS#n#FENCE#k` / `SEND_FENCE`, its own partition so the compiler's Core write grant reaches nothing else ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md)) — with the execution ID and expiry `min(requested_at + 60 seconds, view expiry, approval expiry, earliest relied-on mandate expiry)`; fewer than five seconds of remaining authority denies instead of racing.
 
 Mandate decisions, revocations, and authorization-sensitive case mutations conditionally require no unexpired send fence. A concurrent revocation arriving after the fence returns a retryable 409 for at most 60 seconds; therefore the total order is explicit: either revocation commits first and send is denied, or send authorization commits first and the later revocation cannot unsend it. The sender checks its injected clock is still strictly before fence expiry immediately before the SES call, must call SES within the fence, then releases it in `finally`. Expired authority causes a definite pre-send stale failure. A crashed/expired fence paired with a `SENDING` execution is reconciled to `SEND_UNKNOWN`, never retried automatically.
 

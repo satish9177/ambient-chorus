@@ -23,7 +23,7 @@ from chorus_api.problem_details import (
     register_problem_handlers,
     register_transport_handlers,
 )
-from chorus_api.routes import feed, ingest, investigations, mandates
+from chorus_api.routes import feed, ingest, investigations, mandates, views
 
 API_PREFIX = "/v1"
 API_TITLE = "Ambient CHORUS"
@@ -62,6 +62,7 @@ def build_app(container: ApiContainer) -> FastAPI:
     app.include_router(feed.router, prefix=API_PREFIX)
     app.include_router(mandates.router, prefix=API_PREFIX)
     app.include_router(investigations.router, prefix=API_PREFIX)
+    app.include_router(views.router, prefix=API_PREFIX)
     return app
 
 
