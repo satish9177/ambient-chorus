@@ -1305,29 +1305,33 @@ class CoreRepository:
         *,
         expected_version: int,
         expected_authorization_version: int,
+        expected_state: CaseState | None = None,
     ) -> CheckItem:
-        """Condition on the case standing at exactly these two versions, writing nothing.
+        """Condition on the case standing at exactly these versions and state, writing nothing.
 
         The compile transaction's authorization guard, and one participant carrying both
-        conditions rather than two participants (ADR-020 § 6). The compiler's only Core write is
-        the send fence, so it has no grant to touch this row; requiring the exact OCC version
-        therefore costs it nothing, while the authorization version is the term the view's own
-        snapshot is bound to.
+        version conditions rather than two participants (ADR-020 § 6). The compiler's only Core
+        write is the send fence, so it has no grant to touch this row; requiring the exact OCC
+        version therefore costs it nothing, while the authorization version is the term the
+        view's own snapshot is bound to.
+
+        ``expected_state`` is optional and is supplied by the Phase-8 approval, whose fifth
+        participant must assert ``ACTION_PROPOSED`` as well (ADR-025 § 11 shape A). An approval
+        takes no case edge -- it is not a lifecycle transition -- so the case appears in its
+        transaction as a read-only condition and in no other form.
         """
 
         if expected_version < 1 or expected_authorization_version < 1:
             raise ValueError("expected case versions must be positive")
-        return CheckItem(
-            key=codec_core.case_key(scope),
-            condition=AllOf(
-                (
-                    AttributeEqualsNumber(name=ATTR_VERSION, value=expected_version),
-                    AttributeEqualsNumber(
-                        name=ATTR_AUTHORIZATION_VERSION, value=expected_authorization_version
-                    ),
-                )
+        conditions: list[ItemCondition] = [
+            AttributeEqualsNumber(name=ATTR_VERSION, value=expected_version),
+            AttributeEqualsNumber(
+                name=ATTR_AUTHORIZATION_VERSION, value=expected_authorization_version
             ),
-        )
+        ]
+        if expected_state is not None:
+            conditions.append(AttributeEqualsString(name=ATTR_STATE, value=expected_state.value))
+        return CheckItem(key=codec_core.case_key(scope), condition=AllOf(tuple(conditions)))
 
     @staticmethod
     def _require_case_capacity(case: CommunityCase) -> None:

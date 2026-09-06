@@ -214,6 +214,24 @@ class ApprovalDecision(StrEnum):
     REJECTED = "REJECTED"
 
 
+class ApproverAssurance(StrEnum):
+    """How strongly the approver's identity is actually known (ADR-023 SS 4).
+
+    One member, because there is one mechanism: a high-entropy shared access token validated
+    against a Secrets Manager hash, after which ``X-Chorus-Demo-Actor`` selects a fixed
+    persona. That is **single-presenter demo access control and not authentication of a
+    person**. It does not identify who approved; it identifies that somebody holding the demo
+    token asserted the approver persona.
+
+    The enum has one member rather than a reserved second one, because an unreachable value is
+    an invitation to write code that pretends the stronger case exists. Adding
+    ``PRODUCTION_AUTHENTICATED`` requires the authentication ADR that R26 and T26 already say
+    V1 does not have, and that ADR is what would decide what the value means.
+    """
+
+    DEMO_SHARED_TOKEN = "DEMO_SHARED_TOKEN"  # noqa: S105 - an assurance level, not a credential
+
+
 class ActorType(StrEnum):
     HUMAN = "HUMAN"
     SYSTEM = "SYSTEM"
@@ -720,30 +738,67 @@ class ActionProposal:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Approval:
+    """One human decision about one immutable proposal, written once and never again.
+
+    **Fully immutable** (ADR-023 SS 1). ``consumed_at`` does not exist: the execution reaching
+    ``SENDING`` *is* the consumption, it is one-time by compare-and-swap on the execution's row
+    version, and it is already durable in the state the sender must write anyway. Recording it
+    a second time here bought nothing and cost three things -- a mutable field inside an
+    authorization digest, a second place the same fact could disagree, and a write grant on the
+    immutable proposal's own partition for whoever performed it (ADR-024 SS 1).
+
+    Because nothing here ever moves, :func:`chorus.privacy.canonical.hash_approval` omits only
+    ``{approval_hash, version, created_at, updated_at}`` -- row bookkeeping -- and recomputation
+    is meaningful at any later instant. An integrity check that a legitimate write invalidated
+    could prove nothing, and would be deleted by the second person who met it (T32).
+
+    **What it binds, and what it deliberately does not.** ``case_id``, ``action_id``,
+    ``execution_id``, ``proposal_hash``, ``view_hash``, and ``authorization_version`` are
+    stored. ``view_id``, ``preview_hash``, ``template_version``, ``from_identity_id``, and the
+    whole destination routing triple are bound **transitively** through ``proposal_hash``,
+    which covers ``preview_hash``, which covers all of them. Copying a transitively bound value
+    onto this record would create a second copy of a fact the digest already fixes, and two
+    copies of one fact can disagree (ADR-023 SS 3). The recipient address, the ``Reply-To``
+    address, and the SES configuration set are bound by nothing here, because no artifact a
+    human or a model can see may contain them.
+
+    ``execution_id`` is what makes "consumed once by one execution" a statement about two named
+    rows rather than about a convention. ``request_key_hash`` replaces a raw caller-supplied
+    key, for the reason every other command in this repository already hashes one.
+    """
+
     approval_id: ApprovalId
-    action_id: ActionId
+    namespace: Namespace
+    community_id: CommunityId
     case_id: CaseId
+    action_id: ActionId
+    execution_id: ExecutionId
     proposal_hash: Sha256Digest
     view_hash: Sha256Digest
-    approver_id: ContributorId
+    authorization_version: int
+    """The disclosure-authority epoch current when the human decided. **Provenance only.**
+
+    Send-time authority is re-derived from live Core state by the fence, never read from here
+    (ADR-025 SS 4). Storing it records what the human was told, not what the sender may rely on.
+    """
+    approver_id_hash: Sha256Digest
+    approver_assurance: ApproverAssurance
     decision: ApprovalDecision
     approved_at: datetime
     expires_at: datetime
-    consumed_at: datetime | None
     approval_hash: Sha256Digest
-    idempotency_key: str
+    request_key_hash: Sha256Digest
     version: int
     created_at: datetime
     updated_at: datetime
-    schema_version: str = "approval/v1"
+    schema_version: str = "approval/v2"
 
     def __post_init__(self) -> None:
         require_utc(self.approved_at)
         require_utc(self.expires_at)
         if self.expires_at <= self.approved_at:
             raise ValueError("approval expiry must be after decision")
-        if self.consumed_at is not None:
-            require_utc(self.consumed_at)
+        _positive_version(self.authorization_version)
         _positive_version(self.version)
         _timestamps(self.created_at, self.updated_at)
 
@@ -772,6 +827,22 @@ EXECUTION_FIELD_PRESENCE: dict[str, dict[ActionExecutionState, FieldPresence]] =
     "idempotency_key": {
         ActionExecutionState.DRAFT: _A,
         ActionExecutionState.APPROVED: _R,
+        ActionExecutionState.SENDING: _R,
+        ActionExecutionState.SENT: _R,
+        ActionExecutionState.FAILED: _O,
+        ActionExecutionState.SEND_UNKNOWN: _R,
+    },
+    "claim_owner_hash": {
+        # The per-attempt claim owner (ADR-025 SS 1). It is written in the same conditional
+        # write that moves APPROVED -> SENDING, so a durable SENDING row answers not merely
+        # "was this execution claimed" but "**which attempt** owns the claim" -- and only the
+        # second question authorizes a sender.
+        #
+        # OPTIONAL at FAILED for the same reason ``started_at`` is: the pre-send failures
+        # (a rendered-hash mismatch, an authorization denial, an expired fence) move a row to
+        # FAILED from APPROVED, where no claim was ever taken.
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
         ActionExecutionState.SENDING: _R,
         ActionExecutionState.SENT: _R,
         ActionExecutionState.FAILED: _O,
@@ -825,6 +896,25 @@ EXECUTION_FIELD_PRESENCE: dict[str, dict[ActionExecutionState, FieldPresence]] =
         ActionExecutionState.FAILED: _R,
         ActionExecutionState.SEND_UNKNOWN: _A,
     },
+    "failure_detail_safe": {
+        # ADR-025's closing amendment to the ADR-022 table: the one field the original left
+        # ungoverned. OPTIONAL at FAILED, and ABSENT everywhere else -- a detail about a
+        # failure has no meaning on a row that has not failed, and leaving a cell unwritten
+        # would let a future state default into accepting one.
+        #
+        # ABSENT at SEND_UNKNOWN, which the first freeze made OPTIONAL. Presence is monotonic
+        # and the architecture permits SEND_UNKNOWN -> SENT on positive evidence, where this
+        # field is ABSENT -- so a quarantined row that had recorded a detail here could never
+        # take the edge that resolves it. An OPTIONAL cell that only one value is reachable
+        # from is not an option, it is a trap. The unknown reason is carried by the
+        # ``action.send.unknown`` audit event, which is where ADR-025 SS 14 puts it.
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
+        ActionExecutionState.SENDING: _A,
+        ActionExecutionState.SENT: _A,
+        ActionExecutionState.FAILED: _O,
+        ActionExecutionState.SEND_UNKNOWN: _A,
+    },
     "reconciled_at": {
         ActionExecutionState.DRAFT: _A,
         ActionExecutionState.APPROVED: _A,
@@ -871,6 +961,7 @@ class ActionExecution:
     view_hash: Sha256Digest
     idempotency_key: str | None
     state: ActionExecutionState
+    claim_owner_hash: Sha256Digest | None
     rendered_message_hash: Sha256Digest | None
     ses_request_token_hash: Sha256Digest | None
     ses_message_id: str | None
@@ -883,7 +974,7 @@ class ActionExecution:
     created_at: datetime
     updated_at: datetime
     attempt_number: int = 1
-    schema_version: str = "action-execution/v2"
+    schema_version: str = "action-execution/v3"
 
     def __post_init__(self) -> None:
         if self.attempt_number != 1:

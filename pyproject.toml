@@ -306,6 +306,23 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "The sender function composes adapters and never a model, an agent, or a scheduler"
+type = "forbidden"
+source_modules = ["functions.sender"]
+# The same shape as the compiler contract, and the same reason: a composition root is allowed
+# to see infrastructure, so the contract names what it must never reach. Strands and the agent
+# contracts are forbidden because the sender must not be able to acquire an opinion about what
+# it is sending; the scheduler because a send is not a schedule; `chorus_api` because the
+# sender is not a transport.
+forbidden_modules = [
+  "strands",
+  "aws_cdk",
+  "chorus.contracts",
+  "chorus_api",
+  "runtimes",
+]
+
+[[tool.importlinter.contracts]]
 name = "The compiler function composes adapters and never a model or a transport"
 type = "forbidden"
 source_modules = ["functions.compiler"]

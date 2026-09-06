@@ -138,5 +138,24 @@ def hash_action_proposal(proposal: ActionProposal) -> Sha256Digest:
     return hash_value(proposal, omit_fields=frozenset({"proposal_hash"}))
 
 
+APPROVAL_HASH_OMITTED_FIELDS: frozenset[str] = frozenset(
+    {"approval_hash", "version", "created_at", "updated_at"}
+)
+"""Row bookkeeping, and nothing else (ADR-023 SS 1).
+
+The omit set used to be ``{approval_hash}`` alone, which was correct only for as long as
+nobody recomputed the digest. Phase 8 is the phase that must: send-time revalidation exists to
+prove that the approval on file is the approval the human made, and a digest that a legitimate
+state change invalidates cannot prove anything.
+
+Every field outside this set is written once and never changes, so recomputation is meaningful
+at any later instant. The four inside it describe the *row* -- which revision it is and when it
+was touched -- rather than the decision, and an approval is never written twice anyway, so the
+set is a statement of what the digest is *about* rather than a licence to move anything.
+"""
+
+
 def hash_approval(approval: Approval) -> Sha256Digest:
-    return hash_value(approval, omit_fields=frozenset({"approval_hash"}))
+    """Seal one human decision over every field except row bookkeeping."""
+
+    return hash_value(approval, omit_fields=APPROVAL_HASH_OMITTED_FIELDS)

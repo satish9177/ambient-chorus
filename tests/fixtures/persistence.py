@@ -11,7 +11,7 @@ record on every run.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import UUID, uuid5
@@ -31,6 +31,7 @@ from chorus.domain.entities import (
     ApplicationOperationStatus,
     Approval,
     ApprovalDecision,
+    ApproverAssurance,
     AssessmentAlternative,
     AuditDecision,
     AuditDetails,
@@ -163,6 +164,7 @@ from chorus.ports.storage import (
     StoredItem,
     TableName,
 )
+from chorus.privacy.canonical import hash_approval
 from chorus.privacy.compiler import POLICY_BUILD_HASH
 
 FIXTURE_UUID_NAMESPACE = UUID("6b9b7f4e-2a71-5a2f-9a06-2a3f0dbf4a11")
@@ -953,25 +955,38 @@ class World:
             created_at=NOW - timedelta(hours=4 - index),
         )
 
-    def approval(self, *, version: int = 1, consumed: bool = False) -> Approval:
+    def approval(self, *, version: int = 1) -> Approval:
+        """One ``approval/v2`` row: immutable, and sealed with its own real digest.
+
+        There is no ``consumed`` switch and no version to advance to. Consumption is the
+        execution reaching ``SENDING`` (ADR-023 SS 1), so the only legal write to this row is
+        the one that creates it -- and the digest is computed here rather than faked so a test
+        that recomputes it is checking the production authority.
+        """
+
         approved_at = NOW - timedelta(hours=3)
-        return Approval(
+        draft = Approval(
             approval_id=self.approval_id,
-            action_id=self.action_id,
+            namespace=self.namespace,
+            community_id=self.community_id,
             case_id=self.case_id,
+            action_id=self.action_id,
+            execution_id=self.execution_id,
             proposal_hash=digest(f"proposal:{self.seed}:0"),
             view_hash=digest(f"view:{self.seed}:0"),
-            approver_id=self.contributor_id,
+            authorization_version=1,
+            approver_id_hash=digest(f"approver:{self.seed}"),
+            approver_assurance=ApproverAssurance.DEMO_SHARED_TOKEN,
             decision=ApprovalDecision.APPROVED,
             approved_at=approved_at,
-            expires_at=approved_at + timedelta(hours=24),
-            consumed_at=approved_at + timedelta(minutes=5) if consumed else None,
-            approval_hash=digest(f"approval:{self.seed}"),
-            idempotency_key=f"approve-{self.seed}",
+            expires_at=approved_at + timedelta(minutes=15),
+            approval_hash=digest("placeholder"),
+            request_key_hash=digest(f"approve-key:{self.seed}"),
             version=version,
             created_at=approved_at,
             updated_at=approved_at + timedelta(minutes=version),
         )
+        return replace(draft, approval_hash=hash_approval(draft))
 
     def execution(
         self,
@@ -1000,6 +1015,9 @@ class World:
             view_hash=digest(f"view:{self.seed}:0"),
             idempotency_key=f"send-{self.seed}" if present["idempotency_key"] else None,
             state=state,
+            claim_owner_hash=(
+                digest(f"claim-owner:{self.seed}") if present["claim_owner_hash"] else None
+            ),
             rendered_message_hash=(
                 digest(f"rendered:{self.seed}") if present["rendered_message_hash"] else None
             ),

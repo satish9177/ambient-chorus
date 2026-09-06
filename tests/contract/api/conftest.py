@@ -84,6 +84,14 @@ class ApiHarness:
                 shareable=compile_harness.shareable,  # type: ignore[attr-defined]
                 from_identity_id=ACTION_FROM_IDENTITY_ID,
             ),
+            # Rebound with the compile world's own destination registry entry, because the
+            # approval's exact-equality configuration check compares against the deployment's
+            # current entry -- and the compile harness seeds a different one than the Monitor
+            # harness does.
+            approve_action=replace(
+                container.approve_action,
+                destination=compile_harness.stored_destination(),  # type: ignore[attr-defined]
+            ),
         )
 
 
@@ -134,6 +142,8 @@ def build_harness(
         read_mandate_thread=harness.read_mandate_thread,
         compile_view=harness.compile_view,
         read_current_action=harness.read_current_action,
+        approve_action=harness.approve_action,
+        invalidate_action=harness.invalidate_action,
         dispatcher=dispatcher,
     )
     app = build_app(container)

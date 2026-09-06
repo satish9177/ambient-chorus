@@ -48,7 +48,7 @@ Everything else is defence in depth or serves a different purpose:
 
 | Mechanism | What it actually prevents |
 |---|---|
-| **claim CAS** `APPROVED@v → SENDING` | two processes both proceeding to SES for one execution |
+| **claim CAS** `APPROVED@v → SENDING`, carrying the attempt's `claim_owner_hash` | two processes both proceeding to SES for one execution |
 | **never-resend-from-`SENDING`** | the *same* process, redelivered, calling SES a second time |
 | **one execution per action**, `attempt_number = 1`, no edge out of `SENT` | a second attempt for one approved message |
 | **send fence** (per case) | a mandate revocation and a send both believing they won |
@@ -64,6 +64,21 @@ SENT          -> 200 with the same message reference
 FAILED        -> 409 terminal; a fresh proposal and approval are required
 SEND_UNKNOWN  -> 409 quarantine; no retry endpoint exists
 ```
+
+**The claim must be proved by the row, not by the commit's own answer.** The repair pass found the one interleaving in which the paragraph above was false. Worker A commits the claim; worker B's claim transaction is *lost* rather than rejected --- an ambiguous transport outcome, which is the one thing a caller cannot distinguish from a write that landed. The unit of work resolves that by reading the plan's commit proof, and every Phase-8 send record is keyed on the **execution** (§ 12, domains 4 to 6) precisely so it is replay-safe regardless of who was invoked. So B read A's proof, correctly concluded that *the claim committed*, and incorrectly concluded that **it** had claimed. Two deliberate SES calls for one approved message.
+
+A shared proof answers "was this execution claimed". Only the second question --- "which attempt owns the claim" --- authorizes a sender, and no derivation the send path already had could answer it: `idempotency_key`, `ses_request_token_hash`, and all three send keys are pure functions of durable values, so two workers compute every one of them identically.
+
+`ActionExecution` therefore gains **`claim_owner_hash`**: minted per attempt before the claim, written in the same conditional write that moves the state, and required at `SENDING` onwards. Recovery then reads the durable execution strongly and compares:
+
+```text
+SENDING with this attempt's owner   -> this attempt claimed; it may continue
+SENDING with another owner          -> somebody else claimed; NEVER call SES
+APPROVED, no owner                  -> nothing committed; the same claim may be retried
+any terminal state                  -> the replay table forbids an SES call anyway
+```
+
+The comparison is made on **every** send rather than only on the ambiguous branch, at the cost of one strongly consistent get: a check that ran only where somebody remembered ambiguity was possible is a check the next change moves out from under.
 
 **Two concurrent send workers** therefore resolve to one SES call and one 202. **A duplicate Lambda delivery** of the same job resolves to the same, because the second delivery reads `SENDING` or a terminal state. Neither outcome depends on the fence.
 
@@ -107,12 +122,18 @@ Rendering is a pure function of immutable inputs with no side effect, so it can 
     REQUIRE rendered_message_hash == proposal.preview_hash
       -> mismatch is a definite pre-send failure: FAILED / STALE_AUTHORIZATION, no SES call
  5. ses_request_token_hash := the § 5 derivation
+5b. claim_owner_hash := § 7's derivation over a nonce minted for THIS attempt
  6. CLAIM  transaction C: APPROVED@v -> SENDING@v+1, writing rendered_message_hash,
-    ses_request_token_hash, started_at
- 7. AcquireSendAuthorizationFence   (the compiler performs full send-time revalidation)
+    ses_request_token_hash, claim_owner_hash, started_at
+6b. strong-read the execution; REQUIRE SENDING carrying THIS attempt's claim_owner_hash
+      -> another owner: no SES call, nothing written, answer from the durable row
+ 7. AcquireSendAuthorizationFence   (the compiler takes the fence and revalidates the
+    whole case side from inside it)
       -> DENY: transaction D, SENDING -> FAILED / STALE_AUTHORIZATION, no SES call
  8. require now < fence.expires_at, sampled again from the injected clock
  9. resolve the recipient from the destination-registry secret; assert exactly one
+9b. require now < fence.expires_at AGAIN, after every awaited resolution and after the
+    payload is built, with nothing between this sample and the call
 10. ONE ses:SendEmail
 11. persist the outcome: transaction E, D, or F
 12. ReleaseSendAuthorizationFence, in a finally
@@ -120,11 +141,21 @@ Rendering is a pure function of immutable inputs with no side effect, so it can 
 
 Step 4 is the invariant the phase exists for, and it is a comparison rather than a tautology only because the two digests have different owners and different moments ([ADR-022](ADR-022-action-draft-preview-and-transaction.md) § 2). It fires when the template version, the sending identity, or the destination routing has changed since approval, because all four are inside the digest.
 
+**Steps 6b and 9b are added by the Phase-8 repair pass**, and each closes a window the original order left open. 6b is § 1's claim-ownership proof. 9b exists because step 8's sample sits *before* two awaited registry lookups --- a destination resolution and an identity resolution, each of which reaches a secret store --- and a clock read that a later `await` can invalidate is not a check on the instant that matters. The fence expiry is `min(now + 60s, view.expires_at, approval.expires_at, earliest relied-on mandate expiry)`, so the single comparison at 9b is every frozen temporal boundary at once; checking them separately there would be four ways to spell one number, and the ways would drift.
+
+**The transport timeout is deliberately not changed.** An SES call that begins with five seconds of fence remaining can still be in flight when the fence lapses, because botocore's default read timeout is sixty seconds. Shortening it would not make the safety property stronger --- the property is about the *number of deliberate attempts*, which a timeout does not affect --- and it would make the system strictly worse: a read timeout is classified `SEND_UNKNOWN` (§ 8), so an aggressive one converts slow-but-successful sends into quarantines that no path may ever retry. What is pinned instead is that the read timeout does not *exceed* the fence's maximum life, so an in-flight request cannot outlive the window by more than the window itself, and that the connect timeout is short, because a failed connection is a **definite** non-send. § 5's mirror ordering already records the residual: once an attempt has started, the message cannot be recalled.
+
 Step 2's expiry checks and step 8's clock re-read exist for the reason [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md) already gives about the proposal's second clock sample: **expiry is the one freshness fact no storage condition can express**, because the passage of time mutates no row.
 
 ### 4. Send-time authorization: what is checked, by whom, and what must not be
 
 The sender has no Core access, so it cannot check the case at all. The case-side checks are the **compiler's**, inside fence acquisition, which is why that operation exists and why it takes a request rather than an execution ID.
+
+**The order inside that operation is: take the fence, *then* revalidate.** The Phase-8 repair pass found the race the other order leaves. Authorization is validated; a contributor's revocation commits; the fence is then acquired, and acquisition checks only the fence. Neither half saw the revocation --- the validation had already run, and the acquisition was never looking --- and the message went out under a mandate that had been withdrawn. Reproduced end to end: mandate `REVOKED`, case `INVESTIGATING`, execution `SENT`, one SES call.
+
+Acquisition is not a decision; it establishes the sixty-second ordering window in which a decision may be made. While the fence is live every authorization-sensitive Core mutation fails its `ConditionCheck`, so nothing the revalidation reads can move underneath it. A denial releases the fence immediately, and so does an integrity failure raised inside the revalidation, so a refused send holds the case for exactly the duration of its own reads rather than for sixty seconds of somebody else's authority.
+
+The **sender's** boundary is unchanged by this and must stay so: both halves of the fence and every check below are reached through `chorus.ports.send_authorization.SendAuthorizationPort`, which a deployed sender satisfies with an `lambda:InvokeFunction` adapter against the compiler and no Core handle of any kind (§ 16).
 
 `SendAuthorizationRequest`, frozen:
 
@@ -225,9 +256,18 @@ so binding the opaque ID in `preview_hash` binds the whole letterhead — sender
 
 **No third digest is introduced over the wire payload.** `rendered_message_hash` is the preview digest recomputed at send time, and it is that precisely so it is comparable to something a human approved. A hash of the SES request would be comparable to nothing, and it would be a second version of the truth about bytes the first one already fixes.
 
-### 7. The two derived values
+### 7. The three derived values
 
 ```text
+claim_owner_hash = hash_value({
+    "domain": "send-claim-owner/v1",
+    "namespace": namespace,
+    "action_id": action_id,
+    "execution_id": execution_id,
+    "claim_nonce": <a UUID minted for THIS attempt, before the claim>,
+    "attempt_number": 1,
+})
+
 ses_request_token_hash = hash_value({
     "domain": "ses-request-token/v1",
     "namespace": namespace,
@@ -244,7 +284,9 @@ execution_tag = the 64 lowercase hex characters of hash_value({
 })
 ```
 
-Both are deterministic functions of durable values, so a recovery path can recompute either without having stored it. The tag is **bare hex with no `sha256:` prefix**, because SES email-tag values admit only `[A-Za-z0-9_-]` and a colon would be rejected at the API — a detail worth freezing rather than discovering at the first live send.
+`claim_owner_hash` is the odd one out and deliberately so: it is the **only** derivation on this path that is not recomputable from durable state, because a value two racing workers could both compute cannot distinguish them. The nonce is minted per attempt and hashed rather than stored raw, for the reason every other identifier on a Shareable row is: what is persisted proves a match and is never a value that could be presented as a credential.
+
+The other two are deterministic functions of durable values, so a recovery path can recompute either without having stored it. The tag is **bare hex with no `sha256:` prefix**, because SES email-tag values admit only `[A-Za-z0-9_-]` and a colon would be rejected at the API — a detail worth freezing rather than discovering at the first live send.
 
 `ses_request_token_hash` is a correlation value and **is not treated as an SES deduplication token**, because SES `SendEmail` offers no such guarantee. Writing it into the row before the call is what lets an operator tie a CloudTrail entry to an execution when nothing else can.
 
@@ -298,7 +340,26 @@ Consequences, enumerated for every case the phase must handle:
 | `SEND_UNKNOWN` | `SENT` | positive evidence: an SES configuration-set event whose configuration set is the deployment's, whose `chorus_execution` tag equals the recomputed § 7 tag for this exact execution, and which carries a message ID |
 | `SEND_UNKNOWN` | `FAILED` | positive evidence that SES never accepted: an SES event, or an operator attestation recorded with its own reason code |
 
-Its two callers are the **application worker**, which invokes it when a replay finds an execution in `SENDING` past the window, and an **operator route** for the reconciliation an event supplies. Nothing invokes it on a timer, and `SENDING → SEND_UNKNOWN` never happens as a side effect of a read.
+Its two callers are the **application worker**, which invokes it when a replay finds an execution in `SENDING` past the window, and the **trusted configuration-set event path**, which is the only thing that can supply the positive evidence the second and third rows require. Nothing invokes it on a timer, and `SENDING → SEND_UNKNOWN` never happens as a side effect of a read.
+
+**The second caller is an event boundary and not an HTTP route, and the Phase-8 repair pass is where that was settled.** An earlier draft of this section said "operator route", which § 15's frozen API surface never contained and [08-api-design.md](../architecture/08-api-design.md) § Endpoint summary never listed. The two documents disagreed, and the missing route was the better-specified one: a `SEND_UNKNOWN → SENT` edge needs an SES message identifier, and a message identifier is a value **only SES can produce**. An endpoint accepting `{configuration_set, execution_tag, message_id}` from its caller would be an endpoint through which anybody holding the demo token resolves a quarantine by typing three strings --- T35 with the forger handed the pen.
+
+**Trusted evidence is defined as follows.** It is a configuration-set event notification delivered by SES itself through the deployment's own event destination. Every field of the resulting evidence is read out of that envelope and none of it is caller-supplied: the configuration set comes from the event's `ses:configuration-set` tag, the execution tag from its `chorus_execution` tag, the identifier from `mail.messageId`, and acceptance from an enumerated `eventType` --- `Send` and `Delivery` prove SES took the message, `Rendering Failure` proves it never queued anything, and every other type is refused rather than interpreted. Cross-execution replay is refused by the § 7 tag derivation, which is recomputable for the execution being reconciled and matches exactly one.
+
+**Structure is not provenance, and the second repair pass is where that was settled.** Everything in the paragraph above describes what an envelope *says* and how it *correlates*; none of it establishes where the envelope came from. The gap was reproduced: a caller-built `Delivery` envelope naming the right configuration set, carrying the recomputed § 7 tag and an invented `mail.messageId`, decoded cleanly, correlated cleanly, and moved a quarantined row to `SENT` under the invented identifier. Every check had done its job. None of them was ever about origin.
+
+The boundary is therefore two halves that are never the same object, over one process-local attestation key:
+
+| Half | Held by | Can |
+|---|---|---|
+| attester | the SES event adapter, and nothing else | require an authenticated transport, require this deployment's own event destination, decode, and **mint** attested evidence |
+| verifier | `ReconcileSendOutcome` | **check** an attestation, and nothing more |
+
+The order inside the attester is fixed: authenticate the transport, *then* decode. Decoding first would mean a forged envelope had already been interpreted by the time anybody asked where it came from. `SEND_UNKNOWN → SENT` accepts only the attested wrapper, so a caller-built mapping, a caller-built evidence object, a wrapper edited after minting, and evidence from another deployment's boundary are all refused under `UNATTESTED_EVIDENCE` before any state is read. Authentication and correlation remain two separate questions and both are still asked --- a genuine event about another execution is still refused by the § 7 tag.
+
+**Phase 8 owns the boundary; Phase 11 owns the subscription that feeds it** --- the event destination on the `chorus-{environment}` configuration set and the authenticated transport that carries the notification --- which is the same static-now, live-in-Phase-11 split as the sender function, its role, and the configuration set itself (§ 16). Concretely, Phase 11 owes exactly one object: a `SesEventTransportAuthenticator` over the transport it builds. **Phase 8 implements none**, and that absence is deliberate --- a permissive stand-in would be indistinguishable at the call site from a real one. With no authenticator there is no attester, with no attester no evidence, and with no evidence a `SEND_UNKNOWN` row stays `SEND_UNKNOWN`, which § 9 already names as the correct outcome. The evidence-free `SENDING → SEND_UNKNOWN` path is unaffected and still works in a deployment with no event transport at all.
+
+An **operator attestation** remains on the command and remains sufficient for `SEND_UNKNOWN → FAILED` only, because a person can responsibly say something did not happen and cannot produce a message identifier. It has no V1 transport, and giving it one is Phase-11 work alongside the operator surface that would carry it.
 
 `SEND_UNKNOWN → SENT` and `→ FAILED` already require `reconciliation_proof` in `chorus.domain.state.transition_action_execution`; this ADR is what the flag means. A message ID that disagrees with one already recorded is an `IntegrityError` and never an overwrite — monotonic presence refuses the rewrite, and a **forged or tampered SES message ID is therefore, at worst, a rejected reconciliation**, never a silent replacement of a recorded outcome. Uncertainty remains unknown indefinitely rather than being resolved by anything short of proof.
 
@@ -422,9 +483,9 @@ Bodies are closed (`extra='forbid'`). The execute body is `{execution_id, expect
 
 ### 16. Deployment ownership
 
-Phase 8 **owns and synthesizes**: the approval, invalidation, send, reconciliation, and projection commands; `functions/sender` and its composition root; the SES and destination-registry adapters and their local fakes; the configuration-set event reconciliation path; the API routes; the sender role, its log group, the SES configuration set, and the CDK template and IAM assertions.
+Phase 8 **owns and synthesizes**: the approval, invalidation, send, reconciliation, and projection commands; `functions/sender` and its composition root; the SES and destination-registry adapters and their local fakes; the configuration-set event reconciliation path --- meaning the decode-and-verify boundary of § 10, not the subscription that feeds it; the compiler-invocation send-authorization adapter and the port both implementations satisfy; the API routes; the sender role, its log group, the SES configuration set, and the CDK template and IAM assertions.
 
-Phase 8 **does not deploy to AWS**. The deployed sender function, the live SES send, the verified-identity and sandbox prerequisites, and the post-deploy sender IAM and SES canaries belong to **Phase 11**, which is the same static-now, live-in-Phase-11 split already used for the three agent runtimes and for the compiler, and for the same reason: an identity and a policy can be asserted from a synthesized template long before the resource exists, while a canary proving an `AccessDenied` cannot exist without a deployment.
+Phase 8 **does not deploy to AWS**. The deployed sender function, the live SES send, the verified-identity and sandbox prerequisites, the configuration-set **event destination** and the transport that carries its notifications, any operator surface for an attestation, and the post-deploy sender IAM and SES canaries belong to **Phase 11**, which is the same static-now, live-in-Phase-11 split already used for the three agent runtimes and for the compiler, and for the same reason: an identity and a policy can be asserted from a synthesized template long before the resource exists, while a canary proving an `AccessDenied` cannot exist without a deployment.
 
 In `test` and `development` the sender writes to a filesystem outbox and makes no network call, as [02-trust-iam-deployment-configuration.md](../architecture/02-trust-iam-deployment-configuration.md) § Environment behavior already requires. The one-attempt rule, the claim CAS, the classification table, and the fence apply identically there, so the ambiguous paths are exercised without SES.
 
@@ -454,12 +515,15 @@ And exactly-once delivery becomes at-most-one deliberate attempt, which is what 
 
 - `chorus.application.commands` gains `approve_action`, `invalidate_action`, `send_action`, `reconcile_send_outcome`, and `project_action_outcome`; `chorus.application.services.send_fence` gains the `SendAuthorizationRequest` revalidation of § 4, which Phase 6 deliberately left absent.
 - `functions/sender` is introduced with a composition root and the same import scan the compiler artifact has: no Strands, no Bedrock client, no agent contract, no scheduler, and no private domain type.
-- `ActionExecution.failure_detail_safe` gains a row in [ADR-022](ADR-022-action-draft-preview-and-transaction.md) § 1's presence table — `OPTIONAL` at `FAILED` and `SEND_UNKNOWN`, `ABSENT` everywhere else — closing the one field the table did not govern.
+- `ActionExecution.failure_detail_safe` gains a row in [ADR-022](ADR-022-action-draft-preview-and-transaction.md) § 1's presence table — `OPTIONAL` at `FAILED` and **`ABSENT` everywhere else, `SEND_UNKNOWN` included**. The first freeze made it optional at `SEND_UNKNOWN` too, which cannot hold: presence is monotonic and `SEND_UNKNOWN → SENT` is a legal edge whose target has the field absent, so a quarantined row that exercised the option could never be reconciled. An option only one value is reachable from is not an option, and the production code was already declining to write one. The unknown reason is carried by the `action.send.unknown` audit event.
+- `ActionExecution` gains `claim_owner_hash`, required from `SENDING` onwards and optional at `FAILED`; `action-execution/v2` becomes `/v3` and the codec accepts no earlier version.
+- `chorus.ports.send_authorization` is added, holding `SendAuthorizationRequest`, the two outcome shapes, and `SendAuthorizationPort`. `SendAction.authorization` is typed on the port, the in-process `SendAuthorization` is the local implementation, and `chorus.infrastructure.compiler.send_authorization.CompilerSendAuthorization` is the deployed one. The deployed composition constructs **no** `CoreRepository`, which a static test asserts by walking the object graph.
 - `OperationDispatchPort` gains `dispatch_send_action`; `SendActionOperationJob` carries no agent handover, because `SEND_ACTION` invokes no agent and an operation of that kind holding one is refused at construction ([ADR-016](ADR-016-agent-operation-handover-identity.md)).
 - [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md)'s pipeline diagram is corrected to the § 3 order; its § Idempotency and ambiguous sends gains the § 9 safety statement in place of any exactly-once reading.
 - [06-persistence-and-evidence.md](../architecture/06-persistence-and-evidence.md) § Transaction boundaries' "Begin send" bullet is replaced by shapes C through G with their fixed counts.
 - New failure-matrix rows for the classification table's five outcomes, for a `preview_hash`/`rendered_message_hash` mismatch at step 4, and for a reconciliation whose message ID disagrees with one already recorded.
 - Threat register gains **T34** (an ambiguous send resolved by resending, producing a duplicate external message) and **T35** (a forged configuration-set event reconciling a `SEND_UNKNOWN` to `SENT`), both mitigated above.
+- The Phase-8 repair regression suite adds, at minimum: an ambiguous claim after a foreign commit making exactly one SES call; an ambiguous claim that did not commit resuming safely; a foreign claim owner never sending; a real `DecideMandate(REVOKE)` landing between the claim and the fence and denying; the mirror ordering still refusing a revocation under a live fence; a destination or identity resolution crossing the fence expiry with zero SES calls; a `SENT` execution whose projection failed being repaired by a worker replay with zero SES calls; a committed approval whose completion write was lost replaying; a sending identity or template version moving before approval being refused; a send over the compiler-invocation boundary with no Core handle; a genuine SES event about another execution being refused; and `SEND_UNKNOWN → SENT` remaining legal with `failure_detail_safe` absent.
 - Named tests gain `test_render_precedes_claim_so_sending_can_carry_its_required_hashes`, `test_rendered_hash_mismatch_fails_before_ses`, `test_claim_cas_admits_exactly_one_of_two_workers`, `test_no_ses_call_is_made_from_sending_on_redelivery`, `test_unlisted_ses_exception_classifies_as_send_unknown`, `test_send_unknown_releases_the_fence_and_revocation_proceeds`, `test_reconciliation_rejects_a_disagreeing_message_id`, and `test_send_transaction_participant_counts_are_three_three_and_four`.
 
 ## Revisit condition

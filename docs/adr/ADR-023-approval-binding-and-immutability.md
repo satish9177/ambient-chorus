@@ -128,11 +128,17 @@ An approval decision is validated against strong reads, before anything is stage
 | 6 | the bound view loads, `view_hash` matches the body and the proposal, and `now < view.expires_at` | 409 `STALE_AUTHORIZATION` |
 | 7 | current deployment configuration equals the proposal's by exact equality: `policy_version`, `compiler_version`, `policy_build_hash`, `template_version`, `from_identity_id`, and the destination's `destination_id`, `kind`, `registry_version`, `routing_token`, and `display_label` | 409 `STALE_AUTHORIZATION` |
 
+| 7b | the preview regenerated under current configuration reproduces `proposal.preview_hash` exactly | 409 `STALE_AUTHORIZATION` |
+
+**Check 7b is added by the Phase-8 repair pass, and it is the only way two of the values § 3 binds can be checked at all.** `from_identity_id` and `template_version` are bound *transitively*, through `preview_hash`, and are therefore on no stored row: not on the view, not on the pointer, not on the case. Check 7 compares the view against the deployment and structurally cannot reach either of them, so an approval made after a sending-identity rotation or a template bump passed every check here and was refused later by the send fence --- which is precisely the outcome check 7 exists to prevent.
+
+A transitive binding is verified by **recomputation**, never by comparing fields copied off the proposal: the copy would be the proposal agreeing with itself. So the approval re-renders the proposal under the deployment's current `{from_identity_id, template_version}` and requires the same digest --- the same comparison [ADR-025](ADR-025-one-deliberate-ses-attempt.md) § 3 step 4 makes at send time, run at the moment a human is being asked to commit. A template version the renderer no longer recognises is the same answer as a different digest, and is refused rather than raised.
+
 Check 7 is the same list [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md) check 2 applies at proposal time, and it is here for the same reason [ADR-020](ADR-020-case-authorization-version.md) § 3 gives: these are deployment-owned, they are not in `authorization_version`, and a verified `proposal_hash` proves the old values are internally coherent rather than still current. Refusing at approval is strictly kinder than letting a human approve a message the send fence will refuse.
 
 **Note what is deliberately absent.** The approval does not check the case's OCC `version` against the proposal's recorded `case_version`. Lifecycle progression moved that number on purpose, and requiring it here would reproduce at approval time the deadlock [ADR-020](ADR-020-case-authorization-version.md) removed from send time.
 
-**None of checks 3 to 7 applies to a `REJECTED` decision.** A human must always be able to say no. Rejecting a proposal that has gone stale is the correct response to a proposal that has gone stale, and a reject path that could be blocked by staleness would leave a case with a proposal nobody can approve and nobody can clear. Rejection runs checks 1, 2, and 4 only.
+**None of checks 3 to 7b applies to a `REJECTED` decision.** A human must always be able to say no. Rejecting a proposal that has gone stale is the correct response to a proposal that has gone stale, and a reject path that could be blocked by staleness would leave a case with a proposal nobody can approve and nobody can clear. Rejection runs checks 1, 2, and 4 only.
 
 ### 6. The one-decision boundary is the execution's row version
 
@@ -143,6 +149,29 @@ Check 7 is the same list [07-action-ses-and-commitments.md](../architecture/07-a
 Two approvals race: one wins, the other is 409. An approval races a rejection: one wins, the other is 409. A replay under the same `Idempotency-Key` and request hash replays the recorded answer and writes nothing. A second, *different* decision under a *different* key is a conflict, not a correction.
 
 The approval row itself is create-only under `APPROVAL#{approval_id}`, which prevents a decision from being overwritten; it is not, and never was, what prevents a second decision from being made.
+
+### 6b. A committed decision whose receipt was lost is recovered, never re-decided
+
+Added by the Phase-8 repair pass. The command writes two idempotency records and can only write them in one order: the transaction's own commit proof (domain 2), then the caller's HTTP receipt (domain 1). A crash between them leaves the decision durable and the receipt `IN_PROGRESS` --- and the identical retry the caller is told to make used to fall straight through to the checks, find the execution no longer `DRAFT`, and answer `EXECUTION_NOT_DRAFT`. A human was told their approval had failed while it sat committed one row away, and the case was left holding an `APPROVED` execution nobody believed in.
+
+An `IN_PROGRESS` receipt is therefore resolved by **reading** domain 2's proof before anything is decided again:
+
+| Domain-2 proof | Meaning | Answer |
+|---|---|---|
+| absent | the transaction did not commit | run the checks again; the execution is still `DRAFT@1` and the frozen safe retry applies |
+| present, same request hash | the decision committed | verify the approval's own digest and its bindings, finish domain 1, and replay the recorded answer |
+| present, different request hash | a different decision under one key | conflict, never a correction |
+
+No branch creates a second `Approval` and no branch re-attempts the `DRAFT` compare-and-swap; both would be a second decision, and there was only ever one. The proof says a transaction committed, not that the rows it names are intact, so recovery recomputes `approval_hash` and re-checks the case, action, execution, and decision bindings before answering --- a proof that points at an approval which no longer verifies fails closed.
+
+**A proof says a transaction committed. It does not say which rows, and the second repair pass is where that was settled.** The first version of this recovery verified the *requested* execution: it loaded `command.execution_id`, checked it, and answered. That check cannot see the failure it needed to. Corrupt only the domain-2 proof's `ACTION_EXECUTION` reference so it names a different execution in the same action partition, and the retry replays the proof, loads the row the **proof** names, returns the foreign execution, and finishes domain 1 with the foreign reference --- while the requested row, being intact, passes every check made about it. Reproduced on both the in-memory and DynamoDB Local drivers.
+
+Recovery therefore compares the proof against the request, in two stages, and never a row against itself:
+
+1. **Before any row is read** --- the reference set must be exactly one `APPROVAL` and one `ACTION_EXECUTION`, and the execution it names must be the requested one. Reading first would mean the foreign row had already been returned.
+2. **Before domain 1 is finished** --- the artifacts the proof named are loaded (the approval it names, the immutable proposal that approval binds, and the execution the proof replayed) and required to agree with each other and with the request on every one of: `namespace`, `community_id`, `case_id`, `action_id`, the requested `execution_id`, the `approval_id` the proof names, `decision`, `request_key_hash`, `approver_id_hash`, the recomputed `approval_hash`, `proposal_hash`, `view_hash`, `authorization_version`, the execution identity returned by the replay, and the execution's own `approval_id` for an `APPROVED` decision.
+
+The proof's recorded execution version is compared against `expected_execution_version + 1` --- what *this request's* decision must have produced --- and never against the live row, which is free to have advanced to `SENDING` before the retry arrives. Any disagreement is an `IntegrityError` under a closed reason code, domain 1 stays `IN_PROGRESS`, and no receipt is completed. Two comparisons are deliberately skipped for a `REJECTED` decision, for the reason § 5 already gives: checks 3 and 5 never ran for it, so requiring the approval's bound digests to equal the caller's would refuse a recovery the original decision was entitled to make.
 
 ### 7. A human cannot edit text, and a stale tab cannot approve
 
@@ -206,7 +235,8 @@ It also keeps the boundary [ADR-003](ADR-003-action-runtime-isolation.md) and [A
 - `POST /v1/cases/{case_id}/actions/{action_id}/invalidation` is added to [08-api-design.md](../architecture/08-api-design.md) § Endpoint summary, role `case approver`, guard "current pointer `DRAFT`; execution `DRAFT`, `APPROVED`, or terminal `FAILED`".
 - The approval request body is frozen as `{decision, expected_execution_version, execution_id, view_hash, proposal_hash, preview_hash}`. `expected_action_status` is retired: it named a status where the transaction conditions on a row version, and two ways to say "the thing I saw" is one too many.
 - [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md)'s "Rejection leaves the case `ACTION_PROPOSED`" sentence is replaced by § 8 and § 9 above.
-- New failure-matrix rows: an approval whose deployment configuration moved since the proposal; a rejection of a stale proposal, which succeeds; a withdrawal that loses the race to a sender claim; and an invalidation attempted against `SENDING`, `SENT`, or `SEND_UNKNOWN`.
+- `ApprovalDenial` gains `PREVIEW_BINDING_MOVED` for check 7b, distinct from `DEPLOYMENT_CONFIGURATION_MOVED` because the two check different things in different places: one compares the stored view against the deployment, the other regenerates a digest.
+- New failure-matrix rows: an approval whose deployment configuration moved since the proposal; an approval whose regenerated preview no longer matches, because the sending identity or the template version moved; an approval that committed and whose completion write was lost, which an identical retry replays; a rejection of a stale proposal, which succeeds; a withdrawal that loses the race to a sender claim; and an invalidation attempted against `SENDING`, `SENT`, or `SEND_UNKNOWN`.
 - Threat register gains **T32**: an approval artifact whose digest no longer verifies after a legal write, making integrity checks unenforceable — mitigated by an immutable approval and an omit set covering only row bookkeeping.
 - Named tests gain `test_approval_hash_survives_every_legal_later_write`, `test_second_decision_on_one_draft_conflicts`, `test_stale_tab_cannot_approve_a_replaced_proposal`, `test_rejection_of_a_stale_proposal_succeeds`, `test_withdrawal_and_send_claim_race_has_exactly_one_winner`, and `test_invalidation_after_definite_send_failure_frees_the_case`.
 

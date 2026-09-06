@@ -18,8 +18,11 @@ from uuid import UUID
 
 from chorus.domain.entities import ApplicationOperation
 from chorus.domain.ids import (
+    ActionId,
+    ApprovalId,
     CaseId,
     CommunityId,
+    ExecutionId,
     Namespace,
     OperationId,
     Sha256Digest,
@@ -130,6 +133,41 @@ class ProposeActionOperationJob:
             raise ValueError("a proposal job names the key its operation was started under")
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SendActionOperationJob:
+    """One send attempt, addressed by identity and version alone.
+
+    It carries **no agent handover**, because ``SEND_ACTION`` invokes no agent and an operation
+    of that kind holding one is refused at construction (ADR-016). What binds this job to its
+    operation is the ordinary set -- kind, namespace, operation identity, actor hash, and
+    request hash -- and what prevents a duplicate SES call is not the binding at all: it is the
+    execution's own ``APPROVED@v -> SENDING@v+1`` compare-and-swap.
+
+    It names no recipient, no subject, no body, and no retry flag. A redelivery of this job is
+    safe by construction: the worker's first act is to read the execution, and every state but
+    ``APPROVED`` forbids an SES call outright.
+    """
+
+    operation_id: OperationId
+    namespace: Namespace
+    community_id: CommunityId
+    case_id: CaseId
+    action_id: ActionId
+    execution_id: ExecutionId
+    approval_id: ApprovalId
+    correlation_id: UUID
+    actor_id_hash: Sha256Digest
+    request_hash: Sha256Digest
+    expected_execution_version: int
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        if self.expected_execution_version < 1:
+            raise ValueError("a send job names a positive execution version")
+        if not self.idempotency_key:
+            raise ValueError("a send job names the key its operation was started under")
+
+
 class OperationDispatchPort(Protocol):
     """Hand one job to whatever executes work outside the caller's request."""
 
@@ -146,6 +184,16 @@ class OperationDispatchPort(Protocol):
 
     async def dispatch_propose_action(self, job: ProposeActionOperationJob) -> None:
         """Deliver the proposal job at least once, with the same guarantees."""
+
+    async def dispatch_send_action(self, job: SendActionOperationJob) -> None:
+        """Deliver the send job at least once.
+
+        At-least-once remains the contract here too, and it is safe for a *stronger* reason
+        than elsewhere: a repeated delivery reads the execution before anything else, and the
+        frozen replay table permits an SES call from exactly one state. A duplicate delivery
+        therefore makes zero SES calls rather than relying on this dispatcher to promise
+        something it cannot.
+        """
 
 
 class InvestigationJobRunner(Protocol):
@@ -170,6 +218,19 @@ class ProposeActionJobRunner(Protocol):
         the other two runners do: an at-least-once dispatcher must never be told to retry an
         agent invocation implicitly -- and here a second invocation would write a second
         candidate message for one case.
+        """
+
+
+class SendActionJobRunner(Protocol):
+    """Execute one send job to a terminal operation status."""
+
+    async def execute(self, job: SendActionOperationJob) -> ApplicationOperation:
+        """Run the job and return the operation as it now stands.
+
+        Implementations record failure on the operation rather than raising, for the same
+        reason the agent runners do -- and here the stakes are higher: an exception escaping
+        into an at-least-once dispatcher reads as "retry me", and a retry of a send whose
+        outcome is unknown is the one thing this phase must never do.
         """
 
 

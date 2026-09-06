@@ -42,6 +42,7 @@ _logger = logging.getLogger(LOGGER_NAME)
 
 SERVICE_API: Final = "chorus-api"
 SERVICE_WORKER: Final = "worker"
+SERVICE_SENDER: Final = "sender"
 SERVICE: Final = SERVICE_API
 """The service names the frozen observability table permits for Phase 3.
 
@@ -126,6 +127,16 @@ class EventName:
     SEND_FENCE_ACQUIRED: Final = "send.fence.acquired"
     SEND_FENCE_DENIED: Final = "send.fence.denied"
     SEND_FENCE_RELEASED: Final = "send.fence.released"
+
+    APPROVAL_RECORDED: Final = "approval.recorded"
+    APPROVAL_CONFLICT: Final = "approval.conflict"
+
+    EXECUTION_SENDING: Final = "execution.sending"
+    EXECUTION_CLAIM_NOT_OWNED: Final = "execution.claim.not_owned"
+    EXECUTION_SENT: Final = "execution.sent"
+    EXECUTION_FAILED: Final = "execution.failed"
+    EXECUTION_UNKNOWN: Final = "execution.unknown"
+    EXECUTION_RECONCILED: Final = "execution.reconciled"
 
 
 def _emit(
@@ -1219,4 +1230,262 @@ def send_fence_released(
         entity_type="SEND_FENCE",
         entity_id=execution_id,
         outcome="SUCCEEDED",
+    )
+
+
+def approval_recorded(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    execution_id: UUID,
+    decision: str,
+    proposal_hash: Sha256Digest,
+    view_hash: Sha256Digest,
+    preview_hash: Sha256Digest,
+) -> None:
+    """Record one human decision, by hash and identifier only.
+
+    The approver appears as ``actor_id_hash`` and can never be read as naming a person: the
+    demo mechanism identifies that somebody holding the shared token asserted the approver
+    persona, and a log line that implied more would be a claim the system cannot support.
+    """
+
+    _emit(
+        EventName.APPROVAL_RECORDED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        entity_type="ACTION_EXECUTION",
+        entity_id=execution_id,
+        outcome=decision,
+        proposal_hash=proposal_hash,
+        view_hash=view_hash,
+        preview_hash=preview_hash,
+    )
+
+
+def approval_conflict(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record a decision that lost the one-decision compare-and-swap, or arrived stale."""
+
+    _emit(
+        EventName.APPROVAL_CONFLICT,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        outcome="CONFLICT",
+        reason_codes=reason_codes,
+    )
+
+
+def send_fence_denied(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    execution_id: UUID,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record that send authorization was refused before any SES call could be made.
+
+    ``WARNING`` for the same reason a refused release is: an approved message that cannot be
+    sent is a state a human is waiting on, and the reason codes are what tell them which
+    repair -- recompile, re-propose, reapprove -- is the one they need.
+    """
+
+    _emit(
+        EventName.SEND_FENCE_DENIED,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        entity_type="ACTION_EXECUTION",
+        entity_id=execution_id,
+        outcome="DENIED",
+        reason_codes=reason_codes,
+    )
+
+
+def execution_sending(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    execution_id: UUID,
+    proposal_hash: Sha256Digest,
+    preview_hash: Sha256Digest,
+) -> None:
+    """Record the claim: this execution, and no other process, may now call SES once.
+
+    ``preview_hash`` is emitted because the claim happens *after* the rendered digest was
+    compared against it, so this line is the durable trace that the approved-equals-sent
+    comparison passed before anything was consumed.
+    """
+
+    _emit(
+        EventName.EXECUTION_SENDING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="ACTION_EXECUTION",
+        entity_id=execution_id,
+        outcome="CLAIMED",
+        proposal_hash=proposal_hash,
+        preview_hash=preview_hash,
+    )
+
+
+def execution_claim_not_owned(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    execution_id: UUID,
+) -> None:
+    """Record a delivery that lost an ambiguous claim and therefore made **no** SES call.
+
+    Emitted at ``WARNING`` because it is rare and because it is the line an operator needs when
+    two workers raced one approved message: it says, in one place, that a second sender read
+    durable state, found the claim held by another attempt, and stopped.
+    """
+
+    _emit(
+        EventName.EXECUTION_CLAIM_NOT_OWNED,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="ACTION_EXECUTION",
+        entity_id=execution_id,
+        outcome="CLAIM_NOT_OWNED",
+    )
+
+
+def execution_sent(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    execution_id: UUID,
+    preview_hash: Sha256Digest,
+) -> None:
+    """Record an accepted send. The SES message identifier is never logged beside the body.
+
+    There is no body to log: neither rendered body is persisted anywhere, and the frozen
+    observability table forbids the subject, either body, a claim, a caveat, a recipient
+    address, or a reply-to address from reaching a log line.
+    """
+
+    _emit(
+        EventName.EXECUTION_SENT,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="ACTION_EXECUTION",
+        entity_id=execution_id,
+        outcome="SENT",
+        preview_hash=preview_hash,
+    )
+
+
+def execution_failed(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    execution_id: UUID,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record a definite failure: proof exists that this message was not queued."""
+
+    _emit(
+        EventName.EXECUTION_FAILED,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="ACTION_EXECUTION",
+        entity_id=execution_id,
+        outcome="FAILED",
+        reason_codes=reason_codes,
+        retryable=False,
+    )
+
+
+def execution_unknown(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    execution_id: UUID,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record an ambiguous outcome. ``ERROR``, because a human has to look at this one.
+
+    It is the alarmed residual the whole phase is honest about: the message may have been
+    delivered, and nothing will resend it. A quieter level would make the one state that
+    needs a person look like the two that do not.
+    """
+
+    _emit(
+        EventName.EXECUTION_UNKNOWN,
+        level=logging.ERROR,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="ACTION_EXECUTION",
+        entity_id=execution_id,
+        outcome="SEND_UNKNOWN",
+        reason_codes=reason_codes,
+        retryable=False,
+    )
+
+
+def execution_reconciled(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    execution_id: UUID,
+    outcome: str,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record that durable classification moved on proof, without any SES call."""
+
+    _emit(
+        EventName.EXECUTION_RECONCILED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="ACTION_EXECUTION",
+        entity_id=execution_id,
+        outcome=outcome,
+        reason_codes=reason_codes,
     )

@@ -84,13 +84,18 @@ def test_no_shareable_item_carries_private_text(name: str) -> None:
         assert private not in text
 
 
-# The frozen model deliberately stores two private identifiers in the Shareable table:
-# `Approval.approver_id` (docs/architecture/04, "Approver identity is operationally
-# sensitive and not sent externally") and `Commitment.source_evidence_id` /
-# `verified_by_contributor_id` (same document, Commitment). Both are withheld from the
-# outbound artifact by the renderer, not by the table. Everything else that feeds an
-# external send must carry no private lineage at all.
-ITEMS_WITH_FROZEN_PRIVATE_REFERENCES = frozenset({"APPROVAL", "COMMITMENT"})
+# One Shareable item still stores private identifiers: `Commitment.source_evidence_id` and
+# `verified_by_contributor_id` (docs/architecture/04, Commitment). They are withheld from the
+# outbound artifact by the renderer, not by the table. Everything else that feeds an external
+# send must carry no private lineage at all.
+#
+# `APPROVAL` **left this list in Phase 8**, and its departure is a real narrowing rather than a
+# bookkeeping change. `approval/v1` stored `approver_id: ContributorId`; `approval/v2` stores
+# `approver_id_hash` instead (ADR-023 SS 4), because a contributor is a counted thing --
+# corroboration, independence grouping, and mandate ownership are all defined over contributors
+# -- and the approver is a persona that owns no fact and no report. The row now names no private
+# identity at all, so the exception it needed is gone.
+ITEMS_WITH_FROZEN_PRIVATE_REFERENCES = frozenset({"COMMITMENT"})
 
 EXTERNALLY_BOUND_ITEMS = frozenset(shareable_items()) - ITEMS_WITH_FROZEN_PRIVATE_REFERENCES
 

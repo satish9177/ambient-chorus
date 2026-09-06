@@ -101,6 +101,10 @@ Every grant, and every deny, in one place. `dynamodb:UpdateItem` appears nowhere
 
 The Core deny is total rather than absent. The sender resolves its recipient from an allowlisted registry in configuration; it has no reason to read a case, a fact, a mandate, or the fence row, and it acquires the fence by invoking the compiler's typed operation rather than by touching the item.
 
+**That deny has to be satisfiable by the code, and the Phase-8 repair pass found that it was not.** The sender's composition root built a `CoreRepository` and an in-process `SendAuthorization` for the deployed composition as well as the local one — an object graph that works against local storage and returns `AccessDenied` in an account, so the synthesized component could not perform its own send-time authorization at all. Nothing caught it because no test runs without Core.
+
+The boundary is now a port. `chorus.ports.send_authorization.SendAuthorizationPort` has two methods — acquire-with-revalidation, and release — and two implementations: the in-process one for `test` and `development`, where there is no Lambda boundary to cross, and `CompilerSendAuthorization` for a deployed sender, which holds the `lambda:InvokeFunction` grant above and **no repository, table name, or storage driver of any kind**. A static test walks the constructed object graph and fails if a deployed composition reaches a Core handle anywhere in it, which is the assertion that makes this row of the trust matrix true rather than aspirational.
+
 ### 4. The application also writes executions, and that is not a widening
 
 `APPLICATION_SHAREABLE_PREFIXES` gains `NS#*#EXECUTION#*`. The application already creates the `DRAFT` execution as participant 2 of the proposal apply and moves it on both human decisions, so this is where a write it already had now lives.

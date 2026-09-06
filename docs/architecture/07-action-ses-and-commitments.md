@@ -21,9 +21,12 @@ sequenceDiagram
     API->>S: execute by case/action/execution IDs
     S->>DDB: strong-load proposal, view, approval, execution
     S->>S: deterministic render + hash; require it equals the approved preview_hash
-    S->>DDB: APPROVED -> SENDING (the claim CAS; this is the duplicate-send boundary)
+    S->>DDB: APPROVED -> SENDING (the claim CAS, writing this attempt's claim owner)
+    S->>DDB: strong read; require SENDING carries THIS attempt's claim owner
     S->>PC: acquire current authorization fence
+    PC->>PC: take the fence, then revalidate the case side from inside it
     PC-->>S: ALLOW fence or stale DENY
+    S->>S: resolve recipient and identity; re-read the clock against the fence expiry
     S->>SES: one SendEmail call with execution tag
     alt accepted
       SES-->>S: SES message ID
@@ -43,6 +46,12 @@ No stage accepts a model-authored email body. Approval is authorization for one 
 **Rendering precedes the claim, and the order is normative** ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 3). `rendered_message_hash` is required the moment an execution reaches `SENDING`, so a claim that ran before the render would have to write a digest of bytes nobody had produced. Rendering is a pure function of immutable inputs with no side effect, so moving it earlier costs nothing and is what makes the approved-equals-sent comparison happen *before* anything is consumed.
 
 **The duplicate-send boundary is the claim compare-and-swap, not the fence.** The fence is per case and admits a replay by the same `execution_id`; it exists to order a send against a mandate revocation. What guarantees at most one deliberate SES call per execution is the conditional `APPROVED@v → SENDING@v+1` write, together with the rule that no code path issues an SES call from `SENDING` or from any terminal state.
+
+**The claim is proved by the row, not by the commit's own answer.** The write carries `claim_owner_hash`, minted per attempt, and the sender then strongly reads the execution and requires `SENDING` carrying *its own* owner before anything external happens. Without that, a worker whose claim transaction had an ambiguous outcome resolved it against a commit proof keyed on the execution — a proof another worker had written — and concluded that it held a claim it did not ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 1).
+
+**Send-time authorization is revalidated from inside the fence, never before it.** The compiler acquires the fence first and only then re-derives every case-side fact, because validating first leaves a window nobody owns: a revocation committing between the two is invisible to the validation, which has already run, and to the acquisition, which checks only the fence. A denial releases the fence immediately (§ 4 of the same ADR).
+
+**The clock is sampled once more immediately before the call.** The fence expiry check happens after acquisition and again after the destination and sending-identity resolutions have been awaited, because a clock read that a later `await` can invalidate is not a check on the instant that matters. The fence expiry is the minimum of every relevant authority's expiry, so one comparison covers them all.
 
 The application worker, not the sender role, owns the private `CommunityCase` projection. After sender return—or on replay after a lost return—it strongly reads the execution: `SENT` conditionally moves `ACTION_PROPOSED→ACTIONED`; `FAILED/SEND_UNKNOWN` leaves the case proposed and adds the safe execution banner. Thus sender needs no Core access, and a worker crash cannot lose a sent result.
 
@@ -201,7 +210,7 @@ The outcome classification is **`FAILED` requires proof; everything else is `SEN
 
 If a sender process dies while `SENDING`, reconciliation after the 60-second fence expiry marks it `SEND_UNKNOWN` unless a recorded SES event positively proves acceptance. Configuration-set events may transition `SEND_UNKNOWN→SENT` when the execution tag and message ID match. An operator may inspect SES events and the controlled inbox; `SEND_UNKNOWN→FAILED` requires positive evidence that SES never accepted the call. Uncertainty remains unknown indefinitely rather than risking a duplicate.
 
-Reconciliation is **one application command, `ReconcileSendOutcome`, with two named callers**: the application worker, when a replay finds an execution in `SENDING` past the recovery window with no live fence, and an operator route for the evidence an SES event supplies. Nothing runs it on a timer, nothing runs it as a side effect of a read, and it never calls SES. A message ID that disagrees with one already recorded is an `IntegrityError` and never an overwrite, so a forged or tampered SES message ID is at worst a rejected reconciliation ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 10).
+Reconciliation is **one application command, `ReconcileSendOutcome`, with two named callers**: the application worker, when a replay finds an execution in `SENDING` past the recovery window with no live fence, and the trusted configuration-set **event path**, which is the only caller that can supply positive evidence. There is no HTTP route through which a caller supplies a configuration set, an execution tag, or a message identifier of its own: a message identifier is a value only SES can produce, and an endpoint accepting one would let anybody who could reach it resolve a quarantine by typing three strings (T35). Phase 8 owns the authenticate-decode-and-attest boundary; Phase 11 owns the event destination and transport that feed it. **Decoding is not provenance**, so the boundary is split into an attester the event adapter alone holds and a verifier the command holds: the adapter authenticates the transport *before* reading the envelope and mints attested evidence, and `ReconcileSendOutcome` accepts nothing else. A caller-built mapping or evidence object is refused under `UNATTESTED_EVIDENCE` before any state is read, and a deployment with no transport authenticator — which is every Phase-8 deployment — resolves nothing and leaves the quarantine standing. Nothing runs it on a timer, nothing runs it as a side effect of a read, and it never calls SES. A message ID that disagrees with one already recorded is an `IntegrityError` and never an overwrite, so a forged or tampered SES message ID is at worst a rejected reconciliation ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 10).
 
 **The fence is released on every terminal outcome, including `SEND_UNKNOWN`.** The fence is not the record of the attempt — the execution row is — and a fence retained as a quarantine marker would permanently refuse every future mandate decision and revocation on that case, making a contributor's ability to withdraw consent collateral damage of an ambiguous send.
 

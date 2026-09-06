@@ -102,14 +102,19 @@ def test_the_encoded_item_carries_a_null_for_every_absent_field(
             assert item[name] is None, name
 
 
-def test_the_execution_schema_is_v2_and_v1_is_not_accepted() -> None:
-    """No V1 data has been deployed, so a reader that still accepted ``/v1`` would be a reader
-    accepting an item whose nullable shape it cannot interpret."""
+@pytest.mark.parametrize("superseded", ["action-execution/v1", "action-execution/v2"])
+def test_the_execution_schema_is_v3_and_no_earlier_version_is_accepted(superseded: str) -> None:
+    """No data has been deployed at any version, so a reader that still accepted an earlier one
+    would be a reader accepting an item whose nullable shape it cannot interpret.
 
-    assert frozenset({"action-execution/v2"}) == codec_share.EXECUTION_SCHEMA_VERSIONS
+    ``/v3`` is the shape carrying ``claim_owner_hash``, which a ``/v2`` row cannot supply -- and
+    a ``SENDING`` row without one cannot prove which attempt owns the claim.
+    """
+
+    assert frozenset({"action-execution/v3"}) == codec_share.EXECUTION_SCHEMA_VERSIONS
 
     item = dict(codec_share.encode_execution(_action_scope(), WORLD.execution()))
-    item["schema_version"] = "action-execution/v1"
+    item["schema_version"] = superseded
     with pytest.raises(IntegrityError):
         codec_share.decode_execution(item)
 

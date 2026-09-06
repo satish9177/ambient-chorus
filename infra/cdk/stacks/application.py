@@ -49,13 +49,30 @@ VIEW_KEY_PREFIXES = ("NS#*#VIEW#*", "NS#*#VIEW_CURRENT#*")
 """The compiler-owned Shareable partitions. The application reads and condition-checks these
 and can never write one."""
 
-APPLICATION_SHAREABLE_PREFIXES = ("NS#*#ACTION#*", "NS#*#ACTION_CURRENT#*", "NS#*#CASE#*")
+APPLICATION_SHAREABLE_PREFIXES = (
+    "NS#*#ACTION#*",
+    "NS#*#ACTION_CURRENT#*",
+    "NS#*#EXECUTION#*",
+    "NS#*#CASE#*",
+)
 """The only Shareable partitions the application may write.
 
-``ACTION#`` holds proposals, approvals, and executions; ``ACTION_CURRENT#`` holds the current
+``ACTION#`` holds the immutable proposals and approvals; ``ACTION_CURRENT#`` holds the current
 action pointer, the action history locators, and the action-apply idempotency record;
-``CASE#`` holds commitments. The Phase-7 proposal transaction writes into the first two and
-condition-checks the second view prefix, which is the whole of its Shareable footprint.
+``EXECUTION#`` holds the send execution and the send-command records; ``CASE#`` holds
+commitments.
+
+``EXECUTION#`` is **not a widening** (ADR-024 SS 4). The application already created the
+``DRAFT`` execution as participant 2 of the proposal apply and moves it on both human
+decisions; this is where a write it already had now lives.
+
+Two principals therefore hold ``PutItem`` over one prefix, and that is the one Phase-8 boundary
+IAM does not draw. What keeps them apart is the state machine: the application can only move a
+row that is in ``DRAFT`` or ``APPROVED``, and the sender only one in ``APPROVED`` or
+``SENDING``, each conditioned on an exact row version. The single overlapping state is the
+approval-withdrawal race, which the compare-and-swap resolves with exactly one winner. It is
+written down here rather than left implied, because an assertion that it holds is a test over
+the transitions and not over a policy.
 """
 
 READ_ACTIONS = ("dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query")

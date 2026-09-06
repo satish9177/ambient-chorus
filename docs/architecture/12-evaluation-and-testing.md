@@ -204,6 +204,20 @@ Playwright covers exactly three surfaces: discovery, Resident B adjust/revoke, p
 66. `test_reconciliation_rejects_a_disagreeing_message_id`
 67. `test_send_transaction_participant_counts_are_three_three_and_four` — claim, outcome, and case projection, asserted arithmetically against the staged plans.
 68. `test_send_fence_denies_after_authorization_version_moves_post_approval` — the revocation-after-approval race, end to end.
+69. `test_r1_a_lost_claim_outcome_after_a_foreign_send_makes_no_second_call` — a commit proof keyed on the execution says the claim committed, not who owns it; asserts SES call count 1 through the real unit of work.
+70. `test_r2_a_claim_that_did_not_commit_leaves_the_execution_safely_claimable`
+71. `test_r3_a_foreign_claim_owner_is_never_overwritten_and_never_sends`
+72. `test_r4_a_revocation_landing_between_the_claim_and_the_fence_denies_the_send` — a real `DecideMandate(REVOKE)` at the exact seam; asserts SES call count 0.
+73. `test_r5_a_fence_held_first_refuses_the_revocation_for_its_window` — the mirror ordering, asserted from inside the attempt the fence authorizes.
+74. `test_r6_r7_a_resolution_that_crosses_the_fence_expiry_calls_nothing` — both awaited registry lookups, parametrised over one assertion.
+75. `test_r8_a_sent_execution_with_a_lost_projection_is_repaired_without_sending` — through the worker and the durable operation record.
+76. `test_the_worker_resumes_an_uncommitted_ambiguous_claim`
+77. `test_r9_a_committed_approval_whose_receipt_was_lost_replays_successfully`
+78. `test_r10_an_approval_transaction_that_did_not_commit_is_safely_retried`
+79. `test_r11_a_sending_identity_change_before_approval_is_refused` and `test_r12_a_template_version_change_before_approval_is_refused` — both values live only inside `preview_hash`, so approval regenerates the preview.
+80. `test_r13_a_send_over_the_compiler_boundary_succeeds_with_no_core_handle` and `test_the_deployed_composition_reaches_the_compiler_and_never_core` — the deployed authorization boundary, exercised and then asserted structurally over the object graph.
+81. `test_r14_a_genuine_event_about_another_execution_is_refused` — cross-execution replay is refused by the recomputed execution tag, not by the transport.
+82. `test_r15_send_unknown_resolves_to_sent_with_failure_detail_absent` — the frozen `SEND_UNKNOWN → SENT` edge stays reachable.
 
 ## CI gates
 

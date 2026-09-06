@@ -95,6 +95,13 @@ class IdempotencyPartitionKind(StrEnum):
     compile record in ``NS#n#CASE#k`` would be a row the principal that must write it is
     denied. It is still the contextual case partition the persistence document names -- for
     a compile, the case partition of the Shareable table *is* the view-current one.
+
+    ``EXECUTION`` is the second entry whose placement is a permission fact rather than a
+    filing choice, and it is the mirror image of the same problem (ADR-024). Every Phase-8
+    send record -- the claim proof, the result proof, and the projection proof -- must be
+    written by the sender, and the sender must never be able to write ``NS#n#ACTION#a``,
+    where the immutable proposal and the immutable approval live. A record that only one
+    principal must write must not sit where only that principal is denied.
     """
 
     NAMESPACE = "NAMESPACE"
@@ -102,6 +109,7 @@ class IdempotencyPartitionKind(StrEnum):
     CASE = "CASE"
     VIEW_CURRENT = "VIEW_CURRENT"
     ACTION = "ACTION"
+    EXECUTION = "EXECUTION"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -121,6 +129,7 @@ class IdempotencyPartition:
             IdempotencyPartitionKind.CASE: ("case_id",),
             IdempotencyPartitionKind.VIEW_CURRENT: ("case_id",),
             IdempotencyPartitionKind.ACTION: ("action_id",),
+            IdempotencyPartitionKind.EXECUTION: ("action_id",),
         }[self.kind]
         for name in ("community_id", "case_id", "action_id"):
             present = getattr(self, name) is not None

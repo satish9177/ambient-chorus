@@ -18,6 +18,7 @@ from chorus.domain.entities import (
     ActionTone,
     Approval,
     ApprovalDecision,
+    ApproverAssurance,
     Commitment,
     CommitmentStatus,
     DestinationKind,
@@ -75,8 +76,8 @@ VIEW_SCHEMA_VERSIONS: Final = frozenset({"shareable-case-view/v2"})
 VIEW_POINTER_SCHEMA_VERSIONS: Final = frozenset({"current-view-pointer/v2"})
 VIEW_HISTORY_SCHEMA_VERSIONS: Final = frozenset({"view-history-locator/v1"})
 PROPOSAL_SCHEMA_VERSIONS: Final = frozenset({"action-proposal/v2"})
-APPROVAL_SCHEMA_VERSIONS: Final = frozenset({"approval/v1"})
-EXECUTION_SCHEMA_VERSIONS: Final = frozenset({"action-execution/v2"})
+APPROVAL_SCHEMA_VERSIONS: Final = frozenset({"approval/v2"})
+EXECUTION_SCHEMA_VERSIONS: Final = frozenset({"action-execution/v3"})
 ACTION_POINTER_SCHEMA_VERSIONS: Final = frozenset({"current-action-pointer/v2"})
 """The accepted schema versions, four of them moved to ``/v2`` by the Phase-7 gate.
 
@@ -524,6 +525,13 @@ def decode_proposal(item: StoredItem) -> tuple[DecodedScope, ActionProposal]:
 
 
 def approval_key(scope: ActionScope, approval_id: ApprovalId) -> ItemKey:
+    """The immutable decision, beside the immutable proposal it is about.
+
+    Deliberately still in ``NS#n#ACTION#a``. ADR-024 moved the *execution* out because the
+    sender must write it; the approval and the proposal stay together precisely because
+    nothing that sends may write either of them.
+    """
+
     return ItemKey(
         table=_SHARE,
         partition_key=keys.action_partition(scope.namespace, scope.action_id),
@@ -545,15 +553,17 @@ def encode_approval(scope: ActionScope, approval: Approval) -> StoredItem:
         {
             "approval_id": identifier(approval.approval_id),
             "action_id": identifier(approval.action_id),
+            "execution_id": identifier(approval.execution_id),
             "proposal_hash": approval.proposal_hash.value,
             "view_hash": approval.view_hash.value,
-            "approver_id": identifier(approval.approver_id),
+            "authorization_version": approval.authorization_version,
+            "approver_id_hash": approval.approver_id_hash.value,
+            "approver_assurance": approval.approver_assurance.value,
             "decision": approval.decision.value,
             "approved_at": instant(approval.approved_at),
             "expires_at": instant(approval.expires_at),
-            "consumed_at": optional_instant(approval.consumed_at),
             "approval_hash": approval.approval_hash.value,
-            "idempotency_key": approval.idempotency_key,
+            "request_key_hash": approval.request_key_hash.value,
             "version": approval.version,
             "created_at": instant(approval.created_at),
             "updated_at": instant(approval.updated_at),
@@ -569,23 +579,27 @@ def decode_approval(item: StoredItem) -> tuple[DecodedScope, Approval]:
         expected_type=EntityType.APPROVAL,
         accepted_schema_versions=APPROVAL_SCHEMA_VERSIONS,
     )
-    if scope.case_id is None:
+    if scope.case_id is None or scope.community_id is None:
         raise build_entity_error(reader, "scope")
     approval = build_entity(
         reader.entity_ref,
         Approval,
         approval_id=reader.identifier("approval_id", ApprovalId),
-        action_id=reader.identifier("action_id", ActionId),
+        namespace=scope.namespace,
+        community_id=scope.community_id,
         case_id=scope.case_id,
+        action_id=reader.identifier("action_id", ActionId),
+        execution_id=reader.identifier("execution_id", ExecutionId),
         proposal_hash=reader.digest("proposal_hash"),
         view_hash=reader.digest("view_hash"),
-        approver_id=reader.identifier("approver_id", ContributorId),
+        authorization_version=reader.number("authorization_version"),
+        approver_id_hash=reader.digest("approver_id_hash"),
+        approver_assurance=reader.enum("approver_assurance", ApproverAssurance),
         decision=reader.enum("decision", ApprovalDecision),
         approved_at=reader.instant("approved_at"),
         expires_at=reader.instant("expires_at"),
-        consumed_at=reader.optional_instant("consumed_at"),
         approval_hash=reader.digest("approval_hash"),
-        idempotency_key=reader.text("idempotency_key"),
+        request_key_hash=reader.digest("request_key_hash"),
         version=reader.number("version"),
         created_at=reader.instant("created_at"),
         updated_at=reader.instant("updated_at"),
@@ -596,9 +610,16 @@ def decode_approval(item: StoredItem) -> tuple[DecodedScope, Approval]:
 
 
 def execution_key(scope: ActionScope, execution_id: ExecutionId) -> ItemKey:
+    """The send state, in the partition only the sender and the application may write.
+
+    ``NS#n#EXECUTION#a`` rather than ``NS#n#ACTION#a`` (ADR-024). Resolved here so load,
+    create, update, and condition move together or not at all -- a second site computing this
+    address is how one of them ends up still writing into the proposal's partition.
+    """
+
     return ItemKey(
         table=_SHARE,
-        partition_key=keys.action_partition(scope.namespace, scope.action_id),
+        partition_key=keys.execution_partition(scope.namespace, scope.action_id),
         sort_key=keys.execution_sort_key(execution_id),
     )
 
@@ -623,6 +644,7 @@ def encode_execution(scope: ActionScope, execution: ActionExecution) -> StoredIt
             "idempotency_key": execution.idempotency_key,
             "state": execution.state.value,
             "attempt_number": execution.attempt_number,
+            "claim_owner_hash": _optional_digest(execution.claim_owner_hash),
             "rendered_message_hash": _optional_digest(execution.rendered_message_hash),
             "ses_request_token_hash": _optional_digest(execution.ses_request_token_hash),
             "ses_message_id": execution.ses_message_id,
@@ -660,6 +682,7 @@ def decode_execution(item: StoredItem) -> tuple[DecodedScope, ActionExecution]:
         idempotency_key=reader.optional_text("idempotency_key"),
         state=reader.enum("state", ActionExecutionState),
         attempt_number=reader.number("attempt_number"),
+        claim_owner_hash=reader.optional_digest("claim_owner_hash"),
         rendered_message_hash=reader.optional_digest("rendered_message_hash"),
         ses_request_token_hash=reader.optional_digest("ses_request_token_hash"),
         ses_message_id=reader.optional_text("ses_message_id"),

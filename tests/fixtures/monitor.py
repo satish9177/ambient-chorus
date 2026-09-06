@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import UUID, uuid4, uuid5
 
+from chorus.application.commands.approve_action import ApproveAction
 from chorus.application.commands.compile_view import CompileView
 from chorus.application.commands.decide_mandate import DecideMandate
 from chorus.application.commands.ingest_messages import (
@@ -25,6 +26,7 @@ from chorus.application.commands.ingest_messages import (
     IngestMessagesCommand,
     IngestMessagesResult,
 )
+from chorus.application.commands.invalidate_action import InvalidateAction
 from chorus.application.commands.propose_mandates import ProposeMandates
 from chorus.application.commands.run_monitor import RunMonitor, RunMonitorCommand
 from chorus.application.commands.run_monitor_operation import MonitorOperationWorker
@@ -72,7 +74,8 @@ from chorus.ports.retention import AuditRetention
 from chorus.ports.scopes import CommunityScope
 from chorus.ports.storage import StorageDriver, TableName
 from chorus.ports.unit_of_work import TransactionPlan
-from chorus.privacy.compiler import PrivacyCompiler
+from chorus.privacy.compiler import POLICY_BUILD_HASH, PrivacyCompiler
+from chorus.privacy.policy import COMPILER_VERSION, POLICY_VERSION
 
 NAMESPACE = Namespace("TEST_MONITOR")
 OTHER_NAMESPACE = Namespace("TEST_MONITOR_ALT")
@@ -337,6 +340,45 @@ class MonitorHarness:
             clock=self.clock,
             ids=self.ids,
             community_public_label="Example Community Building",
+        )
+
+    @property
+    def approve_action(self) -> ApproveAction:
+        """The Phase-8 decision command, over the same driver as everything else."""
+
+        return ApproveAction(
+            core=self.core,
+            shareable=ShareableRepository(
+                driver=self.driver, cursors=SignedCursorCodec(CURSOR_SECRET)
+            ),
+            audit=self.audit,
+            # The two approval domains live in the ACTION partition of the Shareable table
+            # (ADR-025 SS 12), beside the immutable proposal the decision is about.
+            idempotency=IdempotencyRepository(driver=self.driver, table=TableName.SHAREABLE),
+            unit_of_work=self.unit_of_work,
+            clock=self.clock,
+            ids=self.ids,
+            destination=self.stored_destination,
+            from_identity_id=FROM_IDENTITY_ID,
+            policy_version=POLICY_VERSION,
+            compiler_version=COMPILER_VERSION,
+            policy_build_hash=POLICY_BUILD_HASH,
+        )
+
+    @property
+    def invalidate_action(self) -> InvalidateAction:
+        """Withdrawal and clearing, whose records live in the EXECUTION partition."""
+
+        return InvalidateAction(
+            core=self.core,
+            shareable=ShareableRepository(
+                driver=self.driver, cursors=SignedCursorCodec(CURSOR_SECRET)
+            ),
+            audit=self.audit,
+            idempotency=IdempotencyRepository(driver=self.driver, table=TableName.SHAREABLE),
+            unit_of_work=self.unit_of_work,
+            clock=self.clock,
+            ids=self.ids,
         )
 
     @property
