@@ -123,7 +123,9 @@ def test_the_investigator_has_its_own_log_group() -> None:
     groups = template().find_resources("AWS::Logs::LogGroup")
     names = {str(group["Properties"]["LogGroupName"]) for group in groups.values()}
     assert any("chorus-investigator" in name for name in names)
-    assert len(names) == 2
+    # One dedicated group per agent runtime, three from Phase 7 on. A shared group would put
+    # three isolated runtimes' telemetry behind one read permission.
+    assert len(names) == 3
 
 
 def test_neither_runtime_is_granted_a_data_action_anywhere() -> None:

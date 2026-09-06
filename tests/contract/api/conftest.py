@@ -22,8 +22,16 @@ from chorus_api.main import build_app
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from tests.fixtures.drivers import DRIVER_PARAMS, storage_driver
-from tests.fixtures.monitor import DESTINATION_ID, FIXTURE_ID_NAMESPACE, MonitorHarness
+from tests.fixtures.monitor import (
+    DESTINATION_ID,
+    FIXTURE_ID_NAMESPACE,
+    MonitorHarness,
+)
+from tests.fixtures.monitor import (
+    FROM_IDENTITY_ID as ACTION_FROM_IDENTITY_ID,
+)
 
+from chorus.application.queries.current_action import ReadCurrentAction
 from chorus.domain.ids import Uuid5Generator
 from chorus.infrastructure.local.dispatch import (
     InProcessOperationDispatcher,
@@ -72,6 +80,10 @@ class ApiHarness:
             community_id=compile_harness.scope.community_id,  # type: ignore[attr-defined]
             destination=compile_harness.stored_destination(),  # type: ignore[attr-defined]
             compile_view=compile_harness.compile_view(),  # type: ignore[attr-defined]
+            read_current_action=ReadCurrentAction(
+                shareable=compile_harness.shareable,  # type: ignore[attr-defined]
+                from_identity_id=ACTION_FROM_IDENTITY_ID,
+            ),
         )
 
 
@@ -121,6 +133,7 @@ def build_harness(
         decide_mandate=harness.decide_mandate,
         read_mandate_thread=harness.read_mandate_thread,
         compile_view=harness.compile_view,
+        read_current_action=harness.read_current_action,
         dispatcher=dispatcher,
     )
     app = build_app(container)

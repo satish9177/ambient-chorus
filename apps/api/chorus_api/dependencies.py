@@ -29,6 +29,7 @@ from chorus.application.commands.decide_mandate import DecideMandate
 from chorus.application.commands.ingest_messages import IngestMessages
 from chorus.application.commands.propose_mandates import ProposeMandates
 from chorus.application.operations import ApplicationOperations
+from chorus.application.queries.current_action import ReadCurrentAction
 from chorus.application.queries.feed import ReadAmbientFeed
 from chorus.application.queries.mandates import ReadMandateThread
 from chorus.domain.ids import CommunityId, ContributorId, DestinationId, Namespace, Sha256Digest
@@ -88,6 +89,13 @@ class ApiContainer:
     decide_mandate: DecideMandate
     read_mandate_thread: ReadMandateThread
     compile_view: CompileView
+    read_current_action: ReadCurrentAction
+    """The Phase-7 safe preview read path.
+
+    Wired here rather than reached for, because a use case that exists and is not in the
+    container is a use case no route can call -- which is exactly what it was.
+    """
+
     dispatcher: OperationDispatchPort
 
 
@@ -120,6 +128,20 @@ def require_presenter(actor: DemoActor) -> DemoActor:
 
     if actor is not DemoActor.PRESENTER_ADMIN:
         raise HTTPException(status_code=403, detail="This surface requires the presenter role.")
+    return actor
+
+
+def require_case_reader(actor: DemoActor) -> DemoActor:
+    """Restrict the case surface to the two personas the frozen access table names.
+
+    ``GET /cases/{case_id}`` is "presenter/approver safe subset". The presenter runs the demo
+    and the approver has to read a proposal before deciding on it; a resident persona has no
+    business reading the case surface, and this route returns action-safe data only, so the
+    approver's narrower view and the presenter's coincide for everything Phase 7 puts here.
+    """
+
+    if actor not in {DemoActor.PRESENTER_ADMIN, DemoActor.CASE_APPROVER}:
+        raise HTTPException(status_code=403, detail="This surface requires a case reader role.")
     return actor
 
 

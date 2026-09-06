@@ -83,6 +83,25 @@ class Settings(BaseSettings):
     scheduler_group: str = "chorus-development"
     scheduler_role_arn: str | None = None
     ses_configuration_set: str = "chorus-development"
+    ses_from_identity_id: str = Field(
+        default="chorus-demo-sender", min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._:-]+$"
+    )
+    """The opaque, stable identifier of the verified sending identity. **Never the address.**
+
+    Ordinary deployment configuration rather than a Secrets Manager read, in the same class as
+    the safe destination label, registry version, and routing token: it is non-secret, it names
+    no mailbox, and the actual ``From`` address is resolved only by the sender from its own
+    destination secret (ADR-022 § 4).
+
+    It exists in Phase 7 because the preview hash must be computable at proposal time, and it is
+    inside that hash because approval must bind *who the message claims to be from* -- a preview
+    a human approved that could be sent under a different sending identity would be an approval
+    of the words and not of the letter. Phase 8's sender reconstructs the same digest from the
+    same value, which is what makes the comparison meaningful.
+
+    No agent runtime ever sees it. It is a renderer input, and the renderer runs in application
+    code.
+    """
     destination_id: str = "property_manager:demo"
     destination_display_label: str = "Property Management"
     destination_registry_version: int = Field(default=1, ge=1)

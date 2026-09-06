@@ -53,14 +53,14 @@ def actions_of(sid: str) -> set[str]:
 
 
 def test_the_stack_creates_exactly_one_role_per_agent_runtime() -> None:
-    """Two roles from Phase 5 on: the Monitor's and the Investigator's, and nothing else.
+    """Three roles from Phase 7 on: Monitor, Investigator, Action, and nothing else.
 
-    The count is asserted rather than the names, because the failure this catches is a *third*
+    The count is asserted rather than the names, because the failure this catches is a *fourth*
     role appearing -- a shared "agents" role, or a convenience role attached during a later
-    phase -- which is how two isolated identities quietly become one.
+    phase -- which is how three isolated identities quietly become one.
     """
 
-    template().resource_count_is(ROLE_TYPE, 2)
+    template().resource_count_is(ROLE_TYPE, 3)
 
 
 def test_the_role_is_assumable_only_by_the_agentcore_service() -> None:

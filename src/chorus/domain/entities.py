@@ -192,6 +192,23 @@ class ActionProposalStatus(StrEnum):
     INVALIDATED = "INVALIDATED"
 
 
+class ActionTone(StrEnum):
+    """The register a proposal asks the renderer to use (ADR-021 § 11).
+
+    A closed set, promoted from the free ``str`` the proposal used to carry -- which had
+    already drifted: a Phase-1 hash fixture constructed ``tone="PROFESSIONAL"``, a value
+    outside the frozen set that nothing refused.
+
+    The renderer consumes it only to select frozen template copy. It never reaches the model's
+    own text and it grants nothing: no tone widens a scope, names an identity, or changes which
+    facts may travel.
+    """
+
+    NEUTRAL = "NEUTRAL"
+    COLLABORATIVE = "COLLABORATIVE"
+    FIRM = "FIRM"
+
+
 class ApprovalDecision(StrEnum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
@@ -425,6 +442,22 @@ class CommunityCase:
     corroboration_source_count: int
     state_reason_code: str
     version: int
+    authorization_version: int
+    """The monotonic epoch of case-owned disclosure authority (ADR-020).
+
+    Deliberately a second counter rather than a second reading of ``version``, and deliberately
+    required rather than defaulted. ``version`` is the optimistic-concurrency token and answers
+    "has this row moved since I read it"; this answers "has what this case may disclose changed
+    since the view was compiled". Before Phase 7 every command gave both questions the same
+    answer, so one integer served -- and ``READY_FOR_ACTION -> ACTION_PROPOSED`` is the first
+    write where they diverge. Recording that a proposal exists moves the row and changes no
+    fact, status, mandate, or count, so a valid proposal must not stale the view that
+    authorized it.
+
+    A default of ``1`` would be a guessed-low epoch, which is a view that looks fresher than it
+    is. Every construction states the value, and the persistence codec fails closed on a stored
+    row that does not carry one.
+    """
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None = None
@@ -440,6 +473,7 @@ class CommunityCase:
         if self.corroboration_source_count < 0:
             raise ValueError("corroboration_source_count cannot be negative")
         _positive_version(self.version)
+        _positive_version(self.authorization_version)
         _timestamps(self.created_at, self.updated_at)
         if self.resolved_at is not None:
             require_utc(self.resolved_at)
@@ -583,11 +617,58 @@ class ActionClaim:
         _unique(self.export_fact_ids, "claim citations")
 
 
+MAX_PROPOSAL_CLAIMS = 12
+MAX_PROPOSAL_CAVEATS = 8
+MAX_CITATIONS_PER_FIELD = 10
+"""The frozen proposal bounds, restated once so the entity and the contract cannot drift."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ActionCaveat:
+    """One qualifying statement with the citations that make it checkable (ADR-021 § 2).
+
+    Structured rather than the bare string the proposal used to store, because the immutable
+    artifact a human approves has to contain the caveat-to-fact proof the validator relied on.
+    Without it, Phase-8 revalidation could not re-check the binding and the renderer could not
+    put the caveat in the References block.
+
+    ``caveat_id`` is model-local within one proposal and deliberately UUID-shaped, exactly as
+    ``claim_id`` is: it names nothing outside its own proposal, survives no lookup, and grants
+    nothing. The identifier-shape guard that refuses a UUID-shaped Monitor ``client_ref`` does
+    not apply to either.
+
+    There is no zero-citation caveat in V1. A caveat nobody can trace is the sentence structured
+    claims exist to prevent.
+    """
+
+    caveat_id: UUID
+    text: str
+    export_fact_ids: tuple[UUID, ...]
+    caveat_hash: Sha256Digest
+
+    def __post_init__(self) -> None:
+        _bounded(self.text, 1, 500, "caveat text")
+        if not 1 <= len(self.export_fact_ids) <= MAX_CITATIONS_PER_FIELD:
+            raise ValueError("caveat citations must contain 1 to 10 fact IDs")
+        if tuple(sorted(self.export_fact_ids, key=str)) != self.export_fact_ids:
+            raise ValueError("caveat citations must be sorted")
+        _unique(self.export_fact_ids, "caveat citations")
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ActionProposal:
     action_id: ActionId
     case_id: CaseId
     case_version: int
+    """The Core OCC version observed at proposal time. **Provenance only** (ADR-020 § 4).
+
+    It answers "which row revision was this artifact built beside" and nothing consults it for
+    authorization. Reading it as a requirement that the Core row must never advance again is
+    exactly the defect ADR-020 removed -- the proposal's own apply transaction advances it.
+    """
+    authorization_version: int
+    """The disclosure-authority epoch this proposal is valid against. **This is the freshness
+    comparison**, performed by the validator now and by the Phase-8 send fence later."""
     view_id: ViewId
     view_hash: Sha256Digest
     subject: str
@@ -595,22 +676,42 @@ class ActionProposal:
     requested_action: str
     requested_deadline: datetime | None
     request_fact_ids: tuple[UUID, ...]
-    caveats: tuple[str, ...]
-    tone: str
+    caveats: tuple[ActionCaveat, ...]
+    tone: ActionTone
     agent_invocation_id: UUID
     prompt_version: str
+    preview_hash: Sha256Digest
+    """The digest of the exact deterministic preview a human is shown and approves.
+
+    Not the execution's ``rendered_message_hash``, which the sender writes later over the bytes
+    it prepared for one SES attempt. Two fields, two owners, two moments -- which is what makes
+    "the sender sent what the human approved" a comparison rather than a tautology
+    (ADR-022 § 2). ``proposal_hash`` covers this field, so an approval binding the proposal hash
+    transitively binds the preview.
+    """
     proposal_hash: Sha256Digest
     status: ActionProposalStatus
     created_at: datetime
-    schema_version: str = "action-proposal/v1"
+    schema_version: str = "action-proposal/v2"
 
     def __post_init__(self) -> None:
         _positive_version(self.case_version)
-        _bounded(self.subject, 1, 200, "subject")
+        _positive_version(self.authorization_version)
+        _bounded(self.subject, 1, 120, "subject")
         _bounded(self.requested_action, 1, 500, "requested_action")
-        if not self.claims:
-            raise ValueError("proposal requires at least one claim")
+        if not 1 <= len(self.claims) <= MAX_PROPOSAL_CLAIMS:
+            raise ValueError("a proposal carries 1 to 12 claims")
+        if len(self.caveats) > MAX_PROPOSAL_CAVEATS:
+            raise ValueError("a proposal carries at most 8 caveats")
         _unique(tuple(claim.claim_id for claim in self.claims), "claim IDs")
+        _unique(tuple(caveat.caveat_id for caveat in self.caveats), "caveat IDs")
+        if not 1 <= len(self.request_fact_ids) <= MAX_CITATIONS_PER_FIELD:
+            # Never zero. ADR-021 § 1 removes the factual-premise classifier by making every
+            # model-authored substantive field citation-bound, and a request with no reason is
+            # a request the recipient cannot evaluate.
+            raise ValueError("request citations must contain 1 to 10 fact IDs")
+        if tuple(sorted(self.request_fact_ids, key=str)) != self.request_fact_ids:
+            raise ValueError("request citations must be sorted")
         _unique(self.request_fact_ids, "request_fact_ids")
         if self.requested_deadline is not None:
             require_utc(self.requested_deadline)
@@ -647,18 +748,131 @@ class Approval:
         _timestamps(self.created_at, self.updated_at)
 
 
+class FieldPresence(StrEnum):
+    """Whether one ``ActionExecution`` field must, must not, or may be set in a given state."""
+
+    REQUIRED = "REQUIRED"
+    ABSENT = "ABSENT"
+    OPTIONAL = "OPTIONAL"
+
+
+_R = FieldPresence.REQUIRED
+_A = FieldPresence.ABSENT
+_O = FieldPresence.OPTIONAL
+
+EXECUTION_FIELD_PRESENCE: dict[str, dict[ActionExecutionState, FieldPresence]] = {
+    "approval_id": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _R,
+        ActionExecutionState.SENDING: _R,
+        ActionExecutionState.SENT: _R,
+        ActionExecutionState.FAILED: _O,
+        ActionExecutionState.SEND_UNKNOWN: _R,
+    },
+    "idempotency_key": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _R,
+        ActionExecutionState.SENDING: _R,
+        ActionExecutionState.SENT: _R,
+        ActionExecutionState.FAILED: _O,
+        ActionExecutionState.SEND_UNKNOWN: _R,
+    },
+    "ses_request_token_hash": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
+        ActionExecutionState.SENDING: _R,
+        ActionExecutionState.SENT: _R,
+        ActionExecutionState.FAILED: _O,
+        ActionExecutionState.SEND_UNKNOWN: _R,
+    },
+    "rendered_message_hash": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
+        ActionExecutionState.SENDING: _R,
+        ActionExecutionState.SENT: _R,
+        ActionExecutionState.FAILED: _O,
+        ActionExecutionState.SEND_UNKNOWN: _R,
+    },
+    "started_at": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
+        ActionExecutionState.SENDING: _R,
+        ActionExecutionState.SENT: _R,
+        ActionExecutionState.FAILED: _O,
+        ActionExecutionState.SEND_UNKNOWN: _R,
+    },
+    "ses_message_id": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
+        ActionExecutionState.SENDING: _A,
+        ActionExecutionState.SENT: _R,
+        ActionExecutionState.FAILED: _A,
+        ActionExecutionState.SEND_UNKNOWN: _O,
+    },
+    "finished_at": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
+        ActionExecutionState.SENDING: _A,
+        ActionExecutionState.SENT: _R,
+        ActionExecutionState.FAILED: _R,
+        ActionExecutionState.SEND_UNKNOWN: _R,
+    },
+    "failure_code": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
+        ActionExecutionState.SENDING: _A,
+        ActionExecutionState.SENT: _A,
+        ActionExecutionState.FAILED: _R,
+        ActionExecutionState.SEND_UNKNOWN: _A,
+    },
+    "reconciled_at": {
+        ActionExecutionState.DRAFT: _A,
+        ActionExecutionState.APPROVED: _A,
+        ActionExecutionState.SENDING: _A,
+        ActionExecutionState.SENT: _O,
+        ActionExecutionState.FAILED: _A,
+        ActionExecutionState.SEND_UNKNOWN: _O,
+    },
+}
+"""The normative ADR-022 § 1 presence table, expressed as data rather than as prose.
+
+A table rather than nine nullable fields with an implicit rule, for the reason ADR-016 gave for
+the handover pair: a rule nobody wrote down is a rule the next state added to the enum quietly
+escapes. Adding a state adds a **column**, and a missing cell raises rather than defaulting.
+
+The ``OPTIONAL`` cells under ``FAILED`` are the honest ones and the reason this is not a simple
+ladder. ``DRAFT -> FAILED`` reaches a terminal state having never had an approval, and
+``APPROVED -> FAILED`` with ``STALE_AUTHORIZATION`` reaches it having never rendered anything
+or contacted SES. Requiring a rendered hash on a failure that happened before rendering would
+force a fabricated digest onto the record of a message that was never built.
+"""
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ActionExecution:
+    """One send attempt, whose field presence is a function of its state.
+
+    Four fields an earlier shape made non-optional cannot exist before a human has approved
+    anything: there is no ``approval_id`` at ``DRAFT``, the send ``idempotency_key`` is defined
+    *over* the approval, the ``rendered_message_hash`` belongs to the sender, and the SES
+    request token is minted immediately before the SES call. A ``DRAFT`` was therefore a state
+    two documents required and no model could express (ADR-022).
+
+    **Presence is monotonic.** A field that has been set is never unset and never rewritten;
+    :func:`chorus.domain.state.transition_action_execution` refuses a transition that would
+    clear one.
+    """
+
     execution_id: ExecutionId
     action_id: ActionId
     case_id: CaseId
-    approval_id: ApprovalId
+    approval_id: ApprovalId | None
     proposal_hash: Sha256Digest
     view_hash: Sha256Digest
-    idempotency_key: str
+    idempotency_key: str | None
     state: ActionExecutionState
-    rendered_message_hash: Sha256Digest
-    ses_request_token_hash: Sha256Digest
+    rendered_message_hash: Sha256Digest | None
+    ses_request_token_hash: Sha256Digest | None
     ses_message_id: str | None
     started_at: datetime | None
     finished_at: datetime | None
@@ -669,7 +883,7 @@ class ActionExecution:
     created_at: datetime
     updated_at: datetime
     attempt_number: int = 1
-    schema_version: str = "action-execution/v1"
+    schema_version: str = "action-execution/v2"
 
     def __post_init__(self) -> None:
         if self.attempt_number != 1:
@@ -679,6 +893,18 @@ class ActionExecution:
                 require_utc(instant)
         _positive_version(self.version)
         _timestamps(self.created_at, self.updated_at)
+        self.require_state_presence()
+
+    def require_state_presence(self) -> None:
+        """Refuse a record whose set fields disagree with the frozen presence table."""
+
+        for name, row in EXECUTION_FIELD_PRESENCE.items():
+            presence = row[self.state]
+            present = getattr(self, name) is not None
+            if presence is FieldPresence.REQUIRED and not present:
+                raise ValueError(f"{name} is required in state {self.state.value}")
+            if presence is FieldPresence.ABSENT and present:
+                raise ValueError(f"{name} cannot be set in state {self.state.value}")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

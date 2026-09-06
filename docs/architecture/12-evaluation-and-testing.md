@@ -122,6 +122,7 @@ Static policy tests are necessary but insufficient. Post-deploy canaries assume/
 - Action cannot `GetItem/Query/Scan` any table, `GetObject/ListBucket` either bucket, call SES, invoke compiler/sender, or invoke other agents;
 - Monitor/Investigator cannot access data stores or side effects;
 - compiler cannot invoke Bedrock/SES; it can write only the view prefixes, the audit table, and the `NS#*#FENCE#*` partition, and an attempt to put or delete any case-partition item must return `AccessDenied` ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md));
+- the application can condition on, and never write, the view prefixes: a `ConditionCheckItem` on `NS#*#VIEW_CURRENT#*` succeeds while a `PutItem`, `UpdateItem`, or `DeleteItem` on either view prefix must return `AccessDenied` ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 7);
 - sender cannot read Core/private S3 and can send only through the configured identity/configuration set;
 - watcher cannot call agents/compiler/SES or private resources.
 
@@ -169,6 +170,23 @@ Playwright covers exactly three surfaces: discovery, Resident B adjust/revoke, p
 32. `test_compile_never_mutates_the_core_case_or_its_version`
 33. `test_safe_evidence_ref_media_type_is_png_for_a_jpeg_source`
 34. `test_incomplete_fixture_review_fails_closed`
+35. `test_action_proposal_does_not_stale_its_own_bound_view` — the apply moves `version` and carries `authorization_version` forward, so the view, the proposal, and a subsequent fence acquisition all still agree. This is the regression test for the defect [ADR-020](../adr/ADR-020-case-authorization-version.md) fixed; written before the fix, it must fail.
+36. `test_lifecycle_transition_never_bumps_authorization_version` — asserted over the whole edge set, so a future edge cannot quietly acquire an authorization bump.
+37. `test_authorization_sensitive_command_bumps_both_counters` — the mirror of 36, over every command in [ADR-020](../adr/ADR-020-case-authorization-version.md) § 2.
+38. `test_send_fence_ignores_core_occ_version_and_checks_state_and_authorization_version`
+39. `test_current_view_pointer_move_during_invocation_persists_nothing` — the Phase-7 twin of 25: the pointer moves *while the model is answering*, so only the apply transaction's `VIEW_CURRENT` condition can refuse, and no second invocation follows.
+40. `test_draft_execution_round_trips_through_codec` — the `DRAFT` shape carries no approval, send key, rendered hash, or SES token, and presence is monotonic across every transition.
+41. `test_proposal_apply_participant_count_is_exactly_ten` — asserted arithmetically against the staged plan.
+42. `test_second_proposal_against_live_draft_conflicts_without_model_call`
+43. `test_lost_operation_status_recovers_from_durable_invocation_record` — zero model calls.
+44. `test_request_and_caveat_citations_are_never_empty`
+45. `test_relied_contradicted_fact_without_caveat_rejects_whole_proposal`
+46. `test_unsupported_number_date_quote_or_name_rejects_whole_proposal` — including that `four` is not supported by `4`, `24` is not supported by `4`, and a prose date is rejected rather than grounded.
+47. `test_supported_token_with_correct_citation_is_accepted`
+48. `test_preview_hash_inputs_require_no_secret_read`
+49. `test_plain_and_html_derive_from_one_intermediate_tree`
+50. `test_rendered_message_over_100_kib_rejects_and_never_truncates`
+51. `test_application_cannot_write_any_view_prefix` — a static negative-capability sweep of every synthesized allow statement, in the manner [ADR-019](../adr/ADR-019-send-fence-partition-isolation.md) established.
 
 ## CI gates
 

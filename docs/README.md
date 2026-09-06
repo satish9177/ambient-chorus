@@ -26,6 +26,9 @@ Keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. If two a
 - Evidence status is deterministically recomputed, never transitioned. `policy/v1` has no allowed verification source, so `VERIFIED` is unreachable and a model that claims it is downgraded and audited. An agent may lower a fact's status and may never raise it.
 - Three DynamoDB tables (`core`, `shareable`, `audit`) and two S3 buckets (`private-evidence`, `export-evidence`).
 - A compile's DynamoDB transaction is its sole authorization commit point. The safe evidence derivative is written once to a content-addressed export key beforehand and confers no authority until that transaction commits; there is no pending object state and no finalization copy.
+- A case carries two monotonic counters. `version` is optimistic concurrency; `authorization_version` is the disclosure-authority epoch that views, proposals, and the send fence compare. **Lifecycle progress is not itself disclosure authority**, so a valid action proposal does not stale the view that authorized it.
+- Every model-authored Action field — every claim, the request, and every caveat — carries one to ten citations and never zero. There is no factual-premise classifier, no semantic similarity, and no second model validating the first; a false positive rejects and requires a re-proposal.
+- Human approval binds the proposal's immutable `preview_hash`; the sender separately records the `rendered_message_hash` of the bytes it prepared. Rendered bodies are never persisted, only regenerated.
 - Python 3.12, FastAPI, Pydantic v2, Strands Agents, Amazon Bedrock Nova 2 Lite, AgentCore Runtime, Lambda, API Gateway HTTP API, DynamoDB, S3, SES, EventBridge Scheduler, CloudWatch, and CDK v2.
 - React, TypeScript strict mode, Vite, TanStack Query, native `fetch`, CSS Modules, `npm`.
 - Python dependencies and workspaces with `uv`; lint with Ruff, static typing with mypy, tests with pytest.
@@ -74,6 +77,9 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-017](adr/ADR-017-evidence-root-id-locator.md) | Immutable root-ID locator for `EvidenceRoot` ancestry |
 | [ADR-018](adr/ADR-018-safe-evidence-and-compile-commit.md) | Frozen image-sanitizer profile, fixture review, content-addressed export object, and one compile commit point |
 | [ADR-019](adr/ADR-019-send-fence-partition-isolation.md) | The send fence gets its own Core partition so `W(fence only)` is enforceable by IAM |
+| [ADR-020](adr/ADR-020-case-authorization-version.md) | The case authorization version, separate from the OCC row version: lifecycle progress is not disclosure authority |
+| [ADR-021](adr/ADR-021-action-grounding-and-caveats.md) | Every model-authored Action field is cited, and the exact grammar that grounds it |
+| [ADR-022](adr/ADR-022-action-draft-preview-and-transaction.md) | A DRAFT execution that can exist, a preview the proposal owns, and the ten participants that commit them |
 
 ## Implementation control
 

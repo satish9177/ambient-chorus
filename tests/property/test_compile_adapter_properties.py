@@ -58,34 +58,36 @@ def _strings(value: object) -> list[str]:
 @given(secret=st.text(alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ", min_size=6, max_size=24))
 @SLOW
 async def test_no_internal_only_value_reaches_the_persisted_view(secret: str) -> None:
-    """The frozen property, over the artifact that actually landed in the Shareable table.
-
-    A generated sentinel is planted inside the health fact's own value, so the only way it can
-    reach the view is if the adapter widened something the compiler excluded.
-    """
-
     harness = CompileHarness(driver=InMemoryStorageDriver())
     fixture = harness.fixture
+    sentinel = f"INTERNAL_ONLY_SENTINEL_{secret}_HEALTH"
 
     def _mark(fact: Fact) -> Fact:
         if fact.fact_id != fixture.health_fact_id:
             return fact
         value = fact.value
         assert isinstance(value, HealthDetail)
-        return replace(fact, value=replace(value, detail=f"{secret}_HEALTH"))
+        return replace(fact, value=replace(value, detail=sentinel))
 
     marked = tuple(_mark(fact) for fact in fixture.context.facts)
     raw = photo_bytes()
-    await harness.seed(facts=marked, evidence_items=harness.align_photo_digest(raw), photo=raw)
+    await harness.seed(
+        facts=marked,
+        evidence_items=harness.align_photo_digest(raw),
+        photo=raw,
+    )
 
     result = await harness.compile_view().execute(harness.command())
 
     assert result.view is not None
     rendered = " ".join(_strings(to_canonical_primitive(result.view)))
-    assert secret not in rendered
+    assert sentinel not in rendered
 
-    stored = await harness.shareable.load_view(harness.scope, result.view.view_id)
-    assert secret not in " ".join(_strings(to_canonical_primitive(stored)))
+    stored = await harness.shareable.load_view(
+        harness.scope,
+        result.view.view_id,
+    )
+    assert sentinel not in " ".join(_strings(to_canonical_primitive(stored)))
 
 
 @given(order=st.permutations(list(range(6))))

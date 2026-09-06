@@ -8,11 +8,13 @@ import pytest
 from tests.fixtures.elevator import NOW, _uuid, build_elevator_fixture
 
 from chorus.domain.entities import (
+    EXECUTION_FIELD_PRESENCE,
     ActionExecution,
     ActionExecutionState,
     CaseState,
     CommitmentStatus,
     CommunityCase,
+    FieldPresence,
 )
 from chorus.domain.errors import StateTransitionError
 from chorus.domain.ids import (
@@ -116,31 +118,65 @@ def test_actioned_cannot_transition_directly_to_resolved() -> None:
         )
 
 
+_EXECUTION_DIGEST = Sha256Digest("sha256:" + "1" * 64)
+
+_EXECUTION_VALUES: dict[str, object] = {
+    "approval_id": ApprovalId(_uuid("approval:test")),
+    "idempotency_key": "execution-test",
+    "ses_request_token_hash": _EXECUTION_DIGEST,
+    "rendered_message_hash": _EXECUTION_DIGEST,
+    "started_at": NOW - timedelta(minutes=2),
+    "ses_message_id": "ses-test",
+    "finished_at": NOW - timedelta(minutes=1),
+    "failure_code": "STALE_AUTHORIZATION",
+    "reconciled_at": None,
+}
+"""One legal value per presence-table field, so a state's record can be built from the table.
+
+Driven by the table rather than by a fixed field set, because a fixed set is exactly what let
+``DRAFT`` -- the one shape Phase 7 must write -- go unexercised for six phases.
+"""
+
+
+def _present_fields(state: ActionExecutionState) -> dict[str, object]:
+    """Every field this state requires or permits, and nothing it forbids."""
+
+    return {
+        name: _EXECUTION_VALUES[name]
+        for name, row in EXECUTION_FIELD_PRESENCE.items()
+        if row[state] is FieldPresence.REQUIRED
+    }
+
+
+def _newly_required(
+    source: ActionExecutionState, target: ActionExecutionState
+) -> dict[str, object]:
+    """The fields the target state requires that the source did not already carry."""
+
+    return {
+        name: _EXECUTION_VALUES[name]
+        for name, row in EXECUTION_FIELD_PRESENCE.items()
+        if row[target] is FieldPresence.REQUIRED and row[source] is not FieldPresence.REQUIRED
+    }
+
+
 def _execution(state: ActionExecutionState) -> ActionExecution:
     fixture = build_elevator_fixture()
-    digest = Sha256Digest("sha256:" + "1" * 64)
     action_id = fixture.missed_commitment.action_id
     assert action_id is not None
+    absent: dict[str, object] = dict.fromkeys(EXECUTION_FIELD_PRESENCE)
     return ActionExecution(
         execution_id=ExecutionId(_uuid("execution:test")),
         action_id=action_id,
         case_id=fixture.context.case.case_id,
-        approval_id=ApprovalId(_uuid("approval:test")),
-        proposal_hash=digest,
-        view_hash=digest,
-        idempotency_key="execution-test",
+        proposal_hash=_EXECUTION_DIGEST,
+        view_hash=_EXECUTION_DIGEST,
         state=state,
-        rendered_message_hash=digest,
-        ses_request_token_hash=digest,
-        ses_message_id=None,
-        started_at=None,
-        finished_at=None,
-        failure_code=None,
         failure_detail_safe=None,
-        reconciled_at=None,
         version=1,
-        created_at=NOW - timedelta(minutes=1),
-        updated_at=NOW - timedelta(minutes=1),
+        created_at=NOW - timedelta(minutes=3),
+        updated_at=NOW - timedelta(minutes=3),
+        **{**absent, **_present_fields(state)},  # type: ignore[arg-type]
     )
 
 
@@ -156,9 +192,11 @@ def test_action_execution_legal_edges_are_guarded(
         expected_version=1,
         now=NOW,
         reconciliation_proof=source is ActionExecutionState.SEND_UNKNOWN,
+        **_newly_required(source, target),  # type: ignore[arg-type]
     )
 
     assert result.state is target
+    result.require_state_presence()
 
 
 def test_send_unknown_cannot_change_without_reconciliation() -> None:
@@ -210,6 +248,7 @@ def _case_in(state: CaseState, *, version: int = 3) -> CommunityCase:
         corroboration_source_count=2,
         state_reason_code="SEEDED",
         version=version,
+        authorization_version=version,
         created_at=BUMP_NOW,
         updated_at=BUMP_NOW,
     )

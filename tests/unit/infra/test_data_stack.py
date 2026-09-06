@@ -192,6 +192,9 @@ def test_the_application_synthesizes_every_declared_stack() -> None:
         "AmbientChorusData",
         "AmbientChorusAgents",
         "AmbientChorusCompiler",
+        # Phase 7 synthesizes the application principal, so the ADR-022 negative-capability
+        # assertion has a real policy to read rather than a trust-matrix row nothing can check.
+        "AmbientChorusApplication",
     }
 
 

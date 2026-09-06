@@ -39,6 +39,9 @@ ATTR_NAMESPACE = "namespace"
 ATTR_COMMUNITY_ID = "community_id"
 ATTR_CASE_ID = "case_id"
 ATTR_VERSION = "version"
+ATTR_AUTHORIZATION_VERSION = "authorization_version"
+"""The case row's disclosure-authority epoch, named here because two transactions condition on
+it: the compile's read-only case guard and the Action proposal apply's guarded case update."""
 ATTR_EXPIRES_AT_EPOCH = "expires_at_epoch"
 
 

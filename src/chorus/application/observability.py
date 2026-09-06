@@ -116,6 +116,13 @@ class EventName:
     VIEW_PERSISTED: Final = "view.persisted"
     PRIVATE_URI_DENIED: Final = "private_uri.denied"
 
+    PROPOSAL_REQUESTED: Final = "proposal.requested"
+    PROPOSAL_VALIDATED: Final = "proposal.validated"
+    PROPOSAL_DENIED: Final = "proposal.denied"
+    PROPOSAL_STALE_REJECTED: Final = "proposal.stale_rejected"
+    PROPOSAL_PERSISTED: Final = "proposal.persisted"
+    PROPOSAL_REPLAYED: Final = "proposal.replayed"
+
     SEND_FENCE_ACQUIRED: Final = "send.fence.acquired"
     SEND_FENCE_DENIED: Final = "send.fence.denied"
     SEND_FENCE_RELEASED: Final = "send.fence.released"
@@ -131,6 +138,7 @@ def _emit(
     community_id: CommunityId | None = None,
     case_id: CaseId | None = None,
     case_version: int | None = None,
+    authorization_version: int | None = None,
     operation_id: OperationId | None = None,
     invocation_id: UUID | None = None,
     entity_type: str | None = None,
@@ -139,6 +147,8 @@ def _emit(
     input_hash: Sha256Digest | None = None,
     output_hash: Sha256Digest | None = None,
     view_hash: Sha256Digest | None = None,
+    proposal_hash: Sha256Digest | None = None,
+    preview_hash: Sha256Digest | None = None,
     prompt_version: str | None = None,
     outcome: str | None = None,
     reason_codes: tuple[str, ...] = (),
@@ -162,6 +172,7 @@ def _emit(
         "community_id": community_id,
         "case_id": case_id,
         "case_version": case_version,
+        "authorization_version": authorization_version,
         "operation_id": operation_id,
         "invocation_id": invocation_id,
         "entity_type": entity_type,
@@ -170,6 +181,8 @@ def _emit(
         "input_hash": None if input_hash is None else input_hash.value,
         "output_hash": None if output_hash is None else output_hash.value,
         "view_hash": None if view_hash is None else view_hash.value,
+        "proposal_hash": None if proposal_hash is None else proposal_hash.value,
+        "preview_hash": None if preview_hash is None else preview_hash.value,
         "prompt_version": prompt_version,
         "outcome": outcome,
         "attempt": attempt,
@@ -952,6 +965,193 @@ def compile_denied(
         actor_id_hash=actor_id_hash,
         outcome="DENIED",
         reason_codes=reason_codes,
+    )
+
+
+def proposal_requested(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    case_version: int,
+    authorization_version: int,
+    correlation_id: UUID | None,
+    actor_id_hash: Sha256Digest,
+    view_id: UUID,
+    view_hash: Sha256Digest,
+    fact_count: int,
+) -> None:
+    """Record that a proposal was asked for, against which exact view, and how large it was.
+
+    ``authorization_version`` travels as a *count* rather than as prose, alongside the OCC
+    version, because the two answer different questions and an operator reading a staleness
+    incident needs to see which one moved.
+    """
+
+    _emit(
+        EventName.PROPOSAL_REQUESTED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        authorization_version=authorization_version,
+        entity_type="SHAREABLE_VIEW",
+        entity_id=view_id,
+        view_hash=view_hash,
+        counts={"view_facts": fact_count},
+    )
+
+
+def proposal_validated(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    invocation_id: UUID,
+    view_hash: Sha256Digest,
+    claim_count: int,
+    caveat_count: int,
+    citation_count: int,
+) -> None:
+    """Record that one answer survived every deterministic check, in counts only.
+
+    No claim text, no request text, no caveat text, no subject, and no rendered body. The
+    counts are what an operator can act on; the prose is the thing the observability rules
+    forbid a log line from carrying.
+    """
+
+    _emit(
+        EventName.PROPOSAL_VALIDATED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        invocation_id=invocation_id,
+        view_hash=view_hash,
+        outcome="SUCCEEDED",
+        counts={
+            "claims": claim_count,
+            "caveats": caveat_count,
+            "citations": citation_count,
+        },
+    )
+
+
+def proposal_denied(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    invocation_id: UUID,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record a whole-proposal refusal by its bounded ``ActionRejection`` codes.
+
+    ``INFO`` for the same reason a compile denial is: a refused proposal is the validator
+    working, and logging it as a problem would train an operator to treat the system's most
+    important answer as noise.
+    """
+
+    _emit(
+        EventName.PROPOSAL_DENIED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        invocation_id=invocation_id,
+        outcome="DENIED",
+        reason_codes=reason_codes,
+    )
+
+
+def proposal_stale_rejected(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    reason_codes: tuple[str, ...],
+    invoked_model: bool,
+) -> None:
+    """Record a staleness refusal, and say whether it cost a model call.
+
+    ``invoked_model`` is the field that distinguishes the two cases the failure matrix names
+    separately: a stale-before-invocation refusal spends nothing, while a current-view pointer
+    that moved *during* the invocation has already spent one pass and must not spend a second.
+    """
+
+    _emit(
+        EventName.PROPOSAL_STALE_REJECTED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        outcome="DENIED",
+        reason_codes=reason_codes,
+        counts={"model_invocations": 1 if invoked_model else 0},
+    )
+
+
+def proposal_persisted(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    case_version: int,
+    correlation_id: UUID | None,
+    action_id: UUID,
+    proposal_hash: Sha256Digest,
+    preview_hash: Sha256Digest,
+    participants: int,
+) -> None:
+    """Record one committed proposal by identifier and hashes.
+
+    ``proposal_hash`` and ``preview_hash`` are named fields rather than borrowed
+    ``input_hash``/``output_hash`` slots, because the frozen record vocabulary names them and an
+    operator correlating an approval to a send needs the two digests to mean the same thing in
+    every event that carries them. The bytes ``preview_hash`` covers are never persisted or
+    logged anywhere -- only the digest travels.
+    """
+
+    _emit(
+        EventName.PROPOSAL_PERSISTED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        entity_type="ACTION_PROPOSAL",
+        entity_id=action_id,
+        proposal_hash=proposal_hash,
+        preview_hash=preview_hash,
+        outcome="SUCCEEDED",
+        counts={"transaction_participants": participants},
+    )
+
+
+def proposal_replayed(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    invocation_id: UUID,
+) -> None:
+    """Record that a redelivery answered from the durable record and called no model."""
+
+    _emit(
+        EventName.PROPOSAL_REPLAYED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        invocation_id=invocation_id,
+        outcome="REPLAYED",
+        counts={"model_invocations": 0},
     )
 
 

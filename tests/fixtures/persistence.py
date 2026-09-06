@@ -17,11 +17,14 @@ from hashlib import sha256
 from uuid import UUID, uuid5
 
 from chorus.domain.entities import (
+    EXECUTION_FIELD_PRESENCE,
+    ActionCaveat,
     ActionClaim,
     ActionExecution,
     ActionExecutionState,
     ActionProposal,
     ActionProposalStatus,
+    ActionTone,
     ActorType,
     ApplicationOperation,
     ApplicationOperationKind,
@@ -51,6 +54,7 @@ from chorus.domain.entities import (
     EvidenceStatus,
     ExtractionStatus,
     FactType,
+    FieldPresence,
     InvestigationAssessment,
     MalwareScanStatus,
     MandateStatus,
@@ -159,6 +163,7 @@ from chorus.ports.storage import (
     StoredItem,
     TableName,
 )
+from chorus.privacy.compiler import POLICY_BUILD_HASH
 
 FIXTURE_UUID_NAMESPACE = UUID("6b9b7f4e-2a71-5a2f-9a06-2a3f0dbf4a11")
 NOW = datetime(2026, 8, 31, 12, 0, 0, tzinfo=UTC)
@@ -494,7 +499,11 @@ class World:
         )
 
     def case(
-        self, *, version: int = 1, fact_ids: tuple[FactId, ...] | None = None
+        self,
+        *,
+        version: int = 1,
+        authorization_version: int = 1,
+        fact_ids: tuple[FactId, ...] | None = None,
     ) -> CommunityCase:
         return CommunityCase(
             case_id=self.case_id,
@@ -511,6 +520,7 @@ class World:
             corroboration_source_count=4,
             state_reason_code="EVIDENCE_SUFFICIENT",
             version=version,
+            authorization_version=authorization_version,
             created_at=NOW - timedelta(days=3),
             updated_at=NOW - timedelta(days=3) + timedelta(minutes=version),
         )
@@ -750,17 +760,25 @@ class World:
             display_label="Property Management",
         )
 
-    def view(self, *, view_id: ViewId | None = None, index: int = 0) -> StoredShareableView:
+    def view(
+        self,
+        *,
+        view_id: ViewId | None = None,
+        index: int = 0,
+        authorization_version: int = 1,
+    ) -> StoredShareableView:
         identity = self.view_id if view_id is None else view_id
         ref_id = SafeEvidenceRefId(self.uuid(f"safe-evidence:{index}"))
         return StoredShareableView(
-            schema_version="shareable-case-view/v1",
+            schema_version="shareable-case-view/v2",
             view_id=identity,
             case_id=self.case_id,
             community_public_label="Example Community Building",
             case_version=1,
+            authorization_version=authorization_version,
             policy_version="policy/v1",
             compiler_version="compiler/v1",
+            policy_build_hash=POLICY_BUILD_HASH,
             destination=self.destination(),
             purpose=Purpose.REQUEST_ELEVATOR_REPAIR_AND_RESPONSE,
             generated_at=NOW - timedelta(hours=12 - index),
@@ -869,7 +887,9 @@ class World:
             view_hash=digest(f"view:{self.seed}:0") if allowed else None,
         )
 
-    def view_pointer(self, *, version: int = 1, index: int = 0) -> CurrentViewPointer:
+    def view_pointer(
+        self, *, version: int = 1, index: int = 0, authorization_version: int = 1
+    ) -> CurrentViewPointer:
         return CurrentViewPointer(
             namespace=self.namespace,
             community_id=self.community_id,
@@ -877,6 +897,7 @@ class World:
             view_id=self.view_id,
             view_hash=digest(f"view:{self.seed}:{index}"),
             case_version=1,
+            authorization_version=authorization_version,
             expires_at=NOW + timedelta(days=1),
             version=version,
             created_at=NOW - timedelta(hours=12),
@@ -894,12 +915,13 @@ class World:
             generated_at=NOW - timedelta(hours=24 - index),
         )
 
-    def proposal(self, *, index: int = 0) -> ActionProposal:
+    def proposal(self, *, index: int = 0, authorization_version: int = 1) -> ActionProposal:
         export_fact_id = self.uuid(f"export-fact:{index}")
         return ActionProposal(
             action_id=self.action_id,
             case_id=self.case_id,
             case_version=1,
+            authorization_version=authorization_version,
             view_id=self.view_id,
             view_hash=digest(f"view:{self.seed}:{index}"),
             subject="Repeated elevator outages at Example Community Building",
@@ -914,10 +936,18 @@ class World:
             requested_action="Inspect and repair the elevator, then confirm the schedule.",
             requested_deadline=NOW + timedelta(days=7),
             request_fact_ids=(export_fact_id,),
-            caveats=("Reported by residents; not independently inspected.",),
-            tone="NEUTRAL",
+            caveats=(
+                ActionCaveat(
+                    caveat_id=self.uuid(f"caveat:{index}"),
+                    text="Reported by residents; not independently inspected.",
+                    export_fact_ids=(export_fact_id,),
+                    caveat_hash=digest(f"caveat:{self.seed}:{index}"),
+                ),
+            ),
+            tone=ActionTone.NEUTRAL,
             agent_invocation_id=self.uuid(f"invocation:action:{index}"),
             prompt_version="action/v1",
+            preview_hash=digest(f"preview:{self.seed}:{index}"),
             proposal_hash=digest(f"proposal:{self.seed}:{index}"),
             status=ActionProposalStatus.DRAFT,
             created_at=NOW - timedelta(hours=4 - index),
@@ -949,22 +979,45 @@ class World:
         state: ActionExecutionState = ActionExecutionState.APPROVED,
         version: int = 1,
     ) -> ActionExecution:
+        """Build one execution in ``state``, carrying exactly the fields that state permits.
+
+        Driven by the frozen presence table rather than by a fixed field set, because the
+        fixture that only ever built ``APPROVED`` and later is precisely why nothing in the
+        suite had exercised the one shape Phase 7 must write (ADR-022).
+        """
+
         started = NOW - timedelta(hours=2)
+        present = {
+            name: EXECUTION_FIELD_PRESENCE[name][state] is not FieldPresence.ABSENT
+            for name in EXECUTION_FIELD_PRESENCE
+        }
         return ActionExecution(
             execution_id=self.execution_id,
             action_id=self.action_id,
             case_id=self.case_id,
-            approval_id=self.approval_id,
+            approval_id=self.approval_id if present["approval_id"] else None,
             proposal_hash=digest(f"proposal:{self.seed}:0"),
             view_hash=digest(f"view:{self.seed}:0"),
-            idempotency_key=f"send-{self.seed}",
+            idempotency_key=f"send-{self.seed}" if present["idempotency_key"] else None,
             state=state,
-            rendered_message_hash=digest(f"rendered:{self.seed}"),
-            ses_request_token_hash=digest(f"ses-token:{self.seed}"),
-            ses_message_id=None,
-            started_at=started,
-            finished_at=None,
-            failure_code=None,
+            rendered_message_hash=(
+                digest(f"rendered:{self.seed}") if present["rendered_message_hash"] else None
+            ),
+            ses_request_token_hash=(
+                digest(f"ses-token:{self.seed}") if present["ses_request_token_hash"] else None
+            ),
+            ses_message_id=f"ses-{self.seed}" if present["ses_message_id"] else None,
+            started_at=started if present["started_at"] else None,
+            finished_at=(
+                started + timedelta(minutes=1)
+                if EXECUTION_FIELD_PRESENCE["finished_at"][state] is FieldPresence.REQUIRED
+                else None
+            ),
+            failure_code=(
+                "STALE_AUTHORIZATION"
+                if EXECUTION_FIELD_PRESENCE["failure_code"][state] is FieldPresence.REQUIRED
+                else None
+            ),
             failure_detail_safe=None,
             reconciled_at=None,
             version=version,
@@ -972,17 +1025,26 @@ class World:
             updated_at=started + timedelta(minutes=version),
         )
 
-    def action_pointer(self, *, version: int = 1, index: int = 0) -> CurrentActionPointer:
+    def action_pointer(
+        self,
+        *,
+        version: int = 1,
+        index: int = 0,
+        authorization_version: int = 1,
+        status: ActionProposalStatus = ActionProposalStatus.DRAFT,
+    ) -> CurrentActionPointer:
         return CurrentActionPointer(
             namespace=self.namespace,
             community_id=self.community_id,
             case_id=self.case_id,
             action_id=self.action_id,
+            execution_id=self.execution_id,
             proposal_hash=digest(f"proposal:{self.seed}:{index}"),
             view_id=self.view_id,
             view_hash=digest(f"view:{self.seed}:{index}"),
             case_version=1,
-            status=ActionProposalStatus.DRAFT,
+            authorization_version=authorization_version,
+            status=status,
             version=version,
             created_at=NOW - timedelta(hours=4),
             updated_at=NOW - timedelta(hours=4) + timedelta(minutes=version),

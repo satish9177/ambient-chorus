@@ -20,6 +20,7 @@ _SAFE_RECORD_FIELDS: Final[tuple[str, ...]] = (
     "community_id",
     "case_id",
     "case_version",
+    "authorization_version",
     "operation_id",
     "invocation_id",
     "entity_type",
@@ -28,6 +29,8 @@ _SAFE_RECORD_FIELDS: Final[tuple[str, ...]] = (
     "input_hash",
     "output_hash",
     "view_hash",
+    "proposal_hash",
+    "preview_hash",
     "policy_version",
     "prompt_version",
     "outcome",
@@ -37,8 +40,13 @@ _SAFE_RECORD_FIELDS: Final[tuple[str, ...]] = (
     "attempt",
     "retryable",
 )
-"""The allowlist, extended for the agent-invocation events Phase 3 emits and the compile
-events Phase 6 adds.
+"""The allowlist, extended for the agent-invocation events Phase 3 emits, the compile events
+Phase 6 adds, and the three fields Phase 7's action events name: the disclosure-authority
+epoch, the proposal digest, and the preview digest.
+
+``preview_hash`` is worth one sentence of its own. It is the digest of an external message body
+that is deliberately never persisted and never logged; the digest travels so an approval and a
+later send can be compared, and the bytes it covers do not.
 
 Every added field is an identifier, a digest, a version, or a count. There is deliberately no
 field for a message, a summary, a prompt, a completion, a quotation, or an exception message:
@@ -71,7 +79,7 @@ def _safe_log_value(field_name: str, value: object) -> object:
 
 
 _NUMERIC_FIELDS: Final[frozenset[str]] = frozenset(
-    {"duration_ms", "attempt", "case_version", "entity_version"}
+    {"duration_ms", "attempt", "case_version", "authorization_version", "entity_version"}
 )
 
 _MAX_COUNT_KEYS: Final = 20

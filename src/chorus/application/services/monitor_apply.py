@@ -281,6 +281,7 @@ class PlannedCase:
     case_id: CaseId
     existing_case: CommunityCase | None
     base_version: int
+    base_authorization_version: int
     step_count: int
     final_case: CommunityCase
     new_reports: tuple[Report, ...]
@@ -784,8 +785,16 @@ def _plan_case(
     )
 
     base_version = 0 if existing is None else existing.version
+    # The two counters move together here, and that is the ADR-020 § 2 answer for rows 1 and 2
+    # rather than an accident of symmetry. Creating a case starts a new authority epoch, and
+    # linking a report and its facts into an existing one brings new active facts and new
+    # report linkage -- both of which change what the compiler evaluates and what independence
+    # counts. A Monitor apply that moved only the OCC version would leave every view compiled
+    # before the linkage looking fresh.
+    base_authorization_version = 0 if existing is None else existing.authorization_version
     step_count = _step_count(len(new_reports) + len(new_facts) + len(decisions))
     final_version = base_version + step_count
+    final_authorization_version = base_authorization_version + step_count
 
     all_report_ids = tuple(
         sorted(known_report_ids | {report.report_id for report in new_reports}, key=str)
@@ -810,6 +819,7 @@ def _plan_case(
             corroboration_source_count=0,
             state_reason_code=CANDIDATE_REASON_CODE,
             version=final_version,
+            authorization_version=final_authorization_version,
             created_at=now,
             updated_at=now,
         )
@@ -825,6 +835,7 @@ def _plan_case(
             fact_ids=all_fact_ids,
             state_reason_code=CANDIDATE_EXTENDED_REASON_CODE,
             version=final_version,
+            authorization_version=final_authorization_version,
             updated_at=now,
         )
 
@@ -851,6 +862,7 @@ def _plan_case(
         case_id=case_id,
         existing_case=existing,
         base_version=base_version,
+        base_authorization_version=base_authorization_version,
         step_count=step_count,
         final_case=final_case,
         new_reports=new_reports,
@@ -1129,6 +1141,10 @@ def _case_at_step(case: PlannedCase, *, index: int) -> CommunityCase:
         report_ids=tuple(sorted(known_reports, key=str)),
         fact_ids=tuple(sorted(known_facts, key=str)),
         version=case.base_version + index + 1,
+        # Each intermediate step is a real committed case row, so its epoch advances with it.
+        # Carrying the final epoch on an intermediate row would make a partially applied answer
+        # look, to a concurrent compile, like more authority than had actually been written.
+        authorization_version=case.base_authorization_version + index + 1,
     )
 
 

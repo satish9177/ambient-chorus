@@ -13,7 +13,7 @@ from uuid import UUID
 
 import rfc8785
 
-from chorus.domain.entities import ActionClaim, ActionProposal, Approval
+from chorus.domain.entities import ActionCaveat, ActionClaim, ActionProposal, Approval
 from chorus.domain.ids import Sha256Digest, UUIDIdentifier
 from chorus.domain.mandates import DisclosureMandate
 from chorus.domain.time import format_utc
@@ -116,7 +116,25 @@ def hash_action_claim(claim: ActionClaim) -> Sha256Digest:
     return hash_value(claim, omit_fields=frozenset({"claim_hash"}))
 
 
+def hash_action_caveat(caveat: ActionCaveat) -> Sha256Digest:
+    """Seal one structured caveat exactly as a claim is sealed.
+
+    Through the same canonical authority rather than a second recipe, so a caveat and a claim
+    of identical text and citations hash by identical rules and neither can drift into a
+    weaker one (ADR-021 § 2).
+    """
+
+    return hash_value(caveat, omit_fields=frozenset({"caveat_hash"}))
+
+
 def hash_action_proposal(proposal: ActionProposal) -> Sha256Digest:
+    """Seal the whole proposal over every immutable field except its own digest.
+
+    Because the dataclass is walked field by field, this automatically covers the structured
+    caveats, ``authorization_version``, and ``preview_hash`` -- so an approval that binds
+    ``proposal_hash`` transitively binds the preview a human was shown.
+    """
+
     return hash_value(proposal, omit_fields=frozenset({"proposal_hash"}))
 
 

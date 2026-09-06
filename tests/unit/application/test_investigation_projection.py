@@ -101,6 +101,7 @@ def case(*, version: int = 3, issue_type: str = "ELEVATOR_FAILURE") -> Community
         corroboration_source_count=0,
         state_reason_code="SEEDED",
         version=version,
+        authorization_version=version,
         created_at=NOW,
         updated_at=NOW,
     )

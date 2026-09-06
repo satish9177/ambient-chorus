@@ -424,6 +424,7 @@ def build_elevator_fixture() -> ElevatorFixture:
         corroboration_source_count=4,
         state_reason_code="EVIDENCE_SUFFICIENT",
         version=1,
+        authorization_version=1,
         created_at=NOW - timedelta(days=3),
         updated_at=NOW - timedelta(days=1),
     )

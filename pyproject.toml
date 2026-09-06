@@ -249,6 +249,34 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "The Action runtime imports only its own public contract"
+type = "forbidden"
+source_modules = ["runtimes.action"]
+# The strictest of the three, and `chorus.domain` is forbidden here where it is merely absent
+# for the other two. The Action contract restates the view's shape and re-declares its closed
+# enums locally precisely so this runtime -- the one whose output becomes text somebody outside
+# the community reads -- imports no private module at all.
+#
+# The same single `botocore.config` exception applies: the runtime must pin its Bedrock client
+# to one attempt, Strands accepts that only as a `botocore.config.Config`, and that object
+# constructs no client, holds no credential, and reaches no service. A unit test asserts that
+# no other `boto3` or `botocore` module appears in the runtime source.
+ignore_imports = ["runtimes.action.agent -> botocore"]
+unmatched_ignore_imports_alerting = "none"
+forbidden_modules = [
+  "boto3",
+  "botocore",
+  "fastapi",
+  "aws_cdk",
+  "chorus.domain",
+  "chorus.privacy",
+  "chorus.ports",
+  "chorus.application",
+  "chorus.infrastructure",
+  "chorus_api",
+]
+
+[[tool.importlinter.contracts]]
 name = "Infrastructure implements ports without reaching into the privacy compiler"
 type = "forbidden"
 source_modules = ["chorus.infrastructure"]

@@ -52,6 +52,7 @@ from chorus.ports.storage import (
     AllOf,
     AttributeEqualsNumber,
     AttributeEqualsString,
+    CheckItem,
     ItemKey,
     KeyAbsent,
     PutItem,
@@ -62,6 +63,7 @@ from chorus.ports.storage import (
     TableName,
 )
 
+ATTR_VIEW_ID = "view_id"
 ATTR_VIEW_HASH = "view_hash"
 ATTR_PROPOSAL_HASH = "proposal_hash"
 ATTR_APPROVAL_HASH = "approval_hash"
@@ -396,6 +398,35 @@ class ShareableRepository:
             condition=AllOf(
                 (
                     AttributeEqualsNumber(name=ATTR_VERSION, value=expected.row_version),
+                    AttributeEqualsString(name=ATTR_VIEW_HASH, value=expected.view_hash.value),
+                )
+            ),
+        )
+
+    def stage_require_current_view_pointer(
+        self, scope: CaseScope, *, expected: ViewPointerExpectation
+    ) -> CheckItem:
+        """Assert the named view is still current, writing nothing (ADR-022 § 7).
+
+        A ``CheckItem`` and never a ``PutItem``: DynamoDB authorizes a transaction through the
+        permission each participant needs, so this participant requires
+        ``dynamodb:ConditionCheckItem`` alone and the application never gains a write on a
+        compiler-owned prefix in order to perform it.
+
+        ``view_id`` is required here even though the pointer *replace* does not need it. The
+        replace already knows which row it read from the row version it is superseding; this
+        guard sits on the far side of a model invocation, so it names the whole identity of the
+        pointer that authorized the answer rather than only the shape of the row.
+        """
+
+        if expected.view_id is None:
+            raise ValueError("a current-view condition names the exact view it read")
+        return CheckItem(
+            key=codec_share.view_pointer_key(scope),
+            condition=AllOf(
+                (
+                    AttributeEqualsNumber(name=ATTR_VERSION, value=expected.row_version),
+                    AttributeEqualsString(name=ATTR_VIEW_ID, value=str(expected.view_id)),
                     AttributeEqualsString(name=ATTR_VIEW_HASH, value=expected.view_hash.value),
                 )
             ),

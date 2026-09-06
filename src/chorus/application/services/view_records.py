@@ -34,8 +34,10 @@ def to_stored_view(view: ShareableCaseView) -> StoredShareableView:
         case_id=CaseId(view.case_id),
         community_public_label=view.community_public_label,
         case_version=view.case_version,
+        authorization_version=view.authorization_version,
         policy_version=view.policy_version,
         compiler_version=view.compiler_version,
+        policy_build_hash=view.policy_build_hash,
         destination=StoredSafeDestination(
             destination_id=view.destination.destination_id,
             kind=view.destination.kind,

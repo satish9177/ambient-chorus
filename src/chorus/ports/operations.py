@@ -17,7 +17,14 @@ from typing import Protocol
 from uuid import UUID
 
 from chorus.domain.entities import ApplicationOperation
-from chorus.domain.ids import CaseId, CommunityId, Namespace, OperationId, Sha256Digest
+from chorus.domain.ids import (
+    CaseId,
+    CommunityId,
+    Namespace,
+    OperationId,
+    Sha256Digest,
+    ViewId,
+)
 from chorus.ports.records import MessageFeedEntry
 
 
@@ -88,6 +95,41 @@ class InvestigationOperationJob:
             raise ValueError("an investigation job names why it was asked for")
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProposeActionOperationJob:
+    """One action proposal for one case, addressed by identity, version, and exact view.
+
+    It names a case, the version of it the request was made against, and the exact view the
+    proposal must be bound to -- and nothing else. There is deliberately no field for a subject,
+    a claim, a recipient, a tone, or any part of a message: the payload the Action Agent sees is
+    the compiled view, assembled by the use case from storage, so neither a queue message nor an
+    HTTP caller can steer what it reads or what it may say.
+
+    ``view_id`` and ``view_hash`` are carried because they are two thirds of the binding digest.
+    A job that named a different view under a valid-looking request would otherwise reach a
+    worker with nothing to disagree with.
+    """
+
+    operation_id: OperationId
+    namespace: Namespace
+    community_id: CommunityId
+    case_id: CaseId
+    invocation_id: UUID
+    correlation_id: UUID
+    actor_id_hash: Sha256Digest
+    request_hash: Sha256Digest
+    expected_case_version: int
+    view_id: ViewId
+    view_hash: Sha256Digest
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        if self.expected_case_version < 1:
+            raise ValueError("a proposal job names a positive case version")
+        if not self.idempotency_key:
+            raise ValueError("a proposal job names the key its operation was started under")
+
+
 class OperationDispatchPort(Protocol):
     """Hand one job to whatever executes work outside the caller's request."""
 
@@ -102,6 +144,9 @@ class OperationDispatchPort(Protocol):
     async def dispatch_investigation(self, job: InvestigationOperationJob) -> None:
         """Deliver the investigation job at least once, with the same guarantees."""
 
+    async def dispatch_propose_action(self, job: ProposeActionOperationJob) -> None:
+        """Deliver the proposal job at least once, with the same guarantees."""
+
 
 class InvestigationJobRunner(Protocol):
     """Execute one investigation job to a terminal operation status."""
@@ -112,6 +157,19 @@ class InvestigationJobRunner(Protocol):
         Implementations record failure on the operation rather than raising, for the same
         reason the Monitor runner does: an at-least-once dispatcher must never be told to retry
         an agent invocation implicitly.
+        """
+
+
+class ProposeActionJobRunner(Protocol):
+    """Execute one proposal job to a terminal operation status."""
+
+    async def execute(self, job: ProposeActionOperationJob) -> ApplicationOperation:
+        """Run the job and return the operation as it now stands.
+
+        Implementations record failure on the operation rather than raising, for the same reason
+        the other two runners do: an at-least-once dispatcher must never be told to retry an
+        agent invocation implicitly -- and here a second invocation would write a second
+        candidate message for one case.
         """
 
 

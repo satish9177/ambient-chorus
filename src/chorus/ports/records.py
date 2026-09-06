@@ -604,8 +604,13 @@ class StoredShareableView:
     case_id: CaseId
     community_public_label: str
     case_version: int
+    """The Core OCC version observed at compile time. Provenance only (ADR-020 § 4)."""
+    authorization_version: int
+    """The disclosure-authority epoch this view is valid against; the freshness comparison."""
     policy_version: str
     compiler_version: str
+    policy_build_hash: Sha256Digest
+    """The exact policy build that compiled this view, compared by the proposal (ADR-020)."""
     destination: StoredSafeDestination
     purpose: Purpose
     generated_at: datetime
@@ -622,8 +627,8 @@ class StoredShareableView:
         require_utc(self.expires_at)
         if self.expires_at <= self.generated_at:
             raise ValueError("view expiry must be after generation")
-        if self.case_version < 1:
-            raise ValueError("case version must be positive")
+        if self.case_version < 1 or self.authorization_version < 1:
+            raise ValueError("case and authorization versions must be positive")
         if not self.shareable_facts:
             raise ValueError("a stored view always contains at least one safe fact")
         export_ids = tuple(fact.export_fact_id for fact in self.shareable_facts)
@@ -644,14 +649,17 @@ class CurrentViewPointer:
     view_id: ViewId
     view_hash: Sha256Digest
     case_version: int
+    authorization_version: int
+    """The epoch the named view is valid against, carried so a caller can perform the exact
+    staleness comparison from one strongly read pointer without loading the view behind it."""
     expires_at: datetime
     version: int
     created_at: datetime
     updated_at: datetime
-    schema_version: str = "current-view-pointer/v1"
+    schema_version: str = "current-view-pointer/v2"
 
     def __post_init__(self) -> None:
-        if self.case_version < 1 or self.version < 1:
+        if self.case_version < 1 or self.version < 1 or self.authorization_version < 1:
             raise ValueError("versions must be positive")
         require_utc(self.expires_at)
         require_utc(self.created_at)
@@ -687,18 +695,30 @@ class CurrentActionPointer:
     community_id: CommunityId
     case_id: CaseId
     action_id: ActionId
+    execution_id: ExecutionId
+    """The one execution this proposal has, named rather than derived.
+
+    V1 permits exactly one execution per action, and that fact used to be expressed by
+    deriving the execution identity from the action identity with a UUIDv5. The frozen model
+    says both are UUIDv4 (ADR-020/021/022 authorize no derivation), so the relationship is
+    recorded here instead -- which is where a strongly read pointer can answer "which execution
+    belongs to the current proposal" without a lookup and without a derivation rule.
+    """
     proposal_hash: Sha256Digest
     view_id: ViewId
     view_hash: Sha256Digest
     case_version: int
+    authorization_version: int
+    """The epoch the named proposal is valid against; the same comparison the view pointer
+    carries, so neither artifact has to be loaded to decide whether it has gone stale."""
     status: ActionProposalStatus
     version: int
     created_at: datetime
     updated_at: datetime
-    schema_version: str = "current-action-pointer/v1"
+    schema_version: str = "current-action-pointer/v2"
 
     def __post_init__(self) -> None:
-        if self.case_version < 1 or self.version < 1:
+        if self.case_version < 1 or self.version < 1 or self.authorization_version < 1:
             raise ValueError("versions must be positive")
         require_utc(self.created_at)
         require_utc(self.updated_at)
@@ -736,10 +756,18 @@ class MandatePointerExpectation:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ViewPointerExpectation:
-    """Exact current-view-pointer state a conditional replace requires."""
+    """Exact current-view-pointer state a conditional replace, or a condition check, requires.
+
+    ``view_id`` is optional because the compiler's conditional *replace* does not need it: the
+    row version and the hash it is replacing already identify the exact pointer it read. The
+    application's read-only :meth:`stage_require_current_view_pointer` does need it, because an
+    entire model invocation sits between the read and the write and the condition has to name
+    the whole identity of the row that authorized the answer (ADR-022 § 7).
+    """
 
     row_version: int
     view_hash: Sha256Digest
+    view_id: ViewId | None = None
 
     def __post_init__(self) -> None:
         if self.row_version < 1:

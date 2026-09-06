@@ -522,6 +522,7 @@ async def _store_case(
         corroboration_source_count=0,
         state_reason_code="SEEDED_FOR_TEST",
         version=1,
+        authorization_version=1,
         created_at=now,
         updated_at=now,
     )
