@@ -381,7 +381,11 @@ async def test_a_transaction_can_check_the_case_and_the_fence_together(
     plan = TransactionPlan(
         name="two-partition-guards",
         operations=(
-            repository.stage_require_case_version(scope, expected_version=case.version),
+            repository.stage_require_case_version(
+                scope,
+                expected_version=case.version,
+                expected_authorization_version=case.authorization_version,
+            ),
             repository.stage_require_no_live_send_fence(scope, now=NOW),
             repository.stage_create_report(scope, PRIMARY.report()),
         ),

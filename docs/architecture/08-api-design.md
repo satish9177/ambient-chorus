@@ -61,7 +61,7 @@ Lambda async delivery may repeat; the operation/input hash and underlying comman
 | `POST /cases/{case_id}/mandates/{mandate_id}/decisions` | same contributor | 200 new version | expected current version; no active send fence |
 | `POST /cases/{case_id}/investigations` | presenter admin | 202 operation | case in candidate/awaiting/investigating/terminal-reopen flow |
 | `POST /cases/{case_id}/views` | presenter admin | 200 ALLOW view or 422 DENY | expected case version; compiler idempotency |
-| `POST /cases/{case_id}/actions` | presenter admin | 202 proposal operation | current non-expired view; state ready |
+| `POST /cases/{case_id}/actions` | presenter admin | 202 proposal operation | current non-expired view; state ready; matching `authorization_version`; no live `DRAFT` proposal |
 | `POST /cases/{case_id}/actions/{action_id}/approvals` | case approver | 200 approval/execution | exact proposal/view hashes; state draft |
 | `POST /cases/{case_id}/actions/{action_id}/executions` | case approver | 202 send operation | matching unexpired approval; safe replay by execution ID |
 | `POST /demo/external-replies` | presenter admin | 202 investigation operation | demo only; same case/action; message uniqueness |
@@ -121,13 +121,15 @@ A `MONITOR` operation may also move `RUNNING→PENDING` when a frozen validated 
 `GET /v1/cases/{case_id}` returns `CaseSurfaceResponse`:
 
 ```text
-case: {case_id,title,state,version,issue_type,corroboration_source_count}
+case: {case_id,title,state,version,authorization_version,issue_type,corroboration_source_count}
 evidence_summary: [{fact_id,safe_label,evidence_status}]
 current_shareable_view: ShareableCaseView | null
-current_action: ActionProposal + rendered_preview + execution | null
+current_action: ActionProposal + rendered_preview + execution | null   # preview regenerated, never stored
 commitments: [CommitmentSafeProjection]
 privacy_counts: {included,excluded,denied_by_reason}
 ```
+
+`current_action` is the Phase-7 section and is served by `ReadCurrentAction`: the immutable proposal's safe fields, the **regenerated** plain-text and HTML preview with the `preview_hash` the proposal committed and whether the two still agree, and the safe `DRAFT` execution projection. Nothing is read back from a persisted body, because ADR-022 § 3 stores neither. The remaining sections arrive with the phases that own their artifacts; a case with no proposal returns `current_action: null`, which is a state rather than an error. Reading a `DRAFT` here is Phase 7 — approving or sending one is Phase 8, and neither verb exists on this surface.
 
 For `case_approver`, private title/fact labels and privacy exclusion reasons are omitted; only view/action-safe fields remain. `GET .../investigation` returns reports, private facts, contradictions, root/independence groups, assessment, and per-fact compile inclusion/exclusion explanations to presenter admin. Contradictions are returned structured, each with its cited fact IDs, description, and `materiality`; alternative explanations are returned with their citations; each fact carries its resolved `evidence_status`. It never returns contributor contact or private S3 URI; private evidence uses a separate controlled preview reference.
 
@@ -170,7 +172,9 @@ Compile idempotency uses the ordinary two-part identity, and `compile_id` does n
 
 ### Propose, approve, execute
 
-`POST /v1/cases/{case_id}/actions` body `{expected_case_version,view_id,view_hash}` returns 202 Action operation. The case must be `READY_FOR_ACTION`, and the pointer/hash/expiry must be current.
+`POST /v1/cases/{case_id}/actions` body `{expected_case_version,view_id,view_hash}` returns 202 Action operation. The case must be `READY_FOR_ACTION`, its `authorization_version` must equal the view's, and the pointer/hash/expiry must be current. A request arriving while a valid current `DRAFT` proposal stands is 409 with nothing written and no model call.
+
+Proposing uses two idempotency records under one `PROPOSE_ACTION` command family, following the asynchronous investigation's shape: a route/start reservation in the `NAMESPACE` partition binding the key to one operation and one `agent_invocation_id`, and an action-apply commit proof in the `ACTION` partition under a domain-separated key hash. Same key and same request hash returns the same operation and calls no model; a different request hash is 409 `IDEMPOTENCY_CONFLICT` with zero mutations.
 
 `POST .../actions/{action_id}/approvals` body:
 
@@ -180,11 +184,11 @@ Compile idempotency uses the ordinary two-part identity, and `compile_id` does n
   "expected_execution_version": 1,
   "view_hash": "sha256:...",
   "proposal_hash": "sha256:...",
-  "rendered_message_hash": "sha256:..."
+  "preview_hash": "sha256:..."
 }
 ```
 
-Returns immutable approval and execution `APPROVED`. Reject returns decision and leaves execution `DRAFT`/proposal for rework. Preview hash mismatch is 409.
+Returns immutable approval and execution `APPROVED`. `preview_hash` is the proposal's immutable preview binding, not the execution's later `rendered_message_hash`; a mismatch is 409. Reject returns the decision and atomically invalidates the current action pointer, moves the `DRAFT` execution to `FAILED`, and returns the case to `READY_FOR_ACTION` if readiness remains — which is the only path that clears a proposal so a new one may be created.
 
 `POST .../actions/{action_id}/executions` body `{execution_id,expected_execution_version,approval_id}` returns 202. It never accepts recipient, subject, body, claim, attachment, or retry flag. Poll operation/case for `SENT|FAILED|SEND_UNKNOWN`.
 

@@ -340,6 +340,7 @@ class InvestigationHarness:
             corroboration_source_count=corroboration_source_count,
             state_reason_code="SEEDED",
             version=1,
+            authorization_version=1,
             created_at=now,
             updated_at=now,
         )

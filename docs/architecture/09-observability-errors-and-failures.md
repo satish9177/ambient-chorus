@@ -25,9 +25,10 @@ actor_id_hash          sha256 digest|null
 community_id           UUID|null
 case_id                UUID|null
 case_version           int|null
+authorization_version  int|null
 entity_type / entity_id / entity_version
 operation_id / invocation_id / execution_id / commitment_id
-input_hash / output_hash / view_hash / proposal_hash
+input_hash / output_hash / view_hash / proposal_hash / preview_hash
 policy_version / prompt_version / template_version
 outcome                 SUCCEEDED|DENIED|FAILED|REPLAYED|UNKNOWN
 reason_codes            bounded enum array
@@ -53,7 +54,7 @@ Strands/OpenTelemetry content capture is disabled. An exporter processor drops `
 | investigation | `investigation.applied`, `evidence.independence.computed`, `contradiction.recorded`, `evidence.status.downgraded`; counts/IDs/statuses. The downgrade event carries the fact ID, the computed status, and the proposed status — codes and identifiers only, never rationale text |
 | mandate | `mandate.requested`, `mandate.decided`, `mandate.denied`; case/mandate IDs, version, decision and status codes, granted-fact count, one identity-shared bit, denial reason codes |
 | compiler | `compile.started/allowed/denied`, `compile.fact.included/excluded`, `view.persisted`; opaque IDs, rule/reason, scope, hashes |
-| action | `proposal.validated/denied`, `approval.recorded/conflict`, `send.fence.acquired/denied/released`; IDs/hashes |
+| action | `proposal.requested`, `proposal.validated/denied`, `proposal.stale_rejected`, `proposal.persisted`, `proposal.replayed`, `approval.recorded/conflict`, `send.fence.acquired/denied/released`; IDs, hashes, bounded `ActionRejection` codes, and counts only — never claim, request, caveat, subject, or rendered body text |
 | SES | `execution.sending/sent/failed/unknown/reconciled`; execution ID, safe error, SES ID when known |
 | commitment | `commitment.created`, `schedule.created/failed`, `commitment.due/replayed/fulfilled/missed`; IDs/generation |
 | security | `cross_case.denied`, `private_uri.denied`, `prompt_injection.observed`, `iam.probe.denied`; no malicious content |
@@ -148,7 +149,14 @@ Policy denial is not logged as an application error. Unknown exceptions become `
 | mandate adjusted/changed | append version, bump case, stale old view/proposal | no mutation in place | old artifacts retained, current pointer changes | UI requires recompile |
 | contributor revokes after prior compile | revoke waits for any active send fence; then bumps snapshot | exact revoke replay; no future old export | old view retained historical but stale | send denied if revoke ordered first; revocation visible |
 | mandate expires | compiler/send check `now < expires_at`; equality is expired | no same-artifact retry | view/proposal stale; unsent action fails | `MANDATE_EXPIRED`; new mandate required |
-| case version changes after compile | proposal/send current pointer check fails | recompile/re-propose | old view immutable, not current | 409 stale authorization |
+| case **authorization version** changes after compile | proposal pre-invocation check and the apply transaction's case condition both fail; the send fence denies | recompile/re-propose | old view immutable, not current | 409 stale authorization |
+| case **OCC version** changes without an authorization change — a lifecycle transition such as `READY_FOR_ACTION→ACTION_PROPOSED` | nothing is stale; `authorization_version` is carried forward and the view stays valid | none needed | proposal, `DRAFT` execution, and case all commit together | no error; the send fence checks case *state* and `authorization_version`, never the OCC version ([ADR-020](../adr/ADR-020-case-authorization-version.md)) |
+| current view pointer moves while the Action model is running | the proposal apply transaction's `VIEW_CURRENT` condition check fails | **no automatic second invocation**; the command may be restarted under a new key against the new view | no proposal, no `DRAFT` execution, no pointer move, no case transition | operation `FAILED`; 409 stale authorization |
+| action proposal requested while a valid `DRAFT` stands | refused before any model call | none; the human must reject or edit the existing proposal first | nothing written; the pending proposal and its execution are untouched | 409 conflict |
+| proposal apply committed but the operation's `SUCCEEDED` write was lost | the redelivery proves the handover, reads the durable `ACTION` invocation record, and transcribes the status | replay-safe; **zero** model calls | proposal and `DRAFT` execution stand | `operation.resumed` |
+| the view expires while the Action model is answering | a second clock read immediately before staging finds `now >= view.expires_at`; equality is expired | **no automatic second invocation**; a fresh compile and a new operation are required | nothing written: no proposal, no `DRAFT` execution, no pointer move, no history locator, no *successful* invocation record, no case transition | operation `FAILED`; 409 stale authorization with `VIEW_EXPIRED` |
+| proposal apply outcome is **unknown** — the transaction may or may not have committed | recovery is attempted from the durable proof participants: the `ACTION` invocation record and the apply commit proof. Proven committed → `SUCCEEDED`. A strong read proving no record exists → terminal failure. Proof storage itself unavailable → the operation stays `RUNNING` and **recoverable** | **zero** model calls on every branch; a later delivery retries the *proof read*, never the model. The stale-`RUNNING` timeout is gated behind a proof read that succeeded and found nothing, because elapsed time is not evidence about a transaction | whatever actually committed | `operation.resumed`, or the operation left `RUNNING` |
+| a durable `SUCCEEDED` invocation record is found during recovery | it is proof only if it is *this* operation's: scope, invocation identity, `agent == ACTION`, prompt version, the expected input hash recomputed from the immutable bound view, and an exact `{ACTION_PROPOSAL, ACTION_EXECUTION}` result-reference set are all verified first | never a model call | a mismatched record transitions nothing | integrity error; the operation stays `RUNNING` |
 | policy version changes after approval | send-fence acquisition denies | never send old approval | execution `FAILED/STALE_AUTHORIZATION` | new compile/proposal/approval required |
 | concurrent approval/double approve | conditional one-active approval wins | exact key returns winner; other conflicts | one approval/one execution approved | 409 for conflicting decision |
 | double-click send/repeated Lambda invoke | state read/CAS permits only one `APPROVED→SENDING` | same execution key returns current result | one execution and at most one SES call | replay audit; UI polls state |

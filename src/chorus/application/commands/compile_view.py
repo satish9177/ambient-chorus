@@ -21,8 +21,10 @@ append a second record of one decision, and a conservative stale denial is safe 
 because it grants no authority.
 
 **Nothing here touches Core.** The compiler's only Core write is the send fence, so the case
-participates as a check-only condition. A compile that bumped the case version would stale the
-very view it had just produced against the exact-version check the proposal validator performs.
+participates as a check-only condition -- one participant carrying *two* conditions, the exact
+OCC ``version`` and the exact ``authorization_version`` the compile strongly loaded (ADR-020).
+The second is the term the produced view's snapshot is bound to; the first costs nothing
+because this command never writes the case row at all.
 """
 
 from __future__ import annotations
@@ -128,12 +130,13 @@ ALLOW_FIXED_TRANSACTION_PARTICIPANTS = 8
 1. the immutable view; 2. the current-view pointer, conditionally replaced or created;
 3. the immutable view-history locator; 4. the ``compile.allowed`` audit event; 5. the immutable
 compiler audit projection; 6. the completed idempotency record, which is also the plan's commit
-proof; 7. a check that the case still stands at the expected version; 8. a check that no live
-send fence holds the case.
+proof; 7. a check that the case still stands at the expected OCC version *and* the expected
+authorization version, both inside one ``CheckItem``; 8. a check that no live send fence holds
+the case.
 
 Independent of how many facts or evidence items the request named. There are deliberately no
 per-fact and no per-mandate conditions: every authorization-sensitive mutation already bumps
-the case version, so participant 7 covers all of them at the cost of one operation. A test
+both case counters, so participant 7 covers all of them at the cost of one operation. A test
 asserts this number against ``len(plan.operations)``, so a silently added participant fails
 before anything reaches storage.
 """
@@ -444,6 +447,7 @@ class CompileView:
             view_id=result.view.view_id,
             view_hash=result.view.view_hash,
             case_version=result.view.case_version,
+            authorization_version=result.view.authorization_version,
             expires_at=result.view.expires_at,
             version=1 if pointer_row is None else pointer_row.version + 1,
             created_at=now if pointer_row is None else pointer_row.created_at,
@@ -513,9 +517,14 @@ class CompileView:
                 response_status=200,
                 now=now,
             ),
-            # 7. the case has not moved since it was read
+            # 7. the case has not moved since it was read -- neither its OCC row version nor
+            #    its authorization epoch. Two conditions inside one participant (ADR-020 § 6),
+            #    so the fixed count stays at eight while the view's own snapshot term is what
+            #    the second condition actually guards.
             self.core.stage_require_case_version(
-                scope, expected_version=command.expected_case_version
+                scope,
+                expected_version=command.expected_case_version,
+                expected_authorization_version=state.case.authorization_version,
             ),
             # 8. no authorized send is in flight
             self.core.stage_require_no_live_send_fence(scope, now=now),

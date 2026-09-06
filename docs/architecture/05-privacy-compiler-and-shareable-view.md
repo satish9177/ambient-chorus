@@ -78,7 +78,9 @@ Evaluation is stable and stops as specified. Reason codes are enums; no private 
 
 The single DynamoDB transaction is the **sole authorization commit point** for a compile. A sanitized evidence derivative written to its content-addressed export key beforehand confers no authority until that transaction commits ([ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md)).
 
-An **ALLOW** writes eight fixed participants — the immutable view; the current-view pointer; the immutable view-history locator; the `compile.allowed` audit event; the immutable compiler audit projection; the completed idempotency record that is also the plan's commit proof, written to the case's `VIEW_CURRENT` partition because that is the case-scoped Shareable partition inside the compiler's `LeadingKeys` write grant; a check that the case still stands at `expected_case_version`; and a check that no live send fence holds the case. The count is fixed and independent of how many facts or evidence items the request named.
+An **ALLOW** writes eight fixed participants — the immutable view; the current-view pointer; the immutable view-history locator; the `compile.allowed` audit event; the immutable compiler audit projection; the completed idempotency record that is also the plan's commit proof, written to the case's `VIEW_CURRENT` partition because that is the case-scoped Shareable partition inside the compiler's `LeadingKeys` write grant; a check that the case still stands at both the exact `version` and the exact `authorization_version` the compile strongly loaded; and a check that no live send fence holds the case. The count is fixed and independent of how many facts or evidence items the request named.
+
+The case check carries **two conditions in one participant**, not two participants. The compiler never writes the case row, so requiring the exact OCC `version` costs it nothing and keeps its mid-flight race protection exactly as it stands; the `authorization_version` condition is what the produced view's snapshot is actually bound to.
 
 A **DENY** writes no `ShareableCaseView`, no history locator, no safe-evidence reference, and makes **no change to the current pointer** — a denial never invalidates a view that is still valid. It does atomically persist the `compile.denied` audit event, the compiler audit projection, and the completed idempotency record carrying the deterministic denial response. Persisting the denial is what makes a redelivered command replay its answer instead of appending a second record of one decision, and a conservative stale denial is safe to record because it grants no authority. A later attempt under changed circumstances is a new command under a new idempotency key.
 
@@ -90,7 +92,9 @@ Every `ALLOW` replaces the current pointer, conditioned on the **exact** pointer
 
 The pointer is **case-scoped**, and that is sufficient *only because* policy/v1 has exactly one purpose and exactly one destination, so no two live compiles of a case can disagree about where their view was going. Adding a second purpose or a second destination requires its own ADR deciding how the pointer is re-keyed; it is not a configuration change.
 
-Historical views are immutable. A revocation arriving after a view was compiled neither rewrites nor deletes that view and does not clear the pointer: the artifact remains historical, and staleness is caught at proposal time and at fence acquisition through `authorization_snapshot_hash` and `case_version`.
+Historical views are immutable. A revocation arriving after a view was compiled neither rewrites nor deletes that view and does not clear the pointer: the artifact remains historical, and staleness is caught at proposal time and at fence acquisition through `authorization_snapshot_hash` and `authorization_version`.
+
+Because a still-current pointer can therefore name a view whose authorization has since been withdrawn, the pointer alone is never sufficient for a proposal. The pointer proves *which* view is current; the strongly read Core case proves the world has not moved under it.
 
 An integrity, structural, cross-case, stale, transformation, or persistence problem denies the whole compile. Policy ineligibility can exclude only `OPTIONAL` inputs. `CompileDecision` includes `included` and `excluded` entries by opaque IDs/reason codes for the private UI; exclusion details are not part of the Action Agent input.
 
@@ -133,13 +137,15 @@ The demo malicious instruction and `mother_health_condition`, apartment number, 
 
 ```text
 ShareableCaseView
-  schema_version: literal "shareable-case-view/v1"
+  schema_version: literal "shareable-case-view/v2"
   view_id: UUID
   case_id: UUID
   community_public_label: str[1..120]
-  case_version: positive int
+  case_version: positive int              # Core OCC version at compile time; provenance only
+  authorization_version: positive int     # the epoch this view is valid against
   policy_version: literal "policy/v1"
   compiler_version: semantic build identifier
+  policy_build_hash: Sha256Digest        # the exact rule build; compared at proposal/fence time
   destination: SafeDestination
     { destination_id, kind, registry_version, routing_token, display_label }
   purpose: Purpose
@@ -154,7 +160,11 @@ ShareableCaseView
   view_hash: Sha256Digest
 ```
 
-`mandate_version_set` contains only mandates actually relied upon by included facts, with opaque UUIDs and terms hashes—not contributor IDs, statuses, terms, or contacts. `expires_at` is the earlier of the policy/v1 15-minute lifetime and the earliest expiry among those relied-on mandates, so the artifact cannot outlive its grant. `authorization_snapshot_hash` covers the current case version, current policy build hash, and **all evaluated current mandate pointer/version/terms hashes**, including optional excluded candidates. This makes a relevant authorization change stale even if the current visible content would coincidentally look the same.
+`mandate_version_set` contains only mandates actually relied upon by included facts, with opaque UUIDs and terms hashes—not contributor IDs, statuses, terms, or contacts. `expires_at` is the earlier of the policy/v1 15-minute lifetime and the earliest expiry among those relied-on mandates, so the artifact cannot outlive its grant. `authorization_snapshot_hash` covers the current case **authorization version**, current policy build hash, and **all evaluated current mandate pointer/version/terms hashes**, including optional excluded candidates, beside the per-candidate `{fact_id, version, status, evidence_status}` tuples and the destination and purpose. This makes a relevant authorization change stale even if the current visible content would coincidentally look the same.
+
+`policy_build_hash` is a member of the view as well as of the snapshot, and the duplication is deliberate. [ADR-020](../adr/ADR-020-case-authorization-version.md) § 3 puts the policy build, the compiler version, the destination registry version, and the routing token *outside* the case authorization epoch because they are deployment-owned, and requires them to be "re-checked by exact equality at proposal and fence time". That check needs a value a consumer can read: verifying `authorization_snapshot_hash` proves only that the old view is internally coherent, which a view compiled by a superseded build also is. A digest buried inside a snapshot is not a value anybody can compare.
+
+The coarse case term is `authorization_version` and not the Core OCC `version` ([ADR-020](../adr/ADR-020-case-authorization-version.md) § 5). Every fine-grained binding beside it is unchanged; only the backstop is retargeted, from a number that moves for two reasons to one that moves for one. `case_version` remains in the view as provenance — it records which row revision the artifact was built beside — and **nothing consults it for authorization**. Reading a stored `case_version` as a requirement that the Core row must never advance again is exactly the defect ADR-020 removed.
 
 `SafeDestination.routing_token` is a random UUID rotated whenever the actual recipient routing changes; it is not derived from the email address. The compiler has only the safe registry metadata. The sender secret contains the same token/version and the actual verified address; a mismatch is stale authorization.
 
@@ -174,7 +184,9 @@ A **distinct logical compile** may carry a different `compile_id`, `view_id`, an
 
 An idempotent **replay** of a completed compile returns the persisted result. It mints no new identifiers, recomputes no view, and re-runs no gate. Golden view-hash tests pin the compile ID, the clock, and the ID sequence explicitly; a golden hash is a statement about fixed inputs, never about a repeated command.
 
-Authorization-sensitive changes that must increment case version and/or snapshot are: active fact/value/status/evidence-status changes; report linkage; evidence root/safety changes; mandate current version/decision/revocation/expiry correction; destination routing token/version or purpose registry change; policy/compiler version; and safe transformation review result. Presentation-only UI changes do not.
+Authorization-sensitive changes that must increment the case **authorization version** and/or the snapshot are: active fact/value/status/evidence-status changes; report linkage; evidence root/safety changes; mandate current version/decision/revocation/expiry correction; destination routing token/version or purpose registry change; policy/compiler version; and safe transformation review result. Presentation-only UI changes do not, and neither does a **case state transition** — lifecycle progress is not itself disclosure authority.
+
+The first four of those are case-owned and increment `CommunityCase.authorization_version`; the exhaustive per-command table is [ADR-020](../adr/ADR-020-case-authorization-version.md) § 2. The last three are deployment or configuration facts, not case facts, and are covered individually inside the snapshot and re-checked by exact equality rather than by any counter — a configuration change must not become a fan-out write across every case row to record something true of the deployment. Time is likewise not a counter: mandate and view expiry are governed by the injected clock against `expires_at`, with equality at expiry meaning expired.
 
 ## Compile output
 
@@ -187,15 +199,17 @@ The API maps policy denial to HTTP 422, stale state to 409, caller isolation fai
 
 ## Freshness and send authorization fence
 
-At proposal time, application code strongly reads the current view pointer and verifies hash, case version, policy version, destination/purpose, snapshot hash, and expiry. The proposal binds `view_id/view_hash/case_version` and gets its own canonical `proposal_hash`. Approval binds both hashes exactly and expires after 15 minutes.
+At proposal time, application code strongly reads the current view pointer **and** the Core case, and verifies the pointer's `view_id`/`view_hash`, the recomputed view hash, case state `READY_FOR_ACTION`, the caller's expected OCC `version`, `authorization_version` equal to the view's, policy version, destination and purpose, snapshot hash, and expiry. The proposal binds `view_id`, `view_hash`, `authorization_version` (authority) and `case_version` (provenance), and gets its own canonical `proposal_hash`. Approval binds the proposal and view hashes exactly and expires after 15 minutes.
 
-Immediately before rendering/SES, the sender invokes `AcquireSendAuthorizationFence` with `{execution_id, action_id, approval_id, proposal_hash, view_id, view_hash, case_version, policy_version, destination, purpose, mandate_version_set, authorization_snapshot_hash, requested_at}`.
+Immediately before rendering/SES, the sender invokes `AcquireSendAuthorizationFence` with `{execution_id, action_id, approval_id, proposal_hash, view_id, view_hash, authorization_version, policy_version, destination, purpose, mandate_version_set, authorization_snapshot_hash, requested_at}`.
 
 The compiler:
 
 1. strongly reloads current Core state and policy;
 2. verifies the persisted view/proposal/approval hashes from Shareable via passed values and compiler-readable safe records;
-3. repeats case, policy, destination, purpose, expiry, current mandate/version/revocation, and snapshot checks;
+3. repeats the case, policy, destination, purpose, expiry, current mandate/version/revocation, and snapshot checks. Two of those are stated exactly, because getting either wrong is how a send is either wrongly refused or wrongly allowed:
+   - the case's **current state** must be the exact state permitted for a send. This is what stops a closed, resolved, or already-actioned case from sending, and it does the work that a coarse version comparison used to be assumed to do;
+   - the case's current `authorization_version` must equal the proposal's and the view's. The fence **must not** require the current `CommunityCase.version` to equal the proposal's recorded `case_version`: lifecycle progression — the very `READY_FOR_ACTION→ACTION_PROPOSED` transition that created this proposal — intentionally moved that number, and requiring it would fail every first send in the system ([ADR-020](../adr/ADR-020-case-authorization-version.md) § 6). The state check and the authorization check are separate obligations and neither substitutes for the other;
 4. conditionally creates the case's fence item — `NS#n#FENCE#k` / `SEND_FENCE`, its own partition so the compiler's Core write grant reaches nothing else ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md)) — with the execution ID and expiry `min(requested_at + 60 seconds, view expiry, approval expiry, earliest relied-on mandate expiry)`; fewer than five seconds of remaining authority denies instead of racing.
 
 Mandate decisions, revocations, and authorization-sensitive case mutations conditionally require no unexpired send fence. A concurrent revocation arriving after the fence returns a retryable 409 for at most 60 seconds; therefore the total order is explicit: either revocation commits first and send is denied, or send authorization commits first and the later revocation cannot unsend it. The sender checks its injected clock is still strictly before fence expiry immediately before the SES call, must call SES within the fence, then releases it in `finally`. Expired authority causes a definite pre-send stale failure. A crashed/expired fence paired with a `SENDING` execution is reconciled to `SEND_UNKNOWN`, never retried automatically.

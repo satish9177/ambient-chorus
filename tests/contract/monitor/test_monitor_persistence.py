@@ -271,6 +271,7 @@ def _draft_case(harness: MonitorHarness, scope: CaseScope) -> CommunityCase:
         corroboration_source_count=0,
         state_reason_code=CANDIDATE_REASON_CODE,
         version=1,
+        authorization_version=1,
         created_at=now,
         updated_at=now,
     )

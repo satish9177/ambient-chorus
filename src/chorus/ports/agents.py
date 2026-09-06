@@ -18,6 +18,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Protocol
 
+from chorus.contracts.action import ActionInput, ActionProposalDraft
 from chorus.contracts.common import AgentInputEnvelope, AgentResultEnvelope
 from chorus.contracts.investigation import (
     InvestigationAssessmentDraft,
@@ -30,6 +31,9 @@ type MonitorResult = AgentResultEnvelope[MonitorOutput]
 
 type InvestigationInvocation = AgentInputEnvelope[InvestigationInput]
 type InvestigationResult = AgentResultEnvelope[InvestigationAssessmentDraft]
+
+type ActionInvocation = AgentInputEnvelope[ActionInput]
+type ActionResult = AgentResultEnvelope[ActionProposalDraft]
 
 
 class AgentErrorCode(StrEnum):
@@ -105,7 +109,57 @@ class InvestigationRejection(StrEnum):
     TRANSACTION_BOUND_EXCEEDED = "TRANSACTION_BOUND_EXCEEDED"
 
 
-type AgentRejectionCode = AgentRejection | InvestigationRejection
+class ActionRejection(StrEnum):
+    """Every deterministic reason an Action proposal can be refused.
+
+    A third closed set beside :class:`AgentRejection` and :class:`InvestigationRejection`,
+    because the three agents are refused for different things: the Monitor invents reports, the
+    Investigator invents citations, and the Action Agent writes prose that has to be traceable
+    to a compiled safe fact. Sharing one enum would produce a vocabulary where most members can
+    never apply to a given caller, which is how a reason code stops meaning anything.
+
+    **Every member refuses the whole proposal.** There is no per-claim salvage, for the reason
+    ``InvestigationRejection`` already records: a model that wrote one ungrounded quantity has
+    demonstrated that the rest of its wording is unverified too, and keeping the acceptable
+    claims is exactly how an unsupported assertion reaches an external recipient. A rejected
+    proposal is never repaired silently, never partially persisted, and never adjudicated by a
+    second model; it may be re-proposed through a fresh allowed operation.
+
+    Each member is a bounded code and carries no offending text, so it is safe to log, audit,
+    and count without a redaction rule of its own.
+    """
+
+    SCHEMA_INVALID = "SCHEMA_INVALID"
+    ENVELOPE_MISMATCH = "ENVELOPE_MISMATCH"
+    PROMPT_VERSION_MISMATCH = "PROMPT_VERSION_MISMATCH"
+    VIEW_MISMATCH = "VIEW_MISMATCH"
+    STALE_VIEW = "STALE_VIEW"
+    UNKNOWN_EXPORT_FACT_ID = "UNKNOWN_EXPORT_FACT_ID"
+    FOREIGN_IDENTIFIER = "FOREIGN_IDENTIFIER"
+    EMPTY_CITATION_SET = "EMPTY_CITATION_SET"
+    DUPLICATE_CLAIM_ID = "DUPLICATE_CLAIM_ID"
+    DUPLICATE_NORMALIZED_TEXT = "DUPLICATE_NORMALIZED_TEXT"
+    UNSUPPORTED_TOKEN = "UNSUPPORTED_TOKEN"  # noqa: S105 - a closed reason code, not a credential
+    REJECTED_CONSTRUCT = "REJECTED_CONSTRUCT"
+    PHONE_PATTERN = "PHONE_PATTERN"
+    MAILTO_PATTERN = "MAILTO_PATTERN"
+    CONTRADICTED_FACT_NOT_CAVEATED = "CONTRADICTED_FACT_NOT_CAVEATED"
+    OUTPUT_EXCEEDS_BOUNDS = "OUTPUT_EXCEEDS_BOUNDS"
+    SUBJECT_INVALID = "SUBJECT_INVALID"
+    DEADLINE_NOT_AFTER_VIEW = "DEADLINE_NOT_AFTER_VIEW"
+    """A ``requested_deadline`` that is not strictly after ``view.generated_at``.
+
+    ADR-021 § 10 states the bound and the contract type cannot enforce it: the contract sees a
+    typed UTC instant and nothing else, while only the semantic validator holds the view the
+    instant must be after. A narrow code rather than ``REJECTED_CONSTRUCT``, because that member
+    names a *prose* scanner rule and a deadline is not prose -- reusing it would report a
+    grammar failure for a field the grammar never reads.
+    """
+    UNSUPPORTED_NAME = "UNSUPPORTED_NAME"
+    SENSITIVE_TERM = "SENSITIVE_TERM"
+
+
+type AgentRejectionCode = AgentRejection | InvestigationRejection | ActionRejection
 
 
 class AgentError(Exception):
@@ -197,6 +251,18 @@ class MonitorAgentPort(Protocol):
 
         Implementations must not retry internally: retry identity belongs to the application
         use case, which owns the invocation ID and knows whether anything was persisted.
+        """
+
+
+class ActionAgentPort(Protocol):
+    """Invoke the Action runtime exactly once with one compiled safe view."""
+
+    async def invoke_action(self, invocation: ActionInvocation) -> ActionResult:
+        """Return the strict result envelope, or raise a closed :class:`AgentError`.
+
+        The same contract as the other two ports, and for a sharper reason: this is the one
+        agent whose output becomes text an external recipient reads, so an adapter that
+        repaired a malformed answer would be editing a message nobody reviewed.
         """
 
 

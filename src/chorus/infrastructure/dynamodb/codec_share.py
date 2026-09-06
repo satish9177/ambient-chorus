@@ -9,11 +9,13 @@ from __future__ import annotations
 from typing import Final
 
 from chorus.domain.entities import (
+    ActionCaveat,
     ActionClaim,
     ActionExecution,
     ActionExecutionState,
     ActionProposal,
     ActionProposalStatus,
+    ActionTone,
     Approval,
     ApprovalDecision,
     Commitment,
@@ -34,6 +36,7 @@ from chorus.domain.ids import (
     ExecutionId,
     ExportFactId,
     SafeEvidenceRefId,
+    Sha256Digest,
     ViewId,
 )
 from chorus.infrastructure.dynamodb import keys
@@ -68,15 +71,32 @@ from chorus.ports.storage import ItemKey, StoredItem, StoredValue, TableName
 
 _SHARE: Final = TableName.SHAREABLE
 
-VIEW_SCHEMA_VERSIONS: Final = frozenset({"shareable-case-view/v1"})
-VIEW_POINTER_SCHEMA_VERSIONS: Final = frozenset({"current-view-pointer/v1"})
+VIEW_SCHEMA_VERSIONS: Final = frozenset({"shareable-case-view/v2"})
+VIEW_POINTER_SCHEMA_VERSIONS: Final = frozenset({"current-view-pointer/v2"})
 VIEW_HISTORY_SCHEMA_VERSIONS: Final = frozenset({"view-history-locator/v1"})
-PROPOSAL_SCHEMA_VERSIONS: Final = frozenset({"action-proposal/v1"})
+PROPOSAL_SCHEMA_VERSIONS: Final = frozenset({"action-proposal/v2"})
 APPROVAL_SCHEMA_VERSIONS: Final = frozenset({"approval/v1"})
-EXECUTION_SCHEMA_VERSIONS: Final = frozenset({"action-execution/v1"})
-ACTION_POINTER_SCHEMA_VERSIONS: Final = frozenset({"current-action-pointer/v1"})
+EXECUTION_SCHEMA_VERSIONS: Final = frozenset({"action-execution/v2"})
+ACTION_POINTER_SCHEMA_VERSIONS: Final = frozenset({"current-action-pointer/v2"})
+"""The accepted schema versions, four of them moved to ``/v2`` by the Phase-7 gate.
+
+Each set holds exactly one member, and the old spelling is **not** kept beside the new one.
+No V1 data has been deployed to AWS, so there is no row to migrate and nothing to read
+leniently -- and an accepted-set that still admitted ``/v1`` would be a reader that silently
+accepts an item with no authorization epoch, which is the one thing ADR-020 forbids.
+"""
 ACTION_HISTORY_SCHEMA_VERSIONS: Final = frozenset({"action-history-locator/v1"})
 COMMITMENT_SCHEMA_VERSIONS: Final = frozenset({"commitment/v1"})
+
+
+def _optional_digest(digest: Sha256Digest | None) -> StoredValue:
+    """Store a nullable digest as its string or as ``None``, never as a placeholder.
+
+    A sentinel digest in a field whose whole purpose is to bind exact bytes is a lie the
+    storage layer could not later distinguish from a real binding (ADR-022).
+    """
+
+    return None if digest is None else digest.value
 
 
 def view_key(scope: CaseScope, view_id: ViewId) -> ItemKey:
@@ -102,8 +122,10 @@ def encode_view(scope: CaseScope, view: StoredShareableView) -> StoredItem:
             "view_id": identifier(view.view_id),
             "community_public_label": view.community_public_label,
             "case_version": view.case_version,
+            "authorization_version": view.authorization_version,
             "policy_version": view.policy_version,
             "compiler_version": view.compiler_version,
+            "policy_build_hash": view.policy_build_hash.value,
             "destination": {
                 "destination_id": view.destination.destination_id.value,
                 "kind": view.destination.kind.value,
@@ -244,8 +266,10 @@ def decode_view(item: StoredItem) -> tuple[DecodedScope, StoredShareableView]:
         case_id=scope.case_id,
         community_public_label=reader.text("community_public_label"),
         case_version=reader.number("case_version"),
+        authorization_version=reader.number("authorization_version"),
         policy_version=reader.text("policy_version"),
         compiler_version=reader.text("compiler_version"),
+        policy_build_hash=reader.digest("policy_build_hash"),
         destination=destination,
         purpose=reader.enum("purpose", Purpose),
         generated_at=reader.instant("generated_at"),
@@ -284,6 +308,7 @@ def encode_view_pointer(scope: CaseScope, pointer: CurrentViewPointer) -> Stored
             "view_id": identifier(pointer.view_id),
             "view_hash": pointer.view_hash.value,
             "case_version": pointer.case_version,
+            "authorization_version": pointer.authorization_version,
             "expires_at": instant(pointer.expires_at),
             "version": pointer.version,
             "created_at": instant(pointer.created_at),
@@ -311,6 +336,7 @@ def decode_view_pointer(item: StoredItem) -> tuple[DecodedScope, CurrentViewPoin
         view_id=reader.identifier("view_id", ViewId),
         view_hash=reader.digest("view_hash"),
         case_version=reader.number("case_version"),
+        authorization_version=reader.number("authorization_version"),
         expires_at=reader.instant("expires_at"),
         version=reader.number("version"),
         created_at=reader.instant("created_at"),
@@ -397,6 +423,7 @@ def encode_proposal(scope: ActionScope, proposal: ActionProposal) -> StoredItem:
         {
             "action_id": identifier(proposal.action_id),
             "case_version": proposal.case_version,
+            "authorization_version": proposal.authorization_version,
             "view_id": identifier(proposal.view_id),
             "view_hash": proposal.view_hash.value,
             "subject": proposal.subject,
@@ -412,10 +439,19 @@ def encode_proposal(scope: ActionScope, proposal: ActionProposal) -> StoredItem:
             "requested_action": proposal.requested_action,
             "requested_deadline": optional_instant(proposal.requested_deadline),
             "request_fact_ids": tuple(str(value) for value in proposal.request_fact_ids),
-            "caveats": tuple(proposal.caveats),
-            "tone": proposal.tone,
+            "caveats": tuple(
+                {
+                    "caveat_id": str(caveat.caveat_id),
+                    "text": caveat.text,
+                    "export_fact_ids": tuple(str(value) for value in caveat.export_fact_ids),
+                    "caveat_hash": caveat.caveat_hash.value,
+                }
+                for caveat in proposal.caveats
+            ),
+            "tone": proposal.tone.value,
             "agent_invocation_id": str(proposal.agent_invocation_id),
             "prompt_version": proposal.prompt_version,
+            "preview_hash": proposal.preview_hash.value,
             "proposal_hash": proposal.proposal_hash.value,
             "status": proposal.status.value,
             "created_at": instant(proposal.created_at),
@@ -446,12 +482,26 @@ def decode_proposal(item: StoredItem) -> tuple[DecodedScope, ActionProposal]:
         )
         claim_reader.finish()
         claims.append(claim)
+    caveats: list[ActionCaveat] = []
+    for index, raw in enumerate(reader.mappings("caveats")):
+        caveat_reader = reader.child(raw, f"caveats[{index}]")
+        caveat = build_entity(
+            caveat_reader.entity_ref,
+            ActionCaveat,
+            caveat_id=caveat_reader.uuid("caveat_id"),
+            text=caveat_reader.text("text"),
+            export_fact_ids=caveat_reader.uuids("export_fact_ids"),
+            caveat_hash=caveat_reader.digest("caveat_hash"),
+        )
+        caveat_reader.finish()
+        caveats.append(caveat)
     proposal = build_entity(
         reader.entity_ref,
         ActionProposal,
         action_id=reader.identifier("action_id", ActionId),
         case_id=scope.case_id,
         case_version=reader.number("case_version"),
+        authorization_version=reader.number("authorization_version"),
         view_id=reader.identifier("view_id", ViewId),
         view_hash=reader.digest("view_hash"),
         subject=reader.text("subject"),
@@ -459,10 +509,11 @@ def decode_proposal(item: StoredItem) -> tuple[DecodedScope, ActionProposal]:
         requested_action=reader.text("requested_action"),
         requested_deadline=reader.optional_instant("requested_deadline"),
         request_fact_ids=reader.uuids("request_fact_ids"),
-        caveats=reader.texts("caveats"),
-        tone=reader.text("tone"),
+        caveats=tuple(caveats),
+        tone=reader.enum("tone", ActionTone),
         agent_invocation_id=reader.uuid("agent_invocation_id"),
         prompt_version=reader.text("prompt_version"),
+        preview_hash=reader.digest("preview_hash"),
         proposal_hash=reader.digest("proposal_hash"),
         status=reader.enum("status", ActionProposalStatus),
         created_at=reader.instant("created_at"),
@@ -566,14 +617,14 @@ def encode_execution(scope: ActionScope, execution: ActionExecution) -> StoredIt
         {
             "execution_id": identifier(execution.execution_id),
             "action_id": identifier(execution.action_id),
-            "approval_id": identifier(execution.approval_id),
+            "approval_id": optional_identifier(execution.approval_id),
             "proposal_hash": execution.proposal_hash.value,
             "view_hash": execution.view_hash.value,
             "idempotency_key": execution.idempotency_key,
             "state": execution.state.value,
             "attempt_number": execution.attempt_number,
-            "rendered_message_hash": execution.rendered_message_hash.value,
-            "ses_request_token_hash": execution.ses_request_token_hash.value,
+            "rendered_message_hash": _optional_digest(execution.rendered_message_hash),
+            "ses_request_token_hash": _optional_digest(execution.ses_request_token_hash),
             "ses_message_id": execution.ses_message_id,
             "started_at": optional_instant(execution.started_at),
             "finished_at": optional_instant(execution.finished_at),
@@ -603,14 +654,14 @@ def decode_execution(item: StoredItem) -> tuple[DecodedScope, ActionExecution]:
         execution_id=reader.identifier("execution_id", ExecutionId),
         action_id=reader.identifier("action_id", ActionId),
         case_id=scope.case_id,
-        approval_id=reader.identifier("approval_id", ApprovalId),
+        approval_id=reader.optional_identifier("approval_id", ApprovalId),
         proposal_hash=reader.digest("proposal_hash"),
         view_hash=reader.digest("view_hash"),
-        idempotency_key=reader.text("idempotency_key"),
+        idempotency_key=reader.optional_text("idempotency_key"),
         state=reader.enum("state", ActionExecutionState),
         attempt_number=reader.number("attempt_number"),
-        rendered_message_hash=reader.digest("rendered_message_hash"),
-        ses_request_token_hash=reader.digest("ses_request_token_hash"),
+        rendered_message_hash=reader.optional_digest("rendered_message_hash"),
+        ses_request_token_hash=reader.optional_digest("ses_request_token_hash"),
         ses_message_id=reader.optional_text("ses_message_id"),
         started_at=reader.optional_instant("started_at"),
         finished_at=reader.optional_instant("finished_at"),
@@ -647,10 +698,12 @@ def encode_action_pointer(scope: CaseScope, pointer: CurrentActionPointer) -> St
     item.update(
         {
             "action_id": identifier(pointer.action_id),
+            "execution_id": identifier(pointer.execution_id),
             "proposal_hash": pointer.proposal_hash.value,
             "view_id": identifier(pointer.view_id),
             "view_hash": pointer.view_hash.value,
             "case_version": pointer.case_version,
+            "authorization_version": pointer.authorization_version,
             "status": pointer.status.value,
             "version": pointer.version,
             "created_at": instant(pointer.created_at),
@@ -676,10 +729,12 @@ def decode_action_pointer(item: StoredItem) -> tuple[DecodedScope, CurrentAction
         community_id=scope.community_id,
         case_id=scope.case_id,
         action_id=reader.identifier("action_id", ActionId),
+        execution_id=reader.identifier("execution_id", ExecutionId),
         proposal_hash=reader.digest("proposal_hash"),
         view_id=reader.identifier("view_id", ViewId),
         view_hash=reader.digest("view_hash"),
         case_version=reader.number("case_version"),
+        authorization_version=reader.number("authorization_version"),
         status=reader.enum("status", ActionProposalStatus),
         version=reader.number("version"),
         created_at=reader.instant("created_at"),

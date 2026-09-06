@@ -161,6 +161,7 @@ def _case(case_id: CaseId, **changes: object) -> CommunityCase:
         "corroboration_source_count": 0,
         "state_reason_code": "MONITOR_CANDIDATE_DETECTED",
         "version": 1,
+        "authorization_version": 1,
         "created_at": NOW,
         "updated_at": NOW,
     }

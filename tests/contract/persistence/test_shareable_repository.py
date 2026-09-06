@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
 from tests.fixtures.persistence import (
@@ -32,7 +33,8 @@ from chorus.ports.limits import (
 )
 from chorus.ports.pagination import PageRequest
 from chorus.ports.records import ActionPointerExpectation, ViewPointerExpectation
-from chorus.ports.storage import StorageDriver
+from chorus.ports.storage import CheckItem, PutItem, StorageDriver
+from chorus.ports.unit_of_work import TransactionPlan
 
 pytestmark = pytest.mark.anyio
 
@@ -443,5 +445,143 @@ async def test_consumption_is_bound_to_the_stored_approval_hash(
         await storage.write_item(
             repositories.shareable.stage_consume_approval(
                 scope, PRIMARY.approval(version=2, consumed=True), expected=approved
+            )
+        )
+
+
+# ---------------------------------------------------------------------------------------
+# The read-only current-view guard (ADR-022 § 7)
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_the_current_view_guard_is_a_check_and_never_a_write(
+    storage: StorageDriver,
+) -> None:
+    """It must be a ``CheckItem``.
+
+    A ``PutItem`` here would mean the application had been handed a write on a compiler-owned
+    prefix in order to perform a read-only guard -- which is the lazy route ADR-022 § 7 names
+    so it is refused once rather than proposed repeatedly. DynamoDB authorizes a transaction
+    through the permission each participant needs, so the *kind* of this participant is what
+    decides which IAM action the application has to hold.
+    """
+
+    shareable = build_repositories(storage).shareable
+    pointer = PRIMARY.view_pointer()
+
+    item = shareable.stage_require_current_view_pointer(
+        PRIMARY.case_scope,
+        expected=ViewPointerExpectation(
+            row_version=pointer.version, view_hash=pointer.view_hash, view_id=pointer.view_id
+        ),
+    )
+
+    assert isinstance(item, CheckItem)
+    assert not isinstance(item, PutItem)
+    assert item.key == codec_share.view_pointer_key(PRIMARY.case_scope)
+
+
+@pytest.mark.anyio
+async def test_the_current_view_guard_names_the_exact_view_it_read(
+    storage: StorageDriver,
+) -> None:
+    """The whole identity of the row, not only its shape.
+
+    The compile's conditional *replace* already knows which row it read from the version it is
+    superseding. This guard sits on the far side of a model invocation, so it names ``view_id``
+    as well -- otherwise a compile that replaced the pointer with a different view at the same
+    row version would satisfy it.
+    """
+
+    shareable = build_repositories(storage).shareable
+    pointer = PRIMARY.view_pointer()
+
+    item = shareable.stage_require_current_view_pointer(
+        PRIMARY.case_scope,
+        expected=ViewPointerExpectation(
+            row_version=pointer.version, view_hash=pointer.view_hash, view_id=pointer.view_id
+        ),
+    )
+
+    rendered = str(item.condition)
+    assert str(pointer.view_id) in rendered
+    assert pointer.view_hash.value in rendered
+    assert str(pointer.version) in rendered
+
+
+@pytest.mark.anyio
+async def test_the_current_view_guard_refuses_an_expectation_without_a_view_id(
+    storage: StorageDriver,
+) -> None:
+    """Refused at staging rather than silently degrading to a weaker condition."""
+
+    shareable = build_repositories(storage).shareable
+    pointer = PRIMARY.view_pointer()
+
+    with pytest.raises(ValueError):
+        shareable.stage_require_current_view_pointer(
+            PRIMARY.case_scope,
+            expected=ViewPointerExpectation(
+                row_version=pointer.version, view_hash=pointer.view_hash
+            ),
+        )
+
+
+@pytest.mark.anyio
+async def test_the_current_view_guard_passes_on_the_exact_row_and_fails_on_a_moved_one(
+    storage: StorageDriver,
+) -> None:
+    """Committed against real storage, both directions, because a condition nobody evaluated
+    is a condition nobody has checked."""
+
+    repositories = build_repositories(storage)
+    shareable = repositories.shareable
+    unit_of_work = repositories.unit_of_work
+    pointer = PRIMARY.view_pointer()
+    await unit_of_work.commit(
+        TransactionPlan(
+            name="seed-view-pointer",
+            operations=(
+                shareable.stage_replace_current_view_pointer(
+                    PRIMARY.case_scope, pointer, expected=None
+                ),
+            ),
+            audit_required=False,
+        )
+    )
+
+    matching = ViewPointerExpectation(
+        row_version=pointer.version, view_hash=pointer.view_hash, view_id=pointer.view_id
+    )
+    await unit_of_work.commit(
+        TransactionPlan(
+            name="guard-passes",
+            operations=(
+                shareable.stage_require_current_view_pointer(PRIMARY.case_scope, expected=matching),
+                shareable.stage_append_action_history_locator(
+                    PRIMARY.case_scope, PRIMARY.action_history()
+                ),
+            ),
+            audit_required=False,
+        )
+    )
+
+    moved = ViewPointerExpectation(
+        row_version=pointer.version, view_hash=pointer.view_hash, view_id=ViewId(uuid4())
+    )
+    with pytest.raises(PersistenceConflictError):
+        await unit_of_work.commit(
+            TransactionPlan(
+                name="guard-fails",
+                operations=(
+                    shareable.stage_require_current_view_pointer(
+                        PRIMARY.case_scope, expected=moved
+                    ),
+                    shareable.stage_append_action_history_locator(
+                        PRIMARY.case_scope, PRIMARY.action_history(index=1)
+                    ),
+                ),
+                audit_required=False,
             )
         )

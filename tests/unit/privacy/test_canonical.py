@@ -7,15 +7,18 @@ import pytest
 from tests.fixtures.elevator import NOW, _uuid, build_elevator_fixture
 
 from chorus.domain.entities import (
+    ActionCaveat,
     ActionClaim,
     ActionProposal,
     ActionProposalStatus,
+    ActionTone,
     Approval,
     ApprovalDecision,
 )
 from chorus.domain.ids import ActionId, ApprovalId, Sha256Digest, ViewId
 from chorus.privacy.canonical import (
     canonical_bytes,
+    hash_action_caveat,
     hash_action_claim,
     hash_action_proposal,
     hash_approval,
@@ -75,10 +78,18 @@ def test_proposal_and_approval_hash_primitives_bind_authorization_tuple() -> Non
         claim_hash=empty,
     )
     claim = replace(claim_draft, claim_hash=hash_action_claim(claim_draft))
+    caveat_draft = ActionCaveat(
+        caveat_id=_uuid("caveat:hash-test"),
+        text="Reported by residents; not independently inspected.",
+        export_fact_ids=(export_id,),
+        caveat_hash=empty,
+    )
+    caveat = replace(caveat_draft, caveat_hash=hash_action_caveat(caveat_draft))
     proposal_draft = ActionProposal(
         action_id=ActionId(_uuid("action:hash-test")),
         case_id=fixture.context.case.case_id,
         case_version=fixture.context.case.version,
+        authorization_version=fixture.context.case.authorization_version,
         view_id=ViewId(_uuid("view:hash-test")),
         view_hash=Sha256Digest("sha256:" + "1" * 64),
         subject="Elevator repair request",
@@ -86,10 +97,14 @@ def test_proposal_and_approval_hash_primitives_bind_authorization_tuple() -> Non
         requested_action="Inspect and repair the elevator.",
         requested_deadline=None,
         request_fact_ids=(export_id,),
-        caveats=(),
-        tone="PROFESSIONAL",
+        caveats=(caveat,),
+        # ``NEUTRAL`` rather than the ``"PROFESSIONAL"`` this fixture used to carry. That value
+        # was outside the frozen tone set and nothing refused it, which is the drift ADR-021
+        # § 11 closed by promoting ``tone`` from a free string to a closed enum.
+        tone=ActionTone.NEUTRAL,
         agent_invocation_id=_uuid("invocation:hash-test"),
         prompt_version="action/v1",
+        preview_hash=Sha256Digest("sha256:" + "3" * 64),
         proposal_hash=empty,
         status=ActionProposalStatus.DRAFT,
         created_at=NOW,
@@ -121,3 +136,14 @@ def test_proposal_and_approval_hash_primitives_bind_authorization_tuple() -> Non
     assert approval.approval_hash != empty
     changed = replace(approval, view_hash=Sha256Digest("sha256:" + "2" * 64))
     assert hash_approval(changed) != approval.approval_hash
+
+    # The proposal hash covers the whole immutable structure, so each of the three fields the
+    # Phase-7 gate added moves it. Asserted individually rather than in aggregate: a hash that
+    # only happened to change because one of them did would leave the other two unbound, and
+    # ``preview_hash`` in particular is what makes an approval bind the preview transitively.
+    assert hash_action_proposal(replace(proposal, preview_hash=empty)) != proposal.proposal_hash
+    assert (
+        hash_action_proposal(replace(proposal, authorization_version=99)) != proposal.proposal_hash
+    )
+    assert hash_action_proposal(replace(proposal, caveats=())) != proposal.proposal_hash
+    assert hash_action_proposal(replace(proposal, tone=ActionTone.FIRM)) != proposal.proposal_hash

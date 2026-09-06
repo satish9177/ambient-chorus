@@ -15,7 +15,7 @@ sequenceDiagram
     API->>AC: ShareableCaseView only
     AC-->>API: structured ActionProposalDraft
     API->>API: validate IDs, facts, hashes, language constraints
-    API->>DDB: persist immutable proposal + DRAFT execution
+    API->>DDB: one ten-participant transaction: proposal + DRAFT execution + pointers + case READY_FOR_ACTION->ACTION_PROPOSED
     H->>API: approve exact proposal_hash + view_hash
     API->>DDB: approval + execution APPROVED
     API->>S: execute by case/action/execution IDs
@@ -43,26 +43,38 @@ The application worker, not the sender role, owns the private `CommunityCase` pr
 
 ## Deterministic proposal validation
 
-The validator loads the persisted current view by case/view ID with a strong read and performs these checks in order:
+The validator loads the persisted current view by case/view ID with a strong read, loads the Core case with a strong read, and performs these checks in order. Every failure is a **whole-proposal** rejection under a bounded `ActionRejection` code; there is no per-claim salvage.
 
 1. proposal schema, size, enum, and `extra='forbid'`;
-2. exact case ID/version, view ID/hash, destination, purpose, and non-expired view;
+2. exact case ID, case state `READY_FOR_ACTION`, expected OCC `version`, `authorization_version` equal to the view's, view ID/hash, purpose, and non-expired view; and the **current deployment configuration** by exact equality — `policy_version`, `compiler_version`, `policy_build_hash`, and the destination's `destination_id`, `kind`, `registry_version`, `routing_token`, and `display_label`. These last are deployment-owned rather than case-owned ([ADR-020](../adr/ADR-020-case-authorization-version.md) § 3), so a verified `authorization_snapshot_hash` is **not** evidence about them: it proves the old view is internally coherent, which a view compiled by a superseded policy build or against a rotated registry entry also is. Every one of these is checked before any model call;
 3. view hash recomputation and current pointer equality;
-4. unique claim IDs and 1–12 claims;
-5. every cited export fact exists in that exact view and every citation set is nonempty;
-6. every request/caveat factual premise has citations; caveats with no premise may have zero citations;
+4. unique claim IDs and 1–12 claims; unique caveat IDs and 0–8 caveats;
+5. every cited export fact exists in that exact view, and **every citation set on every claim, on the request, and on every caveat holds 1–10 IDs**. There is no zero-citation path;
+6. every relied-upon fact whose `ShareableFact.evidence_status` is `CONTRADICTED` is cited by at least one caveat, where relied-upon means cited by a claim or by the request. A missing caveat is `CONTRADICTED_FACT_NOT_CAVEATED`;
 7. no fact/claim/evidence ID outside the view; foreign IDs are a whole-proposal `AGENT_CONTRACT_VIOLATION` and security audit;
 8. subject contains no CR/LF/control characters and is 1–120 Unicode characters;
-9. claim/request/caveat text contains no HTML, Markdown images, `mailto:`, raw URL, email, apartment/unit pattern, phone pattern, or denylisted sensitive term/token not present in a safe fact;
-10. numbers, dates, quoted strings, and proper-name candidates in factual text must be lexically supported by at least one cited fact's `safe_text`; false positives deny and require re-proposal rather than manual bypass;
-11. normalized text and citations do not duplicate another claim;
+9. none of the four **model-authored textual fields** — `subject`, every claim text, `requested_action`, every caveat text — contains a rejected construct: control, bidi, or invisible characters, markup, Markdown link or image syntax, a URL, `mailto:`, an email address, a telephone or apartment/unit pattern, a quotation mark outside a word-internal apostrophe, a UUID or `sha256:` identifier shape, a non-ISO date construct, or any match of the compiler's own sensitive-term pattern. The telephone rule runs **after** ISO-date span validation and exempts a span that is exactly one valid calendar date, so the only permitted date form is not rejected by the pattern that would otherwise match it. This check reads prose only: the typed contract identifiers are validated by checks 2, 5, and 7;
+10. every risk token — ISO date, clock time, ordinal, number, or number word — extracted from model text is matched exactly by a token of the same kind in a cited fact's `safe_text`, and every proper-name candidate occurs in a cited `safe_text`, the destination display label, the community public label, or the reviewed template-copy allowlist;
+10a. `requested_deadline`, when present, is strictly after `view.generated_at` ([ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) § 10), rejected as `DEADLINE_NOT_AFTER_VIEW`. Equality is a rejection. The contract type owns the shape — a timezone-aware UTC instant — and stops there, because a contract has no view to compare against; the comparison is this layer's because the bound is a property of the artifact the proposal is made against. An absent deadline stays legal;
+11. no two claims and no two caveats share the same comparison-normalized text;
 12. canonical `proposal_hash` recomputation and conditional persistence.
 
-These checks do not prove natural-language truth; they bound the proposal to compiled source facts. The human preview remains mandatory. A human cannot edit text in place: requested edits produce a new proposal and hash, then a new approval.
+Checks 5, 6, 9, 10, and 11 are frozen in exact detail — the normalization, the rejected constructs, the token grammar, the support comparison, and the proper-name detector — by [ADR-021](../adr/ADR-021-action-grounding-and-caveats.md). Two points there change what earlier drafts of this section said and are stated here so the difference is not read as an omission:
+
+- **Every model-authored substantive field is citation-bound, and there is no factual-premise classifier.** `request_fact_ids` and every caveat's `export_fact_ids` are `1..10` and never zero. Distinguishing "please repair the elevator" from "because it failed three times, repair it" is clause-level natural-language analysis, and the only honest implementations are an unspecified parser or a second model. Requiring citations everywhere makes the question disappear. A request without a reason is also a request the recipient cannot evaluate.
+- **The sensitive-term rule is absolute.** The older wording exempted a term "present in a safe fact"; compiler gate 21 runs the same scanner over the constructed view and denies the whole compile on a match, so a view satisfying that exemption cannot exist. Phase 7 rejects absolutely and reuses the compiler's pattern rather than writing a second one.
+
+**Expiry is sampled twice, and the second sample is the load-bearing one.** Check 2 runs before the model is invoked; the injected clock is then read again immediately before the proposal is staged, and the view must still be unexpired at that instant. Expiry is the one freshness fact no transaction condition can express — the apply conditions on the case row's exact `version`, `authorization_version`, and `state`, and on the current-view pointer's exact identity, and every one of those is satisfied by a view whose `expires_at` has simply passed, because the passage of time mutates no row. That second read is an authorization freshness sample and nothing else: it is never persisted, and the command's one canonical instant still stamps every artifact the apply writes, so one apply still produces one coherent set of rows. Equality at expiry means expired, and a view that expired mid-invocation fails the proposal whole — no proposal, no `DRAFT` execution, no pointer movement, no history locator, no successful invocation record, no case transition, and **no second model call**.
+
+These checks do not prove natural-language truth; they bound the proposal to compiled source facts. **A false positive rejects and requires a re-proposal — never a bypass, never an override, and never adjudication by a second model.** The human preview remains mandatory. A human cannot edit text in place: requested edits produce a new proposal and hash, then a new approval.
 
 ## Proposal and execution lifecycle
 
-Each validated proposal creates one `ActionExecution` in `DRAFT`. States and legal transitions are:
+Each validated proposal creates one `ActionExecution` in `DRAFT`. That `DRAFT` carries no `approval_id`, no send `idempotency_key`, no `rendered_message_hash`, and no `ses_request_token_hash`, because none of those exists before a human has approved anything and the send idempotency key is defined over the approval. Field presence is a function of state and is monotonic; the normative table is [ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 1.
+
+A proposal may be created only when no current action pointer exists, or when the current pointer names an `INVALIDATED` proposal whose execution is terminal `FAILED`. **A request arriving while a valid current `DRAFT` stands is a conflict, refused before any model call, with nothing written.** Phase 7 never mutates an existing execution: invalidating a pointer and failing a `DRAFT` belongs to the explicit human reject-or-edit path below, because a second model call must not discard a human's pending decision without a human deciding to. Two live `DRAFT` executions for one case therefore cannot exist.
+
+States and legal transitions are:
 
 ```mermaid
 stateDiagram-v2
@@ -82,7 +94,13 @@ There is no transition out of `SENT`. V1 has exactly one execution/attempt per a
 
 ## Human approval contract
 
-The approval request supplies `action_id`, `expected_action_status`, `view_hash`, `proposal_hash`, decision, and idempotency key. The UI displays exactly the deterministic rendered preview that the sender will reconstruct, plus destination label, view/policy versions, expiry, and safe citations. Approval:
+The approval request supplies `action_id`, `expected_action_status`, `view_hash`, `proposal_hash`, `preview_hash`, decision, and idempotency key. The UI displays exactly the deterministic rendered preview that the sender will reconstruct, plus destination label, view/policy versions, expiry, and safe citations. A `preview_hash` mismatch is 409.
+
+`preview_hash` lives on the immutable `ActionProposal` and binds the exact preview a human is shown; the execution's `rendered_message_hash` is written later by the sender and binds the bytes prepared for one SES attempt. Both come from the same deterministic renderer over the same canonical tuple, so a correct system produces the same digest twice and a mismatch is a definite pre-send stale failure. Keeping them as two fields is what makes "the sender sent what the human approved" a comparison rather than a tautology ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 2).
+
+Rejection is the explicit human path that clears a proposal: it atomically sets the current action pointer's status to `INVALIDATED`, moves the `DRAFT` execution to `FAILED`, and returns the case to `READY_FOR_ACTION` if readiness remains. Only after that may a new proposal be created.
+
+Approval:
 
 - binds exact case/action/view/proposal/template-version hashes;
 - is created by a fixed demo approver actor after access-token validation;
@@ -95,7 +113,13 @@ Concurrent approvals use a conditional `attribute_not_exists(active approval)`; 
 
 ## Deterministic rendering
 
-Renderer version `email/property-manager/v1` takes only `ActionProposal` and its bound `ShareableCaseView`, including the safe destination display label/version/token. It sorts claims in proposal order, escapes all text, and produces UTF-8 plain text plus escaped HTML from the same intermediate document tree.
+`template_version` is `email/property-manager/v1`. That single term names the renderer throughout; "renderer version" as a second name for the same value is retired.
+
+The renderer takes exactly four inputs and nothing else: the validated immutable `ActionProposal`; its exact bound `ShareableCaseView`, including the safe destination display label, registry version, and routing token; `template_version`; and `from_identity_id`. It receives no recipient address, no Core state, no compiler audit projection, no private evidence, no model completion, and no destination secret, and it never imports a private type.
+
+`from_identity_id` is safe deployment configuration — an opaque, stable identifier for the verified sending identity, never the `From` address, which only the sender ever resolves. It is in the preview hash because approval must bind *who the message claims to be from*: a preview approved for one sending identity that could be sent under another is an approval of the words and not of the letter ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 4).
+
+It sorts claims in proposal order, escapes all text, and produces UTF-8 plain text plus escaped HTML from the same intermediate document tree. Caveat markers reuse the claim marker vocabulary, so a caveat citing the fact behind `C2` renders `[C2]` and the References block stays one list.
 
 ```text
 Subject: {validated subject}
@@ -122,7 +146,9 @@ Case reference: {case_id}
 This message was compiled from contributor-authorized, minimum-necessary facts.
 ```
 
-The fixed framing sentence is template copy, not a model claim; the case must meet corroboration before action. The renderer never accesses private types. It rejects a message over 100 KiB, strips no content silently, and hashes canonical `{template_version, from_identity_id, destination_id, destination_registry_version, routing_token, subject, text_body, html_body}`. V1 sends no attachment or live evidence URL; the safe photo is visible in the external-safe UI and can be added to a later deterministic attachment policy by ADR.
+The fixed framing sentence is template copy, not a model claim; the case must meet corroboration before action. The `Caveats` section is omitted entirely when there are none. The renderer never accesses private types. It rejects a message over 100 KiB — it never truncates, drops a section, or silently omits a caveat — and hashes canonical `{template_version, from_identity_id, destination_id, destination_registry_version, routing_token, subject, text_body, html_body}`. The three destination values come from `view.destination`, so the hash binds the routing the compiler authorized rather than whatever is configured at send time. V1 sends no attachment or live evidence URL; the safe photo is visible in the external-safe UI and can be added to a later deterministic attachment policy by ADR.
+
+**The rendered bodies are not persisted.** Only `preview_hash` is stored; neither `text_body` nor `html_body` is written to any table. The renderer is a pure function of immutable inputs, so a stored body could only agree with a regenerated one or be a second version of the truth, and the case surface regenerates the preview on read.
 
 ## Destination and SES controls
 
@@ -134,7 +160,11 @@ The fixed framing sentence is template copy, not a model claim; the case must me
 
 ## Idempotency and ambiguous sends
 
-Execution idempotency key is `sha256(namespace | action_id | execution_id | proposal_hash | view_hash | approval_id)`. API double-clicks, Lambda retries, and repeated sender invokes load the existing execution:
+Execution idempotency key is `sha256(namespace | action_id | execution_id | proposal_hash | view_hash | approval_id)`. It depends on the approval, so it is `null` on a `DRAFT` and becomes required at `APPROVED` — that dependency is why a `DRAFT` cannot carry one, not an oversight.
+
+Proposing an action is a separate command with its own two records, following the shape the asynchronous investigation already uses: a route/start reservation in the `NAMESPACE` partition binding the `Idempotency-Key` to one durable `PROPOSE_ACTION` operation and one `agent_invocation_id`, and an action-apply commit proof in the `ACTION` partition under a domain-separated key hash. They are commit proofs for two different transactions, so they are two records rather than one reused row. A replay under the same key and request hash returns the same operation and calls no model; a different request hash is `IDEMPOTENCY_CONFLICT` with zero mutations; an unknown apply outcome is resolved by reading the commit proof and the durable invocation record before any retry, never by re-invoking.
+
+API double-clicks, Lambda retries, and repeated sender invokes load the existing execution:
 
 - `DRAFT`/`APPROVED`: only the legal next CAS may proceed;
 - `SENDING`: return 202 “in progress”; never issue another SES call;

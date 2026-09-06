@@ -132,6 +132,7 @@ def monitor_locator_hash(locators: tuple[MessageFeedEntry, ...]) -> Sha256Digest
 
 INVESTIGATE_BINDING_SCHEMA = "investigate-binding/v1"
 PROPOSE_ACTION_BINDING_SCHEMA = "propose-action-binding/v1"
+PROPOSE_ACTION_HTTP_REQUEST_SCHEMA = "propose-action-http-request/v1"
 
 
 def investigate_binding_hash(
@@ -175,6 +176,47 @@ def propose_action_binding_hash(
         {
             "schema": PROPOSE_ACTION_BINDING_SCHEMA,
             "case_id": str(case_id),
+            "view_id": str(view_id),
+            "view_hash": view_hash.value,
+        }
+    )
+
+
+def propose_action_request_hash(
+    *, case_id: CaseId, expected_case_version: int, view_id: UUID, view_hash: Sha256Digest
+) -> Sha256Digest:
+    """Digest the identity of one ``POST /v1/cases/{id}/actions`` **request**.
+
+    Deliberately not :func:`propose_action_binding_hash`, and the difference is the whole of
+    this repair. The binding names the work one *invocation* is authorized to do -- which case,
+    which view -- and ADR-016 froze its three members. HTTP request identity is a different
+    concept: it is everything a caller chose, and a caller also chooses
+    ``expected_case_version``.
+
+    Deriving the route's request hash from the binding therefore made two genuinely different
+    requests look identical under one ``Idempotency-Key``:
+
+    ```text
+    POST .../actions  {expected_case_version: 1,   view_id: V, view_hash: H}   -> 202
+    POST .../actions  {expected_case_version: 999, view_id: V, view_hash: H}   -> 202  (!)
+    ```
+
+    The second is a different command -- it asserts a different belief about the case row, and
+    the worker enforces it -- and it was being answered with the first one's operation. It is
+    now an ``IDEMPOTENCY_CONFLICT``, refused with zero mutations and no second dispatch.
+
+    The agent binding is left exactly as ADR-016 froze it. Widening it to fix an HTTP concern
+    would have changed what an *invocation* is authorized to do in order to fix what a *request*
+    is, which is the wrong contract to move.
+    """
+
+    if expected_case_version < 1:
+        raise ValueError("expected_case_version must be positive")
+    return hash_value(
+        {
+            "schema": PROPOSE_ACTION_HTTP_REQUEST_SCHEMA,
+            "case_id": str(case_id),
+            "expected_case_version": expected_case_version,
             "view_id": str(view_id),
             "view_hash": view_hash.value,
         }

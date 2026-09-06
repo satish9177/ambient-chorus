@@ -15,6 +15,7 @@ from uuid import UUID
 
 from chorus.domain.entities import (
     ApplicationOperation,
+    CaseState,
     Community,
     CommunityCase,
     CommunityMessage,
@@ -43,6 +44,7 @@ from chorus.domain.mandates import DisclosureMandate
 from chorus.domain.time import epoch_micros
 from chorus.infrastructure.dynamodb import codec_case, codec_core, codec_fence, codec_mandate, keys
 from chorus.infrastructure.dynamodb.codec import (
+    ATTR_AUTHORIZATION_VERSION,
     ATTR_VERSION,
     DecodedScope,
 )
@@ -88,6 +90,7 @@ from chorus.ports.storage import (
     AttributeEqualsString,
     CheckItem,
     DeleteItem,
+    ItemCondition,
     ItemKey,
     KeyAbsent,
     PutItem,
@@ -100,6 +103,7 @@ from chorus.ports.storage import (
 )
 
 ATTR_MANDATE_VERSION = "mandate_version"
+ATTR_STATE = "state"
 
 
 def _expired_or_absent(now: datetime) -> AnyOf:
@@ -1258,31 +1262,71 @@ class CoreRepository:
         return create_operation(codec_core.case_key(scope), codec_core.encode_case(scope, case))
 
     def stage_update_case(
-        self, scope: CaseScope, case: CommunityCase, *, expected_version: int
+        self,
+        scope: CaseScope,
+        case: CommunityCase,
+        *,
+        expected_version: int,
+        expected_authorization_version: int | None = None,
+        expected_state: CaseState | None = None,
     ) -> PutItem:
-        self._require_case_capacity(case)
-        return replace_operation(
-            codec_core.case_key(scope),
-            codec_core.encode_case(scope, case),
-            expected_version=expected_version,
-            new_version=case.version,
-        )
+        """Replace the case row, guarded on the exact prior state the caller actually read.
 
-    def stage_require_case_version(self, scope: CaseScope, *, expected_version: int) -> CheckItem:
-        """Condition on the case standing at exactly this version, writing nothing.
-
-        The compile transaction's authorization guard. It is a ``CheckItem`` rather than a
-        guarded update for two independent reasons, and either alone would be enough: the
-        compiler's only Core write is the send fence, and a compile that bumped the case
-        version would stale its own freshly written view against the exact-version check the
-        proposal validator performs.
+        The OCC version alone is what every pre-Phase-7 command needs. The Action proposal apply
+        needs all three, because its authority rests on facts a version bump cannot express: the
+        case was ``READY_FOR_ACTION`` and its disclosure epoch had not moved. Conditioning on
+        the epoch is what turns "a revocation did not land while the model was answering" into
+        something DynamoDB refuses rather than something the application hopes.
         """
 
-        if expected_version < 1:
-            raise ValueError("an expected case version must be positive")
+        self._require_case_capacity(case)
+        conditions: list[ItemCondition] = [
+            AttributeEqualsNumber(name=ATTR_VERSION, value=expected_version)
+        ]
+        if expected_authorization_version is not None:
+            conditions.append(
+                AttributeEqualsNumber(
+                    name=ATTR_AUTHORIZATION_VERSION, value=expected_authorization_version
+                )
+            )
+        if expected_state is not None:
+            conditions.append(AttributeEqualsString(name=ATTR_STATE, value=expected_state.value))
+        if case.version != expected_version + 1:
+            raise ValueError("an optimistic write must increment the entity version by one")
+        return PutItem(
+            key=codec_core.case_key(scope),
+            item=codec_core.encode_case(scope, case),
+            condition=conditions[0] if len(conditions) == 1 else AllOf(tuple(conditions)),
+        )
+
+    def stage_require_case_version(
+        self,
+        scope: CaseScope,
+        *,
+        expected_version: int,
+        expected_authorization_version: int,
+    ) -> CheckItem:
+        """Condition on the case standing at exactly these two versions, writing nothing.
+
+        The compile transaction's authorization guard, and one participant carrying both
+        conditions rather than two participants (ADR-020 § 6). The compiler's only Core write is
+        the send fence, so it has no grant to touch this row; requiring the exact OCC version
+        therefore costs it nothing, while the authorization version is the term the view's own
+        snapshot is bound to.
+        """
+
+        if expected_version < 1 or expected_authorization_version < 1:
+            raise ValueError("expected case versions must be positive")
         return CheckItem(
             key=codec_core.case_key(scope),
-            condition=AttributeEqualsNumber(name=ATTR_VERSION, value=expected_version),
+            condition=AllOf(
+                (
+                    AttributeEqualsNumber(name=ATTR_VERSION, value=expected_version),
+                    AttributeEqualsNumber(
+                        name=ATTR_AUTHORIZATION_VERSION, value=expected_authorization_version
+                    ),
+                )
+            ),
         )
 
     @staticmethod

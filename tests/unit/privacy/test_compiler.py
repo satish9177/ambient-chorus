@@ -194,11 +194,19 @@ def test_compile_safe_example_runs_all_22_gates_and_hashes_view() -> None:
     assert result.decision is CompileDecision.ALLOW
     assert tuple(item.gate for item in result.audit_decisions) == tuple(CompilerGate)
     assert result.view.shareable_facts
+    # Re-cut at the Phase-7 gate as a direct, reviewed consequence of ADR-020: the view schema
+    # moved to ``/v2`` to carry ``authorization_version``, the snapshot's coarse case term was
+    # retargeted from the OCC ``version`` to that epoch, and the ``/v2`` view now also carries
+    # the safe ``policy_build_hash`` the proposal compares against current configuration.
+    # A golden is a statement about a specific algorithm, so these vectors move deliberately
+    # here rather than floating. The snapshot digest is unchanged by the last of those: the
+    # policy build hash was already a member of it, and adding the field to the view surfaces
+    # a value the snapshot already covered rather than introducing a new one.
     assert result.view.authorization_snapshot_hash == Sha256Digest(
-        "sha256:7310233202afdbdf7ad8a94acf825e2c8956413fd32936127226e5b0f50b2ef7"
+        "sha256:1faed5d8747a9f932a980b27a3c43f6899d187d28e19b71e2bbf01a08c051001"
     )
     assert result.view.view_hash == Sha256Digest(
-        "sha256:3e6db66c924482c300670489aba1dc688d8f072f1b569710af9a3a7377f63b8c"
+        "sha256:6a4748c83bda924a7d7e0aec6b87d141b53b376208d39af76596e545c5d9339e"
     )
     assert verify_hash(result.view, result.view.view_hash, omit_fields=frozenset({"view_hash"}))
 

@@ -29,6 +29,7 @@ from chorus.application.commands.propose_mandates import ProposeMandates
 from chorus.application.commands.run_monitor import RunMonitor, RunMonitorCommand
 from chorus.application.commands.run_monitor_operation import MonitorOperationWorker
 from chorus.application.operations import ApplicationOperations, monitor_locator_hash
+from chorus.application.queries.current_action import ReadCurrentAction
 from chorus.application.queries.feed import ReadAmbientFeed
 from chorus.application.queries.mandates import ReadMandateThread
 from chorus.application.services.monitor_snapshots import MonitorSnapshots
@@ -81,6 +82,8 @@ NOW = datetime(2030, 1, 14, 9, 0, 0, tzinfo=UTC)
 FIXTURE_ID_NAMESPACE = UUID("0f5a4a6a-6c1c-5f3a-8a4f-9d3a2b1c0e77")
 PRESENTER_ACTOR_HASH = Sha256Digest(f"sha256:{sha256(b'presenter_admin').hexdigest()}")
 DESTINATION_ID = DestinationId("property_manager:demo")
+FROM_IDENTITY_ID = "chorus-demo-sender"
+"""Safe deployment configuration, matching ``CHORUS_SES_FROM_IDENTITY_ID`` (ADR-022 § 4)."""
 
 RESIDENT_PSEUDONYM_BY_ACTOR: dict[str, str] = {
     "resident_a": "resident-a",
@@ -284,6 +287,17 @@ class MonitorHarness:
     @property
     def read_mandate_thread(self) -> ReadMandateThread:
         return ReadMandateThread(core=self.core, clock=self.clock)
+
+    @property
+    def read_current_action(self) -> ReadCurrentAction:
+        """The Phase-7 safe preview read path, wired over the same driver."""
+
+        return ReadCurrentAction(
+            shareable=ShareableRepository(
+                driver=self.driver, cursors=SignedCursorCodec(CURSOR_SECRET)
+            ),
+            from_identity_id=FROM_IDENTITY_ID,
+        )
 
     @property
     def stored_destination(self) -> StoredSafeDestination:

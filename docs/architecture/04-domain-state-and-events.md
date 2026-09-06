@@ -12,7 +12,8 @@ Enums serialize by exact uppercase string value. UTC/hash/list rules follow [01-
 - `EvidenceStatus`: `REPORTED`, `CORROBORATED`, `VERIFIED`, `CONTRADICTED`, `UNKNOWN`. Classification is deterministic recomputation, not a transition; there is no edge set. `CORROBORATED` is a **fact-level** label earned by independent support for one exact canonical claim, and is not the case-level corroboration count. `VERIFIED` is unreachable in policy/v1 because the allowed verification source set is empty, and `UNKNOWN` is never produced by deterministic computation — it is reachable only when the Investigator lowers a computed status through the downgrade-only ladder. Semantics are normative in [ADR-015](../adr/ADR-015-evidence-status-and-verification.md).
 - `CaseState`: `CANDIDATE`, `AWAITING_MANDATES`, `INVESTIGATING`, `READY_FOR_ACTION`, `ACTION_PROPOSED`, `ACTIONED`, `VERIFYING`, `RESOLVED`, `CLOSED_UNRESOLVED`.
 - `MandateStatus`: `PROPOSED`, `APPROVED`, `REFUSED`, `REVOKED`, `EXPIRED`, `SUPERSEDED`.
-- `ActionExecutionState`: `DRAFT`, `APPROVED`, `SENDING`, `SENT`, `FAILED`, `SEND_UNKNOWN`.
+- `ActionExecutionState`: `DRAFT`, `APPROVED`, `SENDING`, `SENT`, `FAILED`, `SEND_UNKNOWN`. Which `ActionExecution` fields are present is a function of this state, and presence is monotonic; the table is normative in [ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 1.
+- `ActionTone`: `NEUTRAL`, `COLLABORATIVE`, `FIRM`. A closed set, consumed only by the deterministic renderer to select fixed template copy. It never reaches the model's own text and grants nothing ([ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) § 11).
 - `CommitmentStatus`: `PENDING`, `DUE`, `FULFILLED`, `MISSED`, `CANCELLED`.
 - `SensitivityCategory`: `GENERAL`, `IDENTITY`, `CONTACT`, `UNIT_LOCATION`, `HEALTH`, `MINOR`, `PRIVATE_QUOTE`, `PRIVATE_EVIDENCE_URI`.
 - `FactType`: `INCIDENT_OCCURRENCE`, `SERVICE_IMPACT`, `LOCATION_AREA`, `IDENTITY_ATTRIBUTE`, `UNIT_LOCATION`, `HEALTH_DETAIL`, `MANAGEMENT_STATEMENT`, `CONTRADICTION`, `COMMITMENT_TERM`, `EVIDENCE_DESCRIPTION`.
@@ -122,11 +123,26 @@ The cap on an adjustment is the deterministic policy/v1 ceiling for each fact, a
 
 Purpose: aggregate root for investigation and lifecycle.
 
-Fields: `case_id`, `community_id`, `title: str[1..160]`, `issue_type`, `state`, `report_ids`, `fact_ids`, `assessment_id?`, `current_view_id?`, `current_action_id?`, `corroboration_source_count: int>=0`, `state_reason_code`, `version`, timestamps, `resolved_at?`, `closed_at?`. IDs/community are immutable. Lists are unique and same case. State changes only through the transition service. Title is private until transformed into safe summary. Owned by application/domain.
+Fields: `case_id`, `community_id`, `title: str[1..160]`, `issue_type`, `state`, `report_ids`, `fact_ids`, `assessment_id?`, `current_view_id?`, `current_action_id?`, `corroboration_source_count: int>=0`, `state_reason_code`, `version`, `authorization_version`, timestamps, `resolved_at?`, `closed_at?`. IDs/community are immutable. Lists are unique and same case. State changes only through the transition service. Title is private until transformed into safe summary. Owned by application/domain.
+
+#### Two counters, two questions
+
+`version` and `authorization_version` are both monotonic, both start at `1`, and neither is ever decremented or reused. They answer different questions and must never be substituted for one another ([ADR-020](../adr/ADR-020-case-authorization-version.md)).
+
+| Counter | Question | Read by |
+|---|---|---|
+| `version` | has this row moved since I read it? | every guarded case write's `expected_version` |
+| `authorization_version` | has what this case may disclose changed since the view was compiled? | `authorization_snapshot_hash`, the Action proposal validator, the send fence |
+
+The governing invariant is that **lifecycle progress is not itself disclosure authority**. An authorization-sensitive command — a fact, report, evidence, mandate, or investigation change — increments both, once, in the transaction that makes it. A lifecycle-only transition increments `version` and carries `authorization_version` forward unchanged. [ADR-020](../adr/ADR-020-case-authorization-version.md) § 2 holds the exhaustive V1 bump table, and a case-mutation path that is not in it does not exist.
+
+That is why `READY_FOR_ACTION→ACTION_PROPOSED` moves `version` and not `authorization_version`: recording that a proposal exists changes no fact, status, mandate, or count, so it cannot stale the view that authorized the proposal. Under one counter it did, and the first send of every case would have failed closed against its own lifecycle write.
 
 `corroboration_source_count` is the **case-level** independent-source count over every `ACTIVE` case fact. Intake creates a case with `0`; the investigation apply writes the deterministically recomputed value in the same transaction that appends the assessment. It is not a fact's `evidence_status`, and a corroborated case may contain facts that remain `REPORTED` ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md)). `assessment_id` is the current-assessment pointer; there is no separate pointer item, so the pointer and the case version can never disagree.
 
-`current_view_id` is **unused in V1 and remains `None`**. The sole current-view authority is the Shareable table's `VIEW_CURRENT` pointer. The compiler never writes the Core case row, never sets this field, and never bumps `CommunityCase.version` — its only Core write is the send fence, and a compile that bumped the case version would immediately stale the very view it had just produced against the exact-version check the Action proposal validator performs. The field is left in place rather than removed during Phase 6; a later cleanup ADR may drop it. `current_action_id` is subject to the same rule under its own `ACTION_CURRENT` pointer.
+`current_view_id` is **unused in V1 and remains `None`**. The sole current-view authority is the Shareable table's `VIEW_CURRENT` pointer. The compiler never writes the Core case row and never sets this field: its only Core write is the send fence, and storing a pointer in two places is how the two come to disagree. The field is left in place rather than removed during Phase 6; a later cleanup ADR may drop it. `current_action_id` is subject to the same rule under its own `ACTION_CURRENT` pointer.
+
+The compiler's abstention from the case row is now an ordinary least-privilege fact rather than a defence against self-staling. Under the split counters above, a writer that moved `version` would not stale a view; only a writer that moved `authorization_version` would, and the compiler moves neither.
 
 ### InvestigationAssessment
 
@@ -160,13 +176,27 @@ Purpose: immutable authorization artifact and sole Action input. Exact fields/ha
 
 Purpose: one factual external statement with complete citations.
 
-Fields: `claim_id: UUID`, `text: str[1..500]`, `export_fact_ids: sorted tuple[1..10]`, `claim_hash`. Immutable within a proposal. All citations exist in the bound view; claim text passes deterministic lexical/semantic guards.
+Fields: `claim_id: UUID`, `text: str[1..500]`, `export_fact_ids: sorted tuple[1..10]`, `claim_hash`. Immutable within a proposal. All citations exist in the bound view; claim text passes the deterministic grammar frozen in [ADR-021](../adr/ADR-021-action-grounding-and-caveats.md).
+
+`claim_id` is **model-local within one output** and is deliberately UUID-shaped, which is the one place the Action contract differs from the Monitor's `client_ref`: it is persisted, it names nothing outside its own proposal, it survives no lookup, and it grants nothing. The identifier-shape guard that refuses a UUID-shaped Monitor client reference does not apply to it.
+
+### ActionCaveat
+
+Purpose: one qualifying statement with complete citations, structured exactly as a claim is.
+
+Fields: `caveat_id: UUID`, `text: str[1..500]`, `export_fact_ids: sorted tuple[1..10]`, `caveat_hash`. Immutable within a proposal. `caveat_id` is model-local under the same rule as `claim_id`.
+
+A caveat has **at least one citation**; there is no zero-citation caveat in V1. Bare-string caveats are gone, because the immutable artifact a human approves has to contain the caveat-to-fact proof the validator relied on — otherwise Phase-8 revalidation cannot re-check it and the renderer cannot cite it ([ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) § 2).
 
 ### ActionProposal
 
 Purpose: immutable candidate action, separate from approval and execution.
 
-Fields: `action_id`, `case_id`, `case_version`, `view_id`, `view_hash`, `subject`, `claims`, `requested_action`, `requested_deadline?`, `request_fact_ids`, `caveats`, `tone`, `agent_invocation_id`, `prompt_version`, `proposal_hash`, `status: DRAFT|INVALIDATED`, `created_at`, `schema_version`. Proposal content is immutable; invalidation is a separate status item/pointer, not a content rewrite. Safe-zone only.
+Fields: `action_id`, `case_id`, `case_version`, `authorization_version`, `view_id`, `view_hash`, `subject: str[1..120]`, `claims: tuple[ActionClaim,...]`, `requested_action`, `requested_deadline?`, `request_fact_ids: sorted tuple[1..10]`, `caveats: tuple[ActionCaveat,...]`, `tone: ActionTone`, `agent_invocation_id`, `prompt_version`, `preview_hash`, `proposal_hash`, `status: DRAFT|INVALIDATED`, `created_at`, `schema_version`. Proposal content is immutable; invalidation is a separate status item/pointer, not a content rewrite. Safe-zone only. The schema version is `action-proposal/v2`.
+
+`case_version` is the Core OCC version observed at proposal time and is **provenance only**; `authorization_version` is the epoch the proposal is valid against and is the freshness comparison every downstream check performs ([ADR-020](../adr/ADR-020-case-authorization-version.md) § 4).
+
+`preview_hash` binds the exact deterministic preview a human is shown and approves. It is not the execution's `rendered_message_hash`, which records the bytes the sender prepared for one attempt; naming them separately is what makes "the sender sent what the human approved" a comparison rather than a tautology ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 2). `proposal_hash` covers `preview_hash`, so an approval binding the proposal hash transitively binds the preview.
 
 ### Approval
 
@@ -178,7 +208,9 @@ Fields: `approval_id`, `action_id`, `case_id`, `proposal_hash`, `view_hash`, `ap
 
 Purpose: durable send attempt state and ambiguity record.
 
-Fields: `execution_id`, `action_id`, `case_id`, `approval_id`, `proposal_hash`, `view_hash`, `idempotency_key`, `state`, `attempt_number: literal 1` in V1, `rendered_message_hash`, `ses_request_token_hash`, `ses_message_id?`, `started_at?`, `finished_at?`, `failure_code?`, `failure_detail_safe?`, `reconciled_at?`, `version`, timestamps. Only sender mutates transitions after creation. Rendered body and recipient are not stored here; the exact rendered body is reconstructible from immutable proposal/view/template version and its hash.
+Fields: `execution_id`, `action_id`, `case_id`, `approval_id?`, `proposal_hash`, `view_hash`, `idempotency_key?`, `state`, `attempt_number: literal 1` in V1, `rendered_message_hash?`, `ses_request_token_hash?`, `ses_message_id?`, `started_at?`, `finished_at?`, `failure_code?`, `failure_detail_safe?`, `reconciled_at?`, `version`, timestamps. Only sender mutates transitions after creation. Rendered body and recipient are not stored here; the exact rendered body is reconstructible from immutable proposal/view/template version and its hash. The schema version is `action-execution/v2`.
+
+**Which fields are present is a function of `state`, and presence is monotonic**: a field that has been set is never unset or rewritten, and the entity refuses a transition that would clear one. The normative table is [ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 1. In outline: a `DRAFT` created by the proposal apply carries no `approval_id`, no `idempotency_key`, no `rendered_message_hash`, and no `ses_request_token_hash`, because none of them exists before a human has approved anything and the send idempotency key is defined over the approval; `approval_id` and `idempotency_key` become required at `APPROVED`; the rendered and SES token hashes become required at `SENDING`. `FAILED` may legitimately carry none of them, because `DRAFT→FAILED` and `APPROVED→FAILED/STALE_AUTHORIZATION` both terminate before anything was rendered or sent — requiring a rendered hash there would put a fabricated digest on the record of a message that was never built.
 
 ### Commitment
 
@@ -315,6 +347,8 @@ stateDiagram-v2
 
 Every transition command supplies `case_id`, `expected_version`, `transition`, `actor`, `reason_code`, `correlation_id`, and idempotency key. The service checks allowed edge, edge-specific guard, and current version; one DynamoDB transaction updates the case and appends an audit event/outbox projection. An exact replay returns the original result; a different request under the key conflicts. Illegal edges are never coerced.
 
+Every transition increments `version`. Whether it also increments `authorization_version` is decided per edge by [ADR-020](../adr/ADR-020-case-authorization-version.md) § 2 and never by the transition service's own judgement: the "authorization" column of that table is part of each command's definition, exactly as its guard is.
+
 | Transition | Required guard | Caused by | Retry/state on failure |
 |---|---|---|---|
 | create `CANDIDATE` | at least 2 potentially related report proposals, not necessarily corroborated | intake service | retryable before persist; no case on failure |
@@ -322,7 +356,7 @@ Every transition command supplies `case_id`, `expected_version`, `transition`, `
 | `CANDIDATE→AWAITING_MANDATES` | human/demo accepts candidate; proposals exist for every participating owner, created in the same transaction ([ADR-013](../adr/ADR-013-mandate-proposal-endpoint.md)) | `POST /v1/cases/{case_id}/mandates` | remains candidate |
 | `AWAITING_MANDATES→INVESTIGATING` | at least one non-proposed decision or timeout/refusal recorded | application | remains awaiting |
 | `INVESTIGATING→READY_FOR_ACTION` | validated assessment bound to the current case version; recomputed `independent_source_count>=2`; no material unresolved different-issue finding; a compile preflight finds eligible facts | application | remains investigating |
-| `READY_FOR_ACTION→ACTION_PROPOSED` | current allowed view and valid proposal hashes | application | remains ready; stale view triggers recompile |
+| `READY_FOR_ACTION→ACTION_PROPOSED` | current allowed view and valid proposal hashes; committed in the proposal apply transaction, conditioned on the exact `version`, `authorization_version`, and `state` the validator read, and moving `version` only | application | remains ready; stale view triggers recompile |
 | `ACTION_PROPOSED→ACTIONED` | execution reaches `SENT`; matching approval consumed | sender/application projection | `FAILED`/`SEND_UNKNOWN` leaves case `ACTION_PROPOSED` with execution banner |
 | `ACTIONED→VERIFYING` | valid commitment or explicit verification request | application | remains actioned if schedule creation fails; retry scheduling |
 | `VERIFYING→RESOLVED` | affected contributor supplies explicit fulfilled decision; optional safe evidence | human verification | remains verifying |

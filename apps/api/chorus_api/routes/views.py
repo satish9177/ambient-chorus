@@ -121,13 +121,20 @@ class MandateVersionRefBody(BaseModel):
 
 
 class ShareableCaseViewBody(BaseModel):
-    """The safe artifact, rendered field for field. Nothing is added and nothing is dropped."""
+    """The safe artifact, rendered field for field. Nothing is added and nothing is dropped.
+
+    Both counters appear, and they mean different things: ``case_version`` is the Core OCC
+    version the view was built beside and is provenance only, while ``authorization_version``
+    is the epoch the view is valid against and is what a caller compares before proposing
+    against it (ADR-020 § 4).
+    """
 
     schema_version: str
     view_id: UUID
     case_id: UUID
     community_public_label: str
     case_version: int
+    authorization_version: int
     policy_version: str
     compiler_version: str
     destination: SafeDestinationBody
@@ -241,6 +248,7 @@ def _view_body(view: StoredShareableView) -> ShareableCaseViewBody:
         case_id=view.case_id.value,
         community_public_label=view.community_public_label,
         case_version=view.case_version,
+        authorization_version=view.authorization_version,
         policy_version=view.policy_version,
         compiler_version=view.compiler_version,
         destination=SafeDestinationBody(

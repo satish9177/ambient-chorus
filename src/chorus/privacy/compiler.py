@@ -82,6 +82,19 @@ _UNSAFE_VALUE = re.compile(
     r"\b(?:unit|apartment|apt)\s*#?[A-Za-z0-9-]+|SECRET_SENTINEL|mother_health|"
     r"\b(?:mother|father|daughter|son|medical|health|diagnos\w*|wheelchair)\b)"
 )
+UNSAFE_VALUE_PATTERN = _UNSAFE_VALUE
+"""The sensitive-value scanner, exposed for reuse by the application layer.
+
+Gate 21 runs it over every constructed view and denies the whole compile on a match, so the
+Action validator reusing *this* pattern rather than writing a second one is what makes the two
+answers impossible to disagree. ADR-021 § 5 licenses the reuse explicitly, and the import
+direction -- application depending on the pure privacy helper -- is one the frozen dependency
+table already permits, so import-linter stays green with no exception.
+
+The alias exists rather than renaming the private constant so the compiler's own hundreds of
+internal references keep reading as private state and only the reuse is public.
+"""
+
 _HARD_INTERNAL_TYPES = {FactType.UNIT_LOCATION, FactType.HEALTH_DETAIL}
 _HARD_INTERNAL_SENSITIVITIES = {
     SensitivityCategory.CONTACT,
@@ -108,6 +121,16 @@ class MandateVersionRef:
     terms_hash: Sha256Digest
 
 
+SHAREABLE_VIEW_SCHEMA_VERSION = "shareable-case-view/v2"
+"""The view schema, at ``/v2`` because it now carries ``authorization_version``.
+
+The bump changes ``view_hash`` and therefore every golden view hash. Those are re-cut as a
+reviewed consequence of ADR-020, in the manner ADR-018 established for a dependency bump that
+moves a golden: a reviewed change with re-cut vectors, never a floating expectation. No V1 data
+has been deployed, so this is a code change with no migration.
+"""
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ShareableCaseView:
     """Immutable compiler-produced DTO and sole Action input.
@@ -121,8 +144,16 @@ class ShareableCaseView:
     case_id: UUID
     community_public_label: str
     case_version: int
+    authorization_version: int
     policy_version: str
     compiler_version: str
+    policy_build_hash: Sha256Digest
+    """The exact policy build this view was compiled by (ADR-020 section 3).
+
+    Already inside ``authorization_snapshot_hash``, and carried here as well because integrity
+    of an old snapshot is not proof that the *current* deployment still runs the same build. A
+    proposal has to compare the value, and a value it cannot read is a check it cannot make.
+    """
     destination: SafeDestination
     purpose: Purpose
     generated_at: datetime
@@ -229,6 +260,33 @@ class _CompileArtifactIds:
         return self.generator.new(SafeEvidenceRefId)
 
 
+POLICY_BUILD_RULES: tuple[str, ...] = (
+    "p1.incident.anonymous.v1",
+    "p1.impact.aggregate.v1",
+    "p1.impact.anonymous.v1",
+    "p1.contradiction.safe.v1",
+    "p1.evidence.photo.v1",
+    "p1.identity.named.v1",
+)
+
+POLICY_BUILD_HASH: Sha256Digest = hash_value(
+    {
+        "policy_version": POLICY_VERSION,
+        "compiler_version": COMPILER_VERSION,
+        "rules": POLICY_BUILD_RULES,
+    }
+)
+"""The digest of the exact policy build this deployment compiles with.
+
+Promoted from a per-instance attribute to a module-level value because it is a property of the
+*deployment*, not of a compiler object -- and because a consumer outside the compiler has to be
+able to compare against it. ADR-020 § 3 requires exactly that: the policy build hash is
+deployment configuration, is not a case-owned authorization bump, and is "re-checked by exact
+equality at proposal and fence time". A value only the compiler could compute made that check
+unwritable.
+"""
+
+
 class PrivacyCompiler:
     """Run the frozen 22 gates without persistence, AWS, an LLM, or ambient authority."""
 
@@ -238,20 +296,7 @@ class PrivacyCompiler:
         id_generator_factory: Callable[[UUID], IdGenerator],
     ) -> None:
         self._id_generator_factory = id_generator_factory
-        self._policy_build_hash = hash_value(
-            {
-                "policy_version": POLICY_VERSION,
-                "compiler_version": COMPILER_VERSION,
-                "rules": (
-                    "p1.incident.anonymous.v1",
-                    "p1.impact.aggregate.v1",
-                    "p1.impact.anonymous.v1",
-                    "p1.contradiction.safe.v1",
-                    "p1.evidence.photo.v1",
-                    "p1.identity.named.v1",
-                ),
-            }
-        )
+        self._policy_build_hash = POLICY_BUILD_HASH
 
     def compile(self, command: CompileCommand, context: CompileContext) -> CompileResult:
         """Evaluate policy in its normative order and return an auditable typed result."""
@@ -882,7 +927,11 @@ class PrivacyCompiler:
         authorization_snapshot_hash = hash_value(
             {
                 "case_id": context.case.case_id,
-                "case_version": context.case.version,
+                # The coarse backstop term, retargeted by ADR-020 § 5 from a number that moves
+                # for two reasons to one that moves for one. Every fine-grained binding beside
+                # it is untouched: a case state transition no longer stales a view, and every
+                # genuine authorization change still does.
+                "authorization_version": context.case.authorization_version,
                 "corroboration_source_count": context.case.corroboration_source_count,
                 "policy_build_hash": self._policy_build_hash,
                 "compiler_version": COMPILER_VERSION,
@@ -976,13 +1025,15 @@ class PrivacyCompiler:
         )
         view_id = artifact_ids.view_id()
         values: dict[str, object] = {
-            "schema_version": "shareable-case-view/v1",
+            "schema_version": SHAREABLE_VIEW_SCHEMA_VERSION,
             "view_id": view_id,
             "case_id": context.case.case_id.value,
             "community_public_label": context.community_public_label,
             "case_version": context.case.version,
+            "authorization_version": context.case.authorization_version,
             "policy_version": POLICY_VERSION,
             "compiler_version": COMPILER_VERSION,
+            "policy_build_hash": self._policy_build_hash,
             "destination": command.destination,
             "purpose": command.purpose,
             "generated_at": command.requested_at,

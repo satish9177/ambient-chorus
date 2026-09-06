@@ -51,7 +51,7 @@ Trust is directional. Data moving right is re-modeled into narrower types, not p
 
 | Principal | Core table | Share table | Audit table | Private S3 | Export S3 | Monitor runtime | Investigator runtime | Action runtime | Compiler | Sender | Scheduler | SES |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| FastAPI/application | RW | RW* | W | RW | R | I | I | I | I | I | W | D |
+| FastAPI/application | RW | RW(action/case)/R + CC(view)* | W | RW | R | I | I | I | I | I | W | D |
 | Monitor runtime | D | D | — | D | D | — | — | — | D | D | D | D |
 | Investigator runtime | D | D | — | D | D | — | — | — | D | D | D | D |
 | Compiler Lambda | R(all)/W(`FENCE` partition only) | R(all safe)/W(view only) | W | R | W | — | — | — | — | D | D | D |
@@ -60,7 +60,9 @@ Trust is directional. Data moving right is re-modeled into narrower types, not p
 | Commitment watcher | D | R/W(commitment/case projection) | W | D | D | — | — | — | D | D | D | D |
 | Scheduler execution role | D | D | D | D | D | — | — | — | D | D | — | D; invokes watcher only |
 
-`*` The application may create proposals, approvals, commitments, and read views. Shareable-table partition keys begin with distinct `NS#...#VIEW#`, `VIEW_CURRENT#`, `ACTION#`, `ACTION_CURRENT#`, and `CASE#` prefixes. IAM `dynamodb:LeadingKeys` allows compiler writes only to the two view prefixes and application writes only to action/case prefixes; the application therefore cannot create or mutate a view. Conditions/repository invariants further protect immutable entity types, and CloudTrail tests the principal identity.
+`*` `CC` = `dynamodb:ConditionCheckItem`, read-only transactional authority. The application may create proposals, approvals, commitments, and read views. Shareable-table partition keys begin with distinct `NS#...#VIEW#`, `VIEW_CURRENT#`, `ACTION#`, `ACTION_CURRENT#`, and `CASE#` prefixes. IAM `dynamodb:LeadingKeys` allows compiler writes only to the two view prefixes and application writes only to action/case prefixes; the application therefore cannot create or mutate a view. Conditions/repository invariants further protect immutable entity types, and CloudTrail tests the principal identity.
+
+The application additionally holds `dynamodb:ConditionCheckItem` on `NS#*#VIEW_CURRENT#*`, scoped by `LeadingKeys` and preferably narrowed further with `dynamodb:EnclosingOperation` equal to `TransactWriteItems`. The action-proposal transaction must be able to condition on the exact current view without being able to move it ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 7). **A condition check must never become a write grant**: no `PutItem`, `UpdateItem`, or `DeleteItem` is granted to the application on either view prefix, and a static negative-capability assertion over the synthesized policy proves it, in the manner [ADR-019](../adr/ADR-019-send-fence-partition-isolation.md) established for the compiler's read-only case guard.
 
 Supporting-resource permissions are explicit as well:
 
@@ -76,7 +78,7 @@ Supporting-resource permissions are explicit as well:
 | Commitment watcher | DENY | WRITE own group | DENY | DENY | DENY | DENY |
 | Scheduler execution role | DENY | service delivery metrics only | DENY | DENY | decrypt DLQ key only | INVOKE watcher only |
 
-KMS key policies repeat these principal/resource constraints; possessing an S3/DynamoDB action without the required key action is insufficient. Safe destination label/version/routing token are deployment configuration, not Secrets Manager reads by agents/compiler.
+KMS key policies repeat these principal/resource constraints; possessing an S3/DynamoDB action without the required key action is insufficient. Safe destination label/version/routing token and `from_identity_id` are deployment configuration, not Secrets Manager reads by agents/compiler. `from_identity_id` is an opaque stable identifier for the verified sending identity and is never the `From` address; only the sender resolves the address, from its own secret.
 
 All three agent runtime roles have only:
 
@@ -89,7 +91,7 @@ They have no general network tool and no persistent AgentCore filesystem or Memo
 
 ## Principal-specific constraints
 
-- **Application:** its broad private access is why it never receives an SES permission. It invokes the sender with an action ID, never a rendered body or recipient address.
+- **Application:** its broad private access is why it never receives an SES permission. It invokes the sender with an action ID, never a rendered body or recipient address. Against the compiler-owned view prefixes it holds `dynamodb:ConditionCheckItem` and nothing else, so it can refuse to commit an action proposal against a view that has moved without ever being able to move one itself.
 - **Compiler:** accepts IDs and intent, then performs its own strongly consistent reads. It has no Bedrock permission, so policy cannot become probabilistic. Its only Core write is the short-lived send-authorization fence, and that is an IAM fact rather than a code convention: the fence has its own `NS#n#FENCE#k` partition ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md)), so `dynamodb:LeadingKeys` can scope the write to it. The case-version guard the compile transaction stages is `dynamodb:ConditionCheckItem` — read-only transactional authority — and case-partition writes are additionally denied outright. No `dynamodb:UpdateItem` is granted anywhere, and no blanket `dynamodb:TransactWriteItems` action is granted, because AWS authorizes a transaction through the permission each participant needs.
 - **Action runtime:** has no tools registered in Strands. Network configuration permits only the Bedrock model path required by AgentCore; IAM remains the authoritative boundary.
 - **Sender:** resolves the recipient from an allowlisted destination registry in configuration. It cannot read Core, so even compromised rendering cannot fetch private details. It can invoke only the compiler's typed acquire/release fence operation and receives no private result.
@@ -162,6 +164,7 @@ CHORUS_WORKER_FUNCTION_ARN=
 CHORUS_SCHEDULER_GROUP=chorus-development
 CHORUS_SCHEDULER_ROLE_ARN=
 CHORUS_SES_CONFIGURATION_SET=chorus-development
+CHORUS_SES_FROM_IDENTITY_ID=chorus-demo-sender  # opaque stable sending-identity ID; never the address
 CHORUS_DESTINATION_ID=property_manager:demo
 CHORUS_DESTINATION_DISPLAY_LABEL=Property Management
 CHORUS_DESTINATION_REGISTRY_VERSION=1

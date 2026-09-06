@@ -27,6 +27,7 @@ from chorus.domain.entities import (
     ApplicationOperation,
     Approval,
     AuditEvent,
+    CaseState,
     Commitment,
     Community,
     CommunityCase,
@@ -364,8 +365,26 @@ class CoreRepositoryPort(Protocol):
     def stage_create_case(self, scope: CaseScope, case: CommunityCase) -> PutItem: ...
 
     def stage_update_case(
-        self, scope: CaseScope, case: CommunityCase, *, expected_version: int
-    ) -> PutItem: ...
+        self,
+        scope: CaseScope,
+        case: CommunityCase,
+        *,
+        expected_version: int,
+        expected_authorization_version: int | None = None,
+        expected_state: CaseState | None = None,
+    ) -> PutItem:
+        """Stage an optimistic case replace, optionally guarded on more than the row version.
+
+        The two optional expectations exist for the Action proposal apply, whose participant 9
+        must condition on the exact ``version``, the exact ``authorization_version``, and the
+        exact ``state`` the validator read (ADR-022 § 8). They are optional rather than required
+        because every other case write genuinely only needs OCC: a mandate decision or an
+        investigation apply moves both counters itself and has no earlier read to disagree with.
+
+        Passing ``expected_authorization_version`` is what makes "this proposal is bound to an
+        epoch that has not moved" a *condition* rather than a hope -- a revocation landing while
+        the model was answering fails the transaction whole.
+        """
 
     def stage_create_report(self, scope: CaseScope, report: Report) -> PutItem: ...
 
@@ -409,19 +428,29 @@ class CoreRepositoryPort(Protocol):
         self, scope: CaseScope, result: AgentInvocationResult
     ) -> PutItem: ...
 
-    def stage_require_case_version(self, scope: CaseScope, *, expected_version: int) -> CheckItem:
-        """Assert the case still stands at exactly this version, writing nothing.
+    def stage_require_case_version(
+        self,
+        scope: CaseScope,
+        *,
+        expected_version: int,
+        expected_authorization_version: int,
+    ) -> CheckItem:
+        """Assert the case still stands at exactly these two versions, writing nothing.
 
         Deliberately a ``CheckItem`` and not a guarded update. The compiler's only Core write is
-        the send fence, so it has no grant to touch the case row at all -- and a compile that
-        bumped the case version would immediately stale the very view it had just produced
-        against the exact-version check the Action proposal validator performs.
+        the send fence, so it has no grant to touch the case row at all.
+
+        **Two conditions, one participant** (ADR-020 § 6). The compiler never writes the case
+        row, so requiring the exact OCC ``version`` costs it nothing and keeps its mid-flight
+        race protection exactly as Phase 6 shipped it; the ``authorization_version`` condition is
+        what the produced view's snapshot is actually bound to. Splitting them into two
+        participants would move the compile's fixed count off eight to say the same thing.
 
         One participant is enough to cover every mutable authorization input a compile read.
         Every authorization-sensitive mutation -- a fact's value, status, or evidence status, a
-        report's linkage, a mandate decision, an adjustment, a revocation -- bumps the case
-        version in the same transaction that makes it, so a per-fact or per-mandate condition
-        would re-check what this one already refuses.
+        report's linkage, a mandate decision, an adjustment, a revocation -- bumps both counters
+        in the same transaction that makes it, so a per-fact or per-mandate condition would
+        re-check what this one already refuses.
         """
 
     def stage_require_no_live_send_fence(self, scope: CaseScope, *, now: datetime) -> CheckItem:
@@ -493,6 +522,29 @@ class ShareableRepositoryPort(Protocol):
         *,
         expected: ViewPointerExpectation | None,
     ) -> PutItem: ...
+
+    def stage_require_current_view_pointer(
+        self, scope: CaseScope, *, expected: ViewPointerExpectation
+    ) -> CheckItem:
+        """Assert the named view is still the current one, writing nothing (ADR-022 § 7).
+
+        A ``CheckItem`` and never a ``PutItem``. An entire Action model invocation sits between
+        the pre-invocation pointer *read* and the proposal apply, and a compile committing in
+        that window moves ``VIEW_CURRENT`` while the model is still answering about the old
+        view. This condition is what makes the proposal transaction fail *whole* in that case:
+        no proposal, no ``DRAFT`` execution, no pointer movement, no case transition.
+
+        It conditions on the exact ``view_id``, ``view_hash``, and pointer row version that were
+        strongly read, so it is the Phase-7 counterpart of the exact-pointer condition the
+        compile already uses to make view-pointer rollback impossible.
+
+        **The application must never be given view-mutation authority in order to perform it.**
+        DynamoDB authorizes a transaction through the permission each participant needs, so a
+        ``ConditionCheck`` requires ``dynamodb:ConditionCheckItem`` and nothing more -- which is
+        the whole reason a read-only transactional guard is expressible at all. The synthesized
+        application policy grants exactly that on the view prefixes and no ``PutItem``,
+        ``UpdateItem``, or ``DeleteItem`` there, and a static assertion proves it.
+        """
 
     def stage_append_view_history_locator(
         self, scope: CaseScope, locator: ViewHistoryLocator

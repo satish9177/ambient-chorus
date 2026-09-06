@@ -939,6 +939,7 @@ def encode_case(scope: CaseScope, case: CommunityCase) -> StoredItem:
             "corroboration_source_count": case.corroboration_source_count,
             "state_reason_code": case.state_reason_code,
             "version": case.version,
+            "authorization_version": case.authorization_version,
             "created_at": instant(case.created_at),
             "updated_at": instant(case.updated_at),
             "resolved_at": optional_instant(case.resolved_at),
@@ -974,6 +975,12 @@ def decode_case(item: StoredItem) -> tuple[DecodedScope, CommunityCase]:
         corroboration_source_count=reader.number("corroboration_source_count"),
         state_reason_code=reader.text("state_reason_code"),
         version=reader.number("version"),
+        # Required, never optional. ADR-020 says a reader encountering an item without an
+        # authorization epoch fails closed: it must not default, infer it from the OCC
+        # version, or guess, because a guessed-low epoch is a view that looks fresher than it
+        # is. ``number`` raises ``IntegrityError`` on an absent attribute, which is exactly
+        # the fail-closed behaviour required.
+        authorization_version=reader.number("authorization_version"),
         created_at=reader.instant("created_at"),
         updated_at=reader.instant("updated_at"),
         resolved_at=reader.optional_instant("resolved_at"),
