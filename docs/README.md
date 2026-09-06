@@ -80,6 +80,9 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-020](adr/ADR-020-case-authorization-version.md) | The case authorization version, separate from the OCC row version: lifecycle progress is not disclosure authority |
 | [ADR-021](adr/ADR-021-action-grounding-and-caveats.md) | Every model-authored Action field is cited, and the exact grammar that grounds it |
 | [ADR-022](adr/ADR-022-action-draft-preview-and-transaction.md) | A DRAFT execution that can exist, a preview the proposal owns, and the ten participants that commit them |
+| [ADR-023](adr/ADR-023-approval-binding-and-immutability.md) | What a human approval binds, why it is immutable, and where consumption lives |
+| [ADR-024](adr/ADR-024-execution-partition-and-sender-boundary.md) | Executions get their own Shareable partition so `W(execution only)` is enforceable by IAM |
+| [ADR-025](adr/ADR-025-one-deliberate-ses-attempt.md) | One deliberate SES attempt: the send order, the fence's real job, and the honest unknown |
 
 ## Implementation control
 

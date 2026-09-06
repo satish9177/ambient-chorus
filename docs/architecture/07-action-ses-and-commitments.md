@@ -16,13 +16,14 @@ sequenceDiagram
     AC-->>API: structured ActionProposalDraft
     API->>API: validate IDs, facts, hashes, language constraints
     API->>DDB: one ten-participant transaction: proposal + DRAFT execution + pointers + case READY_FOR_ACTION->ACTION_PROPOSED
-    H->>API: approve exact proposal_hash + view_hash
-    API->>DDB: approval + execution APPROVED
+    H->>API: approve exact proposal_hash + view_hash + preview_hash
+    API->>DDB: immutable approval + execution APPROVED
     API->>S: execute by case/action/execution IDs
-    S->>DDB: consume approval; APPROVED -> SENDING
+    S->>DDB: strong-load proposal, view, approval, execution
+    S->>S: deterministic render + hash; require it equals the approved preview_hash
+    S->>DDB: APPROVED -> SENDING (the claim CAS; this is the duplicate-send boundary)
     S->>PC: acquire current authorization fence
     PC-->>S: ALLOW fence or stale DENY
-    S->>S: deterministic render + hash
     S->>SES: one SendEmail call with execution tag
     alt accepted
       SES-->>S: SES message ID
@@ -38,6 +39,10 @@ sequenceDiagram
 ```
 
 No stage accepts a model-authored email body. Approval is authorization for one attempt, not proof of execution.
+
+**Rendering precedes the claim, and the order is normative** ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 3). `rendered_message_hash` is required the moment an execution reaches `SENDING`, so a claim that ran before the render would have to write a digest of bytes nobody had produced. Rendering is a pure function of immutable inputs with no side effect, so moving it earlier costs nothing and is what makes the approved-equals-sent comparison happen *before* anything is consumed.
+
+**The duplicate-send boundary is the claim compare-and-swap, not the fence.** The fence is per case and admits a replay by the same `execution_id`; it exists to order a send against a mandate revocation. What guarantees at most one deliberate SES call per execution is the conditional `APPROVED@v → SENDING@v+1` write, together with the rule that no code path issues an SES call from `SENDING` or from any terminal state.
 
 The application worker, not the sender role, owns the private `CommunityCase` projection. After sender return—or on replay after a lost return—it strongly reads the execution: `SENT` conditionally moves `ACTION_PROPOSED→ACTIONED`; `FAILED/SEND_UNKNOWN` leaves the case proposed and adds the safe execution banner. Thus sender needs no Core access, and a worker crash cannot lose a sent result.
 
@@ -94,22 +99,32 @@ There is no transition out of `SENT`. V1 has exactly one execution/attempt per a
 
 ## Human approval contract
 
-The approval request supplies `action_id`, `expected_action_status`, `view_hash`, `proposal_hash`, `preview_hash`, decision, and idempotency key. The UI displays exactly the deterministic rendered preview that the sender will reconstruct, plus destination label, view/policy versions, expiry, and safe citations. A `preview_hash` mismatch is 409.
+The approval request body is `{decision, expected_execution_version, execution_id, view_hash, proposal_hash, preview_hash}` plus the `Idempotency-Key` header, and nothing else ([ADR-023](../adr/ADR-023-approval-binding-and-immutability.md) § 2). `expected_action_status` is retired: the transaction conditions on a row version, and two ways to say "the thing I saw" is one too many. The UI displays exactly the deterministic rendered preview that the sender will reconstruct, plus destination label, view/policy versions, expiry, and safe citations. A `preview_hash` mismatch is 409.
 
 `preview_hash` lives on the immutable `ActionProposal` and binds the exact preview a human is shown; the execution's `rendered_message_hash` is written later by the sender and binds the bytes prepared for one SES attempt. Both come from the same deterministic renderer over the same canonical tuple, so a correct system produces the same digest twice and a mismatch is a definite pre-send stale failure. Keeping them as two fields is what makes "the sender sent what the human approved" a comparison rather than a tautology ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 2).
 
-Rejection is the explicit human path that clears a proposal: it atomically sets the current action pointer's status to `INVALIDATED`, moves the `DRAFT` execution to `FAILED`, and returns the case to `READY_FOR_ACTION` if readiness remains. Only after that may a new proposal be created.
-
 Approval:
 
-- binds exact case/action/view/proposal/template-version hashes;
-- is created by a fixed demo approver actor after access-token validation;
-- expires after 15 minutes and before the view if that is earlier;
-- can be consumed once by one execution;
+- binds `case_id`, `action_id`, `execution_id`, `proposal_hash`, `view_hash`, and `authorization_version` directly, and binds `view_id`, `preview_hash`, `template_version`, `from_identity_id`, the destination routing triple, and the exact rendered bytes **transitively** through `proposal_hash`. Nothing transitively bound is copied onto the approval, because a second copy of a fact is a thing that can disagree with the first ([ADR-023](../adr/ADR-023-approval-binding-and-immutability.md) § 3);
+- is created by a fixed demo approver actor after access-token validation, recorded as `approver_id_hash` with `approver_assurance = DEMO_SHARED_TOKEN`. That is single-presenter demo access control and **not** authentication of a person;
+- expires at `min(approved_at + 15 minutes, view.expires_at)`;
+- is **immutable**: it is written once and never updated. Consumption is a property of the execution — reaching `SENDING` *is* the consumption, one-time by compare-and-swap — so the approval digest covers only fields that never move;
 - does not authorize changed text, recipient, destination, purpose, attachment, template, or view;
 - is never inferred from a button page load or agent output.
 
-Concurrent approvals use a conditional `attribute_not_exists(active approval)`; an exact replay returns the original, a second different decision conflicts. Rejection leaves the case `ACTION_PROPOSED` until the human re-proposes or closes.
+**One decision per proposal, enforced by the execution's row version.** Every decision moves the `DRAFT` execution out of `DRAFT` under `expected_version`, so exactly one of any number of concurrent approvals or rejections commits and every other is a 409. An exact replay under the same key and request hash returns the original and writes nothing.
+
+**Three human verbs clear a proposal**, all of which set the current action pointer to `INVALIDATED` — the only thing that frees the case for a new proposal:
+
+| Verb | Legal execution state | Execution effect |
+|---|---|---|
+| **reject** (`decision=REJECTED` on the approvals route) | `DRAFT` | `DRAFT → FAILED / PROPOSAL_REJECTED` |
+| **withdraw** (the invalidation route) | `APPROVED` | `APPROVED → FAILED / APPROVAL_WITHDRAWN` |
+| **clear** (the invalidation route) | terminal `FAILED` | none; a `ConditionCheck` asserts it is already terminal |
+
+Invalidation **refuses `SENDING`, `SENT`, and `SEND_UNKNOWN`**. A withdrawal races the sender's claim on one row and the compare-and-swap picks exactly one winner. **Rejection re-checks nothing beyond scope, the pointer, and the execution version** — a human must always be able to say no, and a reject path blocked by staleness would strand a case with a proposal nobody can approve and nobody can clear.
+
+Every clearing verb ends by returning the case to `READY_FOR_ACTION` when readiness remains. **When readiness does not remain the transaction takes no case edge at all**: the case stays `ACTION_PROPOSED`, the participant that would have written it is a `ConditionCheck` instead, and `ACTION_PROPOSED → INVESTIGATING` stays with the deterministic readiness reconciliation that owns it — that edge bumps `authorization_version`, and a human clearing a draft message is not an authorization event ([ADR-023](../adr/ADR-023-approval-binding-and-immutability.md) § 9).
 
 ## Deterministic rendering
 
@@ -154,9 +169,11 @@ The fixed framing sentence is template copy, not a model claim; the case must me
 
 - `destination_id=property_manager:demo` resolves in a Secrets Manager destination registry to one SES-verified address, safe display label, monotonically increasing registry version, and random routing token. The view contains the label/version/token but never the email address. Sender requires exact version/token equality and denies after any routing change.
 - Sender refuses any destination absent from both the registry and view, any unverified environment, and any recipient count other than one.
-- `From` is a verified CHORUS identity; Reply-To is a controlled demo inbox. No BCC/CC in V1.
+- `From` is a verified CHORUS identity; Reply-To is a controlled demo inbox. No BCC/CC in V1. `from_identity_id` resolves in the sender's own registry secret to exactly one `{from_address, reply_to_address, identity_arn}` entry, so binding the opaque ID in `preview_hash` binds the whole letterhead while no artifact a model, a human, an audit row, or a log line can see contains either address.
 - SES v2 configuration set `chorus-{environment}` publishes send/delivery/bounce events with an `execution_id_hash` email tag. The sender stores the returned SES message ID.
-- SES sandbox restrictions are accepted for the hackathon; moving out of sandbox is a deployment prerequisite, not an application fallback.
+- The request is **`Content.Simple`, never `Content.Raw`**, so SES composes the `multipart/alternative` structure and every header itself and the sender never builds a header line. The exact payload — every field, every omission, both charsets, and the tag derivation — is frozen in [ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) §§ 6–7. The email-tag value is bare lowercase hex with no `sha256:` prefix, because SES admits only `[A-Za-z0-9_-]` there.
+- The IAM allow is `ses:SendEmail` on the sending-identity ARN and the configuration-set ARN only, and it is deliberately **not** narrowed with `ses:Recipients` or `ses:FromAddress`: those condition values are email addresses, and a synthesized template is a build artifact that gets read and diffed. The single-recipient rule is enforced in code against the registry and asserted by test, and a static assertion fails the build if any address-shaped string appears in the template ([ADR-024](../adr/ADR-024-execution-partition-and-sender-boundary.md) § 5).
+- SES sandbox restrictions are accepted for the hackathon; moving out of sandbox is a deployment prerequisite, not an application fallback. Region is the deployment's single region, `us-east-1` by default.
 
 ## Idempotency and ambiguous sends
 
@@ -174,18 +191,35 @@ API double-clicks, Lambda retries, and repeated sender invokes load the existing
 
 SES `SendEmail` has no application-level guarantee that makes a timed-out call safe to repeat. The `ses_request_token_hash` and email tag aid correlation but are not treated as SES deduplication.
 
-If a sender process dies while `SENDING`, a reconciliation task after the 60-second fence expiry marks it `SEND_UNKNOWN` unless a recorded SES event positively proves acceptance. Configuration-set events may transition `SEND_UNKNOWN→SENT` when the execution tag and message ID match. An operator may inspect SES events and the controlled inbox; `SEND_UNKNOWN→FAILED` requires positive evidence that SES never accepted the call. Uncertainty remains unknown indefinitely rather than risking a duplicate.
+**CHORUS therefore does not claim exactly-once email delivery.** The provable property is narrower and is the one every mechanism in this section serves:
+
+> **At most one deliberate SES attempt is made per approved `ActionExecution`, and an attempt whose outcome is unknown is never repeated by any automatic or manual path.**
+
+That is a most-once guarantee about *attempts*, not an exactly-once guarantee about *deliveries*. A message may have been delivered and recorded as `SEND_UNKNOWN`; that is the accepted residual, it is visible and alarmed, and the alternative — resending to be sure — would turn an unknown into a certainty of duplication.
+
+The outcome classification is **`FAILED` requires proof; everything else is `SEND_UNKNOWN`**. A received SES error response proves SES processed and declined the request; a connection that never established proves no request was transmitted. Everything between those two proofs, **and every exception class not on the frozen definite list**, is unknown ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 8). The default lands on the safe side by construction rather than by somebody remembering to extend a list.
+
+If a sender process dies while `SENDING`, reconciliation after the 60-second fence expiry marks it `SEND_UNKNOWN` unless a recorded SES event positively proves acceptance. Configuration-set events may transition `SEND_UNKNOWN→SENT` when the execution tag and message ID match. An operator may inspect SES events and the controlled inbox; `SEND_UNKNOWN→FAILED` requires positive evidence that SES never accepted the call. Uncertainty remains unknown indefinitely rather than risking a duplicate.
+
+Reconciliation is **one application command, `ReconcileSendOutcome`, with two named callers**: the application worker, when a replay finds an execution in `SENDING` past the recovery window with no live fence, and an operator route for the evidence an SES event supplies. Nothing runs it on a timer, nothing runs it as a side effect of a read, and it never calls SES. A message ID that disagrees with one already recorded is an `IntegrityError` and never an overwrite, so a forged or tampered SES message ID is at worst a rejected reconciliation ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 10).
+
+**The fence is released on every terminal outcome, including `SEND_UNKNOWN`.** The fence is not the record of the attempt — the execution row is — and a fence retained as a quarantine marker would permanently refuse every future mandate decision and revocation on that case, making a contributor's ability to withdraw consent collateral damage of an ambiguous send.
 
 ## Failure/retry classification
 
 | Situation | Execution result | Automatic retry? | Next human action |
 |---|---|---:|---|
 | stale view/mandate/policy before fence | `FAILED/STALE_AUTHORIZATION` | no | recompile, re-propose, reapprove |
+| regenerated preview digest differs from the approved `preview_hash` | `FAILED/STALE_AUTHORIZATION` | no | recompile, re-propose, reapprove; **no SES call and no claim** |
+| destination registry version, routing token, or `from_identity_id` moved after approval | `FAILED` with the specific cause code | no | recompile, re-propose, reapprove |
 | SES validation/rejected recipient | `FAILED/SES_REJECTED` | no | fix destination/config, create and approve a fresh proposal |
 | SES explicit throttling/5xx response | `FAILED/SES_DEFINITE_FAILURE` | no in V1 | wait, create and approve a fresh proposal |
+| connection never established (connect timeout, DNS, unreachable endpoint) | `FAILED/SES_UNREACHABLE` | no | no request was transmitted; a fresh proposal and approval |
 | client timeout/connection reset after call begins | `SEND_UNKNOWN` | never | reconcile only |
+| any exception not on the frozen definite-failure list | `SEND_UNKNOWN` | never | reconcile only |
 | process crash in `SENDING` | `SEND_UNKNOWN` after recovery window | never | reconcile only |
 | conditional conflict/double-click | existing state | safe state read only | none |
+| definite failure, then the human clears the proposal | pointer `INVALIDATED`; case `READY_FOR_ACTION` if readiness remains | no | the invalidation route is the only path that frees the case for a new proposal |
 
 ## External reply and commitment creation
 

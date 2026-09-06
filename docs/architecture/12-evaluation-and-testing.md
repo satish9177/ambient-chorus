@@ -123,7 +123,7 @@ Static policy tests are necessary but insufficient. Post-deploy canaries assume/
 - Monitor/Investigator cannot access data stores or side effects;
 - compiler cannot invoke Bedrock/SES; it can write only the view prefixes, the audit table, and the `NS#*#FENCE#*` partition, and an attempt to put or delete any case-partition item must return `AccessDenied` ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md));
 - the application can condition on, and never write, the view prefixes: a `ConditionCheckItem` on `NS#*#VIEW_CURRENT#*` succeeds while a `PutItem`, `UpdateItem`, or `DeleteItem` on either view prefix must return `AccessDenied` ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 7);
-- sender cannot read Core/private S3 and can send only through the configured identity/configuration set;
+- sender cannot read Core or private S3 and can send only through the configured identity/configuration set; it can put an item in `NS#*#EXECUTION#*` while a put or delete against `NS#*#ACTION#*`, `NS#*#ACTION_CURRENT#*`, either view prefix, or `NS#*#CASE#*` must return `AccessDenied` ([ADR-024](../adr/ADR-024-execution-partition-and-sender-boundary.md)); and no statement anywhere in the synthesized template contains an address-shaped string;
 - watcher cannot call agents/compiler/SES or private resources.
 
 An expected AccessDenied is success. A surprising allow fails deployment.
@@ -187,6 +187,23 @@ Playwright covers exactly three surfaces: discovery, Resident B adjust/revoke, p
 49. `test_plain_and_html_derive_from_one_intermediate_tree`
 50. `test_rendered_message_over_100_kib_rejects_and_never_truncates`
 51. `test_application_cannot_write_any_view_prefix` — a static negative-capability sweep of every synthesized allow statement, in the manner [ADR-019](../adr/ADR-019-send-fence-partition-isolation.md) established.
+52. `test_sender_cannot_write_any_action_or_view_prefix` — the same sweep over the sender role; the positive half is that `NS#*#EXECUTION#*` is the only write it holds.
+53. `test_synthesized_template_contains_no_address_shaped_string` — the reason the SES grant is not narrowed by `ses:Recipients`.
+54. `test_approval_hash_survives_every_legal_later_write` — there are none, and that is the assertion.
+55. `test_second_decision_on_one_draft_conflicts` — two approvals, or an approval and a rejection, resolve to exactly one commit.
+56. `test_stale_tab_cannot_approve_a_replaced_proposal`
+57. `test_rejection_of_a_stale_proposal_succeeds` — a proposal that can never be approved must still be clearable.
+58. `test_withdrawal_and_send_claim_race_has_exactly_one_winner`
+59. `test_invalidation_after_definite_send_failure_frees_the_case` — the failure matrix's stated remedy is reachable.
+60. `test_render_precedes_claim_so_sending_can_carry_its_required_hashes`
+61. `test_rendered_hash_mismatch_fails_before_ses` — no claim, no fence, no SES call.
+62. `test_claim_cas_admits_exactly_one_of_two_workers` — asserts SES call count 1.
+63. `test_no_ses_call_is_made_from_sending_on_redelivery`
+64. `test_unlisted_ses_exception_classifies_as_send_unknown` — the safe side is the default.
+65. `test_send_unknown_releases_the_fence_and_revocation_proceeds` — an ambiguous send never becomes a lien on a contributor's consent.
+66. `test_reconciliation_rejects_a_disagreeing_message_id`
+67. `test_send_transaction_participant_counts_are_three_three_and_four` — claim, outcome, and case projection, asserted arithmetically against the staged plans.
+68. `test_send_fence_denies_after_authorization_version_moves_post_approval` — the revocation-after-approval race, end to end.
 
 ## CI gates
 
