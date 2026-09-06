@@ -87,9 +87,8 @@ async def test_no_internal_only_value_reaches_the_persisted_view(secret: str) ->
         harness.scope,
         result.view.view_id,
     )
-    assert sentinel not in " ".join(
-        _strings(to_canonical_primitive(stored))
-    )
+    assert sentinel not in " ".join(_strings(to_canonical_primitive(stored)))
+
 
 @given(order=st.permutations(list(range(6))))
 @SLOW
