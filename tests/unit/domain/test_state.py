@@ -123,6 +123,7 @@ _EXECUTION_DIGEST = Sha256Digest("sha256:" + "1" * 64)
 _EXECUTION_VALUES: dict[str, object] = {
     "approval_id": ApprovalId(_uuid("approval:test")),
     "idempotency_key": "execution-test",
+    "claim_owner_hash": _EXECUTION_DIGEST,
     "ses_request_token_hash": _EXECUTION_DIGEST,
     "rendered_message_hash": _EXECUTION_DIGEST,
     "started_at": NOW - timedelta(minutes=2),
@@ -172,7 +173,6 @@ def _execution(state: ActionExecutionState) -> ActionExecution:
         proposal_hash=_EXECUTION_DIGEST,
         view_hash=_EXECUTION_DIGEST,
         state=state,
-        failure_detail_safe=None,
         version=1,
         created_at=NOW - timedelta(minutes=3),
         updated_at=NOW - timedelta(minutes=3),
@@ -300,3 +300,113 @@ def test_an_authorization_bump_is_guarded_on_the_expected_version() -> None:
 def test_the_mandate_mutable_states_are_exactly_the_non_terminal_ones() -> None:
     terminal = {CaseState.RESOLVED, CaseState.CLOSED_UNRESOLVED}
     assert set(MANDATE_MUTABLE_CASE_STATES) == set(CaseState) - terminal
+
+
+# ---------------------------------------------------------------------------------------
+# The two-writer boundary IAM cannot draw (ADR-024 SS 4)
+# ---------------------------------------------------------------------------------------
+
+APPLICATION_EXECUTION_SOURCES: frozenset[ActionExecutionState] = frozenset(
+    {ActionExecutionState.DRAFT, ActionExecutionState.APPROVED}
+)
+"""The application creates the ``DRAFT`` and moves it on both human decisions."""
+
+SENDER_EXECUTION_SOURCES: frozenset[ActionExecutionState] = frozenset(
+    {ActionExecutionState.APPROVED, ActionExecutionState.SENDING}
+)
+"""The sender claims from ``APPROVED`` and writes the three terminal outcomes."""
+
+
+def test_two_principals_write_executions_and_the_state_machine_separates_them() -> None:
+    """The one Phase-8 boundary IAM does not draw, asserted over the transitions.
+
+    Both the application and the sender hold ``PutItem`` over ``NS#*#EXECUTION#*``, because
+    ``dynamodb:LeadingKeys`` cannot distinguish two writers of one item type. What keeps them
+    apart is this edge set plus the exact-version condition on every write: the application can
+    only move a row in ``DRAFT`` or ``APPROVED``, the sender only one in ``APPROVED`` or
+    ``SENDING``.
+
+    This is a test over the transitions rather than over a policy, which is exactly what
+    ADR-024 SS 4 says it has to be.
+    """
+
+    reachable = {source for source, _ in ACTION_EXECUTION_EDGES}
+    unowned = reachable - APPLICATION_EXECUTION_SOURCES - SENDER_EXECUTION_SOURCES
+
+    # SEND_UNKNOWN is the third source, and it belongs to reconciliation -- an application
+    # command that requires positive proof and never sends.
+    assert unowned == {ActionExecutionState.SEND_UNKNOWN}
+
+
+def test_the_single_overlapping_state_is_the_withdrawal_race() -> None:
+    """``APPROVED`` is the one state both principals may move, and it has exactly two edges.
+
+    Withdrawal and the send claim are two conditional writes to one row, so exactly one
+    commits. There is deliberately no attempt to make the human always win -- that would
+    require holding a lock across an external call.
+    """
+
+    overlap = APPLICATION_EXECUTION_SOURCES & SENDER_EXECUTION_SOURCES
+    assert overlap == {ActionExecutionState.APPROVED}
+
+    from_approved = {
+        target
+        for source, target in ACTION_EXECUTION_EDGES
+        if source is ActionExecutionState.APPROVED
+    }
+    assert from_approved == {ActionExecutionState.SENDING, ActionExecutionState.FAILED}
+
+
+def test_there_is_no_edge_out_of_sent() -> None:
+    """V1 has exactly one attempt per action, and a sent message cannot be recalled."""
+
+    assert not [edge for edge in ACTION_EXECUTION_EDGES if edge[0] is ActionExecutionState.SENT]
+
+
+def test_send_unknown_leaves_only_on_reconciliation_proof() -> None:
+    """Both edges out of the quarantine require proof, and neither is automatic."""
+
+    execution = _send_unknown_execution()
+
+    for target in (ActionExecutionState.SENT, ActionExecutionState.FAILED):
+        with pytest.raises(StateTransitionError):
+            transition_action_execution(
+                execution,
+                target,
+                expected_version=execution.version,
+                now=execution.updated_at,
+                finished_at=execution.finished_at,
+            )
+
+
+def _send_unknown_execution() -> ActionExecution:
+    """The minimal ``SEND_UNKNOWN`` row the presence table admits."""
+
+    from datetime import UTC, datetime
+
+    from chorus.domain.ids import ActionId
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    digest = Sha256Digest("sha256:" + "a" * 64)
+    return ActionExecution(
+        execution_id=ExecutionId(UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")),
+        action_id=ActionId(UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
+        case_id=CaseId(UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")),
+        approval_id=ApprovalId(UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")),
+        proposal_hash=digest,
+        view_hash=digest,
+        idempotency_key="send-key",
+        state=ActionExecutionState.SEND_UNKNOWN,
+        claim_owner_hash=digest,
+        rendered_message_hash=digest,
+        ses_request_token_hash=digest,
+        ses_message_id=None,
+        started_at=now,
+        finished_at=now,
+        failure_code=None,
+        failure_detail_safe=None,
+        reconciled_at=None,
+        version=1,
+        created_at=now,
+        updated_at=now,
+    )

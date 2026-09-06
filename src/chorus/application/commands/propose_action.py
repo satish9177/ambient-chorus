@@ -1014,6 +1014,7 @@ class ProposeAction:
                     view_hash=proposal.view_hash,
                     idempotency_key=None,
                     state=ActionExecutionState.DRAFT,
+                    claim_owner_hash=None,
                     rendered_message_hash=None,
                     ses_request_token_hash=None,
                     ses_message_id=None,

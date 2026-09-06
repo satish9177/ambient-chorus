@@ -9,6 +9,7 @@ from infra.cdk.stacks.application import (
 from infra.cdk.stacks.compiler import ChorusCompilerStack, CompilerBuckets, CompilerTables
 from infra.cdk.stacks.data import ChorusDataStack
 from infra.cdk.stacks.foundation import ChorusFoundationStack
+from infra.cdk.stacks.sender import ChorusSenderStack, SenderBuckets, SenderTables
 
 __all__ = [
     "ApplicationBuckets",
@@ -18,6 +19,9 @@ __all__ = [
     "ChorusCompilerStack",
     "ChorusDataStack",
     "ChorusFoundationStack",
+    "ChorusSenderStack",
     "CompilerBuckets",
     "CompilerTables",
+    "SenderBuckets",
+    "SenderTables",
 ]

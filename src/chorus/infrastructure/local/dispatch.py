@@ -32,6 +32,8 @@ from chorus.ports.operations import (
     MonitorOperationJob,
     ProposeActionJobRunner,
     ProposeActionOperationJob,
+    SendActionJobRunner,
+    SendActionOperationJob,
 )
 
 
@@ -56,6 +58,7 @@ class RecordingOperationDispatcher:
     jobs: list[MonitorOperationJob] = field(default_factory=list)
     investigations: list[InvestigationOperationJob] = field(default_factory=list)
     proposals: list[ProposeActionOperationJob] = field(default_factory=list)
+    sends: list[SendActionOperationJob] = field(default_factory=list)
     failures: int = 0
 
     async def dispatch_monitor(self, job: MonitorOperationJob) -> None:
@@ -76,6 +79,12 @@ class RecordingOperationDispatcher:
             raise DispatchFailedError("the job was not handed over")
         self.proposals.append(job)
 
+    async def dispatch_send_action(self, job: SendActionOperationJob) -> None:
+        if self.failures > 0:
+            self.failures -= 1
+            raise DispatchFailedError("the job was not handed over")
+        self.sends.append(job)
+
 
 @dataclass(slots=True)
 class InProcessOperationDispatcher:
@@ -84,6 +93,7 @@ class InProcessOperationDispatcher:
     worker: MonitorJobRunner
     investigator: InvestigationJobRunner | None = None
     proposer: ProposeActionJobRunner | None = None
+    sender: SendActionJobRunner | None = None
     _tasks: set[asyncio.Task[object]] = field(default_factory=set, init=False)
     _pending: set[threading.Event] = field(default_factory=set, init=False)
 
@@ -101,6 +111,11 @@ class InProcessOperationDispatcher:
         if self.proposer is None:
             raise DispatchFailedError("no proposal runner is wired to this dispatcher")
         self._run(self.proposer.execute(job))
+
+    async def dispatch_send_action(self, job: SendActionOperationJob) -> None:
+        if self.sender is None:
+            raise DispatchFailedError("no send runner is wired to this dispatcher")
+        self._run(self.sender.execute(job))
 
     def _run(self, coroutine: object) -> None:
         finished = threading.Event()

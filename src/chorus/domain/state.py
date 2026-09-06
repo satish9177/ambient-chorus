@@ -290,21 +290,23 @@ def transition_action_execution(
     reconciliation_proof: bool = False,
     approval_id: ApprovalId | None = None,
     idempotency_key: str | None = None,
+    claim_owner_hash: Sha256Digest | None = None,
     rendered_message_hash: Sha256Digest | None = None,
     ses_request_token_hash: Sha256Digest | None = None,
     ses_message_id: str | None = None,
     started_at: datetime | None = None,
     finished_at: datetime | None = None,
     failure_code: str | None = None,
+    failure_detail_safe: str | None = None,
     reconciled_at: datetime | None = None,
 ) -> ActionExecution:
     """Advance one-attempt execution; ambiguous state requires reconciliation proof.
 
-    The nine optional arguments are the values a target state newly requires -- an
-    ``approval_id`` and a send ``idempotency_key`` at ``APPROVED``, a rendered hash and an SES
-    token at ``SENDING``, a ``finished_at`` at every terminal state. They are enumerated rather
-    than taken as ``**kwargs`` because the set is closed by the presence table, and a keyword
-    bag would accept a misspelling silently.
+    The eleven optional arguments are the values a target state newly requires -- an
+    ``approval_id`` and a send ``idempotency_key`` at ``APPROVED``, a claim owner, a rendered
+    hash and an SES token at ``SENDING``, a ``finished_at`` at every terminal state. They are
+    enumerated rather than taken as ``**kwargs`` because the set is closed by the presence
+    table, and a keyword bag would accept a misspelling silently.
 
     They are applied in the same construction as the state change, so the entity's presence
     table validates the *result* rather than an intermediate shape that would fail on its way
@@ -324,12 +326,14 @@ def transition_action_execution(
     supplied = {
         "approval_id": approval_id,
         "idempotency_key": idempotency_key,
+        "claim_owner_hash": claim_owner_hash,
         "rendered_message_hash": rendered_message_hash,
         "ses_request_token_hash": ses_request_token_hash,
         "ses_message_id": ses_message_id,
         "started_at": started_at,
         "finished_at": finished_at,
         "failure_code": failure_code,
+        "failure_detail_safe": failure_detail_safe,
         "reconciled_at": reconciled_at,
     }
     moved = replace(

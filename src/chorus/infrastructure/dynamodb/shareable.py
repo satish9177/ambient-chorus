@@ -8,7 +8,7 @@ result decides whether an export may proceed; ``read_*`` is eventual and display
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from chorus.domain.entities import (
     ActionExecution,
@@ -67,6 +67,7 @@ ATTR_VIEW_ID = "view_id"
 ATTR_VIEW_HASH = "view_hash"
 ATTR_PROPOSAL_HASH = "proposal_hash"
 ATTR_APPROVAL_HASH = "approval_hash"
+ATTR_STATE = "state"
 
 
 @dataclass(slots=True)
@@ -451,42 +452,23 @@ class ShareableRepository:
             codec_share.encode_approval(scope, approval),
         )
 
-    def stage_consume_approval(
-        self, scope: ActionScope, approval: Approval, *, expected: Approval
-    ) -> PutItem:
-        """Record the one-time consumption of an approval without rewriting the decision.
+    def stage_require_execution(
+        self, scope: ActionScope, execution: ActionExecution, *, expected_version: int
+    ) -> CheckItem:
+        """Assert the execution's exact state and version, writing nothing.
 
-        An approval is an immutable human authorization; only ``consumed_at`` and its version
-        projection may ever change. A whole-item put could silently carry a different
-        proposal hash, view hash, decision, approver, or expiry alongside the consumption, so
-        the caller supplies the record it loaded and every other field is compared against
-        it. ``approval_hash`` is bound in the condition as well, but the field-by-field
-        comparison is what makes the guarantee independent of whatever that hash covers.
+        Used by the clearing verb, whose whole effect is on the pointer: the execution is
+        already terminal ``FAILED`` and there is nothing to move. A ``PutItem`` would rewrite
+        a row that records something that already happened, which monotonic presence exists to
+        refuse, and it would need a write grant for a participant that changes nothing.
         """
 
-        if approval.consumed_at is None:
-            raise ValueError("consuming an approval must record consumed_at")
-        if expected.consumed_at is not None:
-            raise ValueError("an approval is consumed exactly once")
-        if approval.version != expected.version + 1:
-            raise ValueError("consuming an approval must increment the version by one")
-        rewound = replace(
-            approval,
-            consumed_at=expected.consumed_at,
-            version=expected.version,
-            updated_at=expected.updated_at,
-        )
-        if rewound != expected:
-            raise ValueError("consuming an approval must not rewrite the decision")
-        return PutItem(
-            key=codec_share.approval_key(scope, approval.approval_id),
-            item=codec_share.encode_approval(scope, approval),
+        return CheckItem(
+            key=codec_share.execution_key(scope, execution.execution_id),
             condition=AllOf(
                 (
-                    AttributeEqualsNumber(name=ATTR_VERSION, value=expected.version),
-                    AttributeEqualsString(
-                        name=ATTR_APPROVAL_HASH, value=expected.approval_hash.value
-                    ),
+                    AttributeEqualsNumber(name=ATTR_VERSION, value=expected_version),
+                    AttributeEqualsString(name=ATTR_STATE, value=execution.state.value),
                 )
             ),
         )

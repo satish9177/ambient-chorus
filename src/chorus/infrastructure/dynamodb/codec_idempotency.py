@@ -4,6 +4,11 @@ The record lives in the contextual partition that owns the command, so an ingest
 its community partition, a case command in its case partition, and an action command in its
 action partition. The command type, actor hash, and key hash are the only sort-key segments;
 no client-supplied text is ever written into a key.
+
+Two kinds are placement decisions about *permissions* rather than filing: ``VIEW_CURRENT``,
+because the compiler may write nowhere else in the Shareable table, and ``EXECUTION``, because
+the sender must write its send records and must never be able to write the partition holding
+the proposal and the approval it is about to honour (ADR-019, ADR-024).
 """
 
 from __future__ import annotations
@@ -57,6 +62,10 @@ def _partition_key(partition: IdempotencyPartition) -> str:
             if partition.action_id is None:  # pragma: no cover - guarded by the record
                 raise ValueError("action partition requires an action")
             return keys.action_partition(partition.namespace, partition.action_id)
+        case IdempotencyPartitionKind.EXECUTION:
+            if partition.action_id is None:  # pragma: no cover - guarded by the record
+                raise ValueError("execution partition requires an action")
+            return keys.execution_partition(partition.namespace, partition.action_id)
         case _:  # pragma: no cover - closed enum
             raise AssertionError("unreachable idempotency partition kind")
 

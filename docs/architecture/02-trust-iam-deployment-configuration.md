@@ -51,16 +51,18 @@ Trust is directional. Data moving right is re-modeled into narrower types, not p
 
 | Principal | Core table | Share table | Audit table | Private S3 | Export S3 | Monitor runtime | Investigator runtime | Action runtime | Compiler | Sender | Scheduler | SES |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| FastAPI/application | RW | RW(action/case)/R + CC(view)* | W | RW | R | I | I | I | I | I | W | D |
+| FastAPI/application | RW | RW(action/execution/case)/R + CC(view)* | W | RW | R | I | I | I | I | I | W | D |
 | Monitor runtime | D | D | — | D | D | — | — | — | D | D | D | D |
 | Investigator runtime | D | D | — | D | D | — | — | — | D | D | D | D |
 | Compiler Lambda | R(all)/W(`FENCE` partition only) | R(all safe)/W(view only) | W | R | W | — | — | — | — | D | D | D |
 | Action runtime | D | D | — | D | D | — | — | — | D | D | D | D |
-| Sender Lambda | D | R(view/proposal/approval)/W(execution only) | W | D | D | — | — | — | I(fence API only) | — | D | S |
+| Sender Lambda | D | R(all safe)/W(`EXECUTION` partition only) | W | D | D | — | — | — | I(fence API only) | — | D | S |
 | Commitment watcher | D | R/W(commitment/case projection) | W | D | D | — | — | — | D | D | D | D |
 | Scheduler execution role | D | D | D | D | D | — | — | — | D | D | — | D; invokes watcher only |
 
-`*` `CC` = `dynamodb:ConditionCheckItem`, read-only transactional authority. The application may create proposals, approvals, commitments, and read views. Shareable-table partition keys begin with distinct `NS#...#VIEW#`, `VIEW_CURRENT#`, `ACTION#`, `ACTION_CURRENT#`, and `CASE#` prefixes. IAM `dynamodb:LeadingKeys` allows compiler writes only to the two view prefixes and application writes only to action/case prefixes; the application therefore cannot create or mutate a view. Conditions/repository invariants further protect immutable entity types, and CloudTrail tests the principal identity.
+`*` `CC` = `dynamodb:ConditionCheckItem`, read-only transactional authority. The application may create proposals, approvals, executions, commitments, and read views. Shareable-table partition keys begin with distinct `NS#...#VIEW#`, `VIEW_CURRENT#`, `ACTION#`, `ACTION_CURRENT#`, `EXECUTION#`, and `CASE#` prefixes. IAM `dynamodb:LeadingKeys` allows compiler writes only to the two view prefixes, application writes only to action/execution/case prefixes, and sender writes only to the execution prefix; the application therefore cannot create or mutate a view, and the sender cannot mutate the proposal or the approval it is about to honour ([ADR-024](../adr/ADR-024-execution-partition-and-sender-boundary.md)).
+
+The application and the sender both write the `EXECUTION#` prefix, and that is the one Phase-8 boundary IAM does not draw. What separates them is the state machine: the application can only move a row in `DRAFT` or `APPROVED`, the sender only one in `APPROVED` or `SENDING`, and each write is conditioned on an exact row version. The single overlapping state is the approval-withdrawal race, which the compare-and-swap resolves with exactly one winner. This is stated rather than implied because it is asserted by a test over the transitions, not by a policy assertion. Conditions/repository invariants further protect immutable entity types, and CloudTrail tests the principal identity.
 
 The application additionally holds `dynamodb:ConditionCheckItem` on `NS#*#VIEW_CURRENT#*`, scoped by `LeadingKeys` and preferably narrowed further with `dynamodb:EnclosingOperation` equal to `TransactWriteItems`. The action-proposal transaction must be able to condition on the exact current view without being able to move it ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 7). **A condition check must never become a write grant**: no `PutItem`, `UpdateItem`, or `DeleteItem` is granted to the application on either view prefix, and a static negative-capability assertion over the synthesized policy proves it, in the manner [ADR-019](../adr/ADR-019-send-fence-partition-isolation.md) established for the compiler's read-only case guard.
 
@@ -94,7 +96,7 @@ They have no general network tool and no persistent AgentCore filesystem or Memo
 - **Application:** its broad private access is why it never receives an SES permission. It invokes the sender with an action ID, never a rendered body or recipient address. Against the compiler-owned view prefixes it holds `dynamodb:ConditionCheckItem` and nothing else, so it can refuse to commit an action proposal against a view that has moved without ever being able to move one itself.
 - **Compiler:** accepts IDs and intent, then performs its own strongly consistent reads. It has no Bedrock permission, so policy cannot become probabilistic. Its only Core write is the short-lived send-authorization fence, and that is an IAM fact rather than a code convention: the fence has its own `NS#n#FENCE#k` partition ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md)), so `dynamodb:LeadingKeys` can scope the write to it. The case-version guard the compile transaction stages is `dynamodb:ConditionCheckItem` — read-only transactional authority — and case-partition writes are additionally denied outright. No `dynamodb:UpdateItem` is granted anywhere, and no blanket `dynamodb:TransactWriteItems` action is granted, because AWS authorizes a transaction through the permission each participant needs.
 - **Action runtime:** has no tools registered in Strands. Network configuration permits only the Bedrock model path required by AgentCore; IAM remains the authoritative boundary.
-- **Sender:** resolves the recipient from an allowlisted destination registry in configuration. It cannot read Core, so even compromised rendering cannot fetch private details. It can invoke only the compiler's typed acquire/release fence operation and receives no private result.
+- **Sender:** resolves the recipient from an allowlisted destination registry in configuration. It cannot read Core — that is a total explicit deny, not an absent grant — so even compromised rendering cannot fetch private details. It can invoke only the compiler's typed acquire/release fence operation and receives no private result. Its Shareable write is `PutItem` scoped by `LeadingKeys` to `NS#*#EXECUTION#*`, with writes to the action, action-current, view, view-current, and case prefixes denied by `ForAnyValue`. No `dynamodb:UpdateItem` is granted anywhere and no blanket `dynamodb:TransactWriteItems` is granted, because AWS authorizes a transaction through the permission each participant needs. Its SES allow is `ses:SendEmail` on the sending-identity and configuration-set ARNs and is deliberately **not** narrowed by `ses:Recipients` or `ses:FromAddress`, whose values are email addresses that would then live in a synthesized template; the single-recipient rule is enforced in code against the registry and a static assertion fails the build on any address-shaped string in the template.
 - **Watcher:** accepts only `CommitmentDueEvent`, does not invoke an LLM, and cannot send external messages.
 - **Audit readers:** a separate operational role may query audit records but is not part of the application runtime. Raw values are not stored in normal audit fields.
 
@@ -169,7 +171,12 @@ CHORUS_DESTINATION_ID=property_manager:demo
 CHORUS_DESTINATION_DISPLAY_LABEL=Property Management
 CHORUS_DESTINATION_REGISTRY_VERSION=1
 CHORUS_DESTINATION_ROUTING_TOKEN=00000000-0000-0000-0000-000000000000 # safe random UUID placeholder
-CHORUS_DESTINATION_REGISTRY_SECRET_ARN=     # sender-only: same version/token plus verified address
+CHORUS_DESTINATION_REGISTRY_SECRET_ARN=     # sender-only: same version/token, the verified destination address,
+                                            # and the from_identity_id -> {from_address, reply_to_address,
+                                            # identity_arn} entry. Binding the opaque identity ID in preview_hash
+                                            # therefore binds the whole letterhead without naming a mailbox.
+CHORUS_SES_IDENTITY_ARN=                    # sender-only IAM scope; deployment-supplied, never in a checked-in file
+CHORUS_SEND_RECOVERY_WINDOW_SECONDS=60      # equals the fence's maximum life; a SENDING row is only reconcilable after it
 CHORUS_DEMO_ACCESS_SECRET_ARN=              # deployed demo access token hash
 CHORUS_DEMO_CLOCK_ENABLED=true              # rejected outside development/demo
 

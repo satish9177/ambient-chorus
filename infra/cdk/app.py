@@ -13,8 +13,11 @@ from infra.cdk.stacks import (
     ChorusCompilerStack,
     ChorusDataStack,
     ChorusFoundationStack,
+    ChorusSenderStack,
     CompilerBuckets,
     CompilerTables,
+    SenderBuckets,
+    SenderTables,
 )
 
 
@@ -77,6 +80,24 @@ def build_app() -> App:
             export=data.export_evidence_bucket,
             private_key=data.private_evidence_key,
             export_key=data.export_evidence_key,
+        ),
+    )
+    # Synthesized in Phase 8 so the ADR-024 negative-capability sweep has a policy to read.
+    # The sender is the principal whose documented boundary was, until now, a sentence beside
+    # a grant that contradicted it: ``W(execution only)`` authorized rewriting the proposal
+    # and the approval, because they shared a partition. Nothing here is deployed.
+    ChorusSenderStack(
+        app,
+        "AmbientChorusSender",
+        config=config,
+        tables=SenderTables(
+            core=data.core_table,
+            shareable=data.shareable_table,
+            audit=data.audit_table,
+        ),
+        buckets=SenderBuckets(
+            private=data.private_evidence_bucket,
+            export=data.export_evidence_bucket,
         ),
     )
     return app

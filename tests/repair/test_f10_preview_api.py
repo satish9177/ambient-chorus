@@ -24,6 +24,7 @@ import pytest
 
 from chorus.application.commands.propose_action import ProposeActionResult
 from chorus.domain.entities import ActionExecutionState, ActionProposalStatus
+from chorus.ports.scopes import ActionScope
 from chorus.ports.storage import StorageDriver
 from tests.contract.api.conftest import ApiHarness, build_harness
 from tests.fixtures.action import ActionHarness
@@ -132,8 +133,6 @@ async def test_the_preview_is_regenerated_rather_than_loaded_from_storage(
 
     # The proof that nothing was loaded: the stored proposal item carries the digest and
     # neither body, so there is no persisted text for the route to have returned.
-    from chorus.ports.scopes import ActionScope
-
     stored = await proposed.compile.shareable.load_proposal(
         ActionScope(
             namespace=proposed.scope.namespace,
@@ -165,17 +164,58 @@ async def test_the_regenerated_bodies_match_the_renderer_run_directly(
 async def test_the_draft_execution_is_projected_without_approving_anything(
     proposed: ActionHarness, storage: StorageDriver
 ) -> None:
-    """Reading a ``DRAFT`` is Phase 7; approving or sending it is Phase 8."""
+    """Reading a ``DRAFT`` decides nothing about it.
 
-    response, api, result = await _surface(proposed, storage)
+    This test originally also asserted that no approval or execution route existed at all,
+    which was true of Phase 7 and is the thing Phase 8 was chartered to change. What it was
+    *really* protecting survives the change and is asserted directly instead: **a read has no
+    side effect.** The execution is still ``DRAFT`` at its original version after the surface
+    has been served, so serving a preview never advances anything -- which is the same rule
+    ADR-025 SS 10 states for reconciliation, applied to the surface a human approves from.
+    """
+
+    response, _api, result = await _surface(proposed, storage)
     execution = response.json()["current_action"]["execution"]
 
     assert execution["execution_id"] == str(result.execution_id)
     assert execution["state"] == ActionExecutionState.DRAFT.value
+
+    stored = await proposed.compile.shareable.load_execution(
+        ActionScope(
+            namespace=proposed.scope.namespace,
+            community_id=proposed.scope.community_id,
+            case_id=proposed.scope.case_id,
+            action_id=result.action_id,
+        ),
+        result.execution_id,
+    )
+    assert stored.state is ActionExecutionState.DRAFT
+    assert stored.version == 1
+    assert stored.approval_id is None
+
+
+async def test_the_phase_eight_verbs_are_commands_and_never_a_second_read_route(
+    proposed: ActionHarness, storage: StorageDriver
+) -> None:
+    """Approving, clearing, and sending are ``POST``; the execution keeps one address.
+
+    ADR-025 SS 15 freezes a minimal surface: three commands, and **no new read route**, because
+    an execution is already part of ``current_action`` here and a second address for one row is
+    a second thing to keep consistent.
+    """
+
+    _response, api, _result = await _surface(proposed, storage)
     with api.client:
-        paths = set(api.app.openapi()["paths"])
-    for forbidden in ("approvals", "executions", "send"):
-        assert not any(forbidden in path for path in paths), forbidden
+        paths: dict[str, Any] = api.app.openapi()["paths"]
+
+    for suffix in ("approvals", "invalidation", "executions"):
+        matching = [path for path in paths if path.endswith(f"/{suffix}")]
+        assert len(matching) == 1, suffix
+        assert set(paths[matching[0]]) == {"post"}, suffix
+
+    # No route reads an execution by identifier, and none offers a retry.
+    assert not any("/executions/" in path for path in paths)
+    assert not any("retry" in path for path in paths)
 
 
 # ---------------------------------------------------------------------------------------

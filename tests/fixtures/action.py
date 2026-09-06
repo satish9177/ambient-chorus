@@ -13,6 +13,7 @@ the pre-invocation checks cannot see.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from uuid import UUID, uuid4, uuid5
@@ -155,8 +156,30 @@ class RecordingUnitOfWork:
     exact point where a real conflict happens.
     """
 
+    before_commit: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
+    """Callbacks to run *between* a command's reads and its write, one per entry, in order.
+
+    This is the only seam that can express the race that matters: a caller whose reads all
+    passed, and whose durable world then moved before its transaction landed. Without it a test
+    can only ever exercise the cheap read-time refusal, which proves that the reads work and
+    says nothing about whether the transaction's own conditions do.
+    """
+
+    fail_by_name: dict[str, Exception] = field(default_factory=dict)
+    """Exceptions keyed by transaction name, raised instead of committing that plan.
+
+    Positional ``fail_next`` cannot express "let the claim commit and lose the *result*", which
+    is the exact shape a crashed sender leaves behind -- a ``SENDING`` row nothing ever
+    finished. Naming the plan makes that scenario constructible without counting commits.
+    """
+
     async def commit(self, plan: TransactionPlan) -> None:
         self.plans.append(plan)
+        if self.before_commit:
+            await self.before_commit.pop(0)()
+        named = self.fail_by_name.pop(plan.name, None)
+        if named is not None:
+            raise named
         if self.fail_next:
             raise self.fail_next.pop(0)
         await self.inner.commit(plan)

@@ -104,6 +104,30 @@ def action_current_partition(namespace: Namespace, case_id: CaseId) -> str:
     return _join("NS", namespace.value, "ACTION_CURRENT", str(case_id))
 
 
+def execution_partition(namespace: Namespace, action_id: ActionId) -> str:
+    """``NS#{namespace}#EXECUTION#{action_id}`` -- the send execution's own partition.
+
+    Keyed by *action*, not by execution, so it stays the per-action collection the access
+    patterns describe; V1 puts exactly one item in it, and the current action pointer already
+    carries both identifiers, so every execution read is still a direct get with no query and
+    no GSI.
+
+    Like the send fence, this is a permission fact rather than a filing choice
+    ([ADR-024](../../../../docs/adr/ADR-024-execution-partition-and-sender-boundary.md)).
+    ``dynamodb:LeadingKeys`` constrains the partition key and nothing constrains the sort key,
+    so while the execution shared ``NS#n#ACTION#a`` with the immutable proposal and the
+    immutable approval, the narrowest grant that could write an execution also authorized
+    overwriting the message a human approved -- and a compromised sender could then have
+    rendered its own replacement and made every hash agree.
+
+    It stays in the Shareable table: this is a partition change, not a new store. The
+    send-command idempotency records move with it, for the mirror reason -- a record only one
+    principal must write must not sit where only that principal is denied.
+    """
+
+    return _join("NS", namespace.value, "EXECUTION", str(action_id))
+
+
 def community_sort_key(community_id: CommunityId) -> str:
     return _join("COMMUNITY", str(community_id))
 

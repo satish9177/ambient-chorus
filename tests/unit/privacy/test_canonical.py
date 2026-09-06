@@ -14,9 +14,11 @@ from chorus.domain.entities import (
     ActionTone,
     Approval,
     ApprovalDecision,
+    ApproverAssurance,
 )
-from chorus.domain.ids import ActionId, ApprovalId, Sha256Digest, ViewId
+from chorus.domain.ids import ActionId, ApprovalId, ExecutionId, Sha256Digest, ViewId
 from chorus.privacy.canonical import (
+    APPROVAL_HASH_OMITTED_FIELDS,
     canonical_bytes,
     hash_action_caveat,
     hash_action_claim,
@@ -115,17 +117,21 @@ def test_proposal_and_approval_hash_primitives_bind_authorization_tuple() -> Non
     )
     approval_draft = Approval(
         approval_id=ApprovalId(_uuid("approval:hash-test")),
-        action_id=proposal.action_id,
+        namespace=fixture.context.case.namespace,
+        community_id=fixture.context.case.community_id,
         case_id=proposal.case_id,
+        action_id=proposal.action_id,
+        execution_id=ExecutionId(_uuid("execution:hash-test")),
         proposal_hash=proposal.proposal_hash,
         view_hash=proposal.view_hash,
-        approver_id=fixture.contributor_ids[0],
+        authorization_version=proposal.authorization_version,
+        approver_id_hash=Sha256Digest("sha256:" + "4" * 64),
+        approver_assurance=ApproverAssurance.DEMO_SHARED_TOKEN,
         decision=ApprovalDecision.APPROVED,
         approved_at=NOW,
         expires_at=NOW + timedelta(minutes=15),
-        consumed_at=None,
         approval_hash=empty,
-        idempotency_key="approval-hash-test",
+        request_key_hash=Sha256Digest("sha256:" + "5" * 64),
         version=1,
         created_at=NOW,
         updated_at=NOW,
@@ -147,3 +153,28 @@ def test_proposal_and_approval_hash_primitives_bind_authorization_tuple() -> Non
     )
     assert hash_action_proposal(replace(proposal, caveats=())) != proposal.proposal_hash
     assert hash_action_proposal(replace(proposal, tone=ActionTone.FIRM)) != proposal.proposal_hash
+
+    # ADR-023 SS 1. The omit set is row bookkeeping and nothing else, so every field that is
+    # part of the *decision* moves the digest and the three that describe the row do not.
+    # Asserted here as well as in the persistence contract because this is where the hasher
+    # itself lives, and a check that only ran beside storage would not catch a change to the
+    # omit set made without one.
+    assert (
+        frozenset({"approval_hash", "version", "created_at", "updated_at"})
+        == APPROVAL_HASH_OMITTED_FIELDS
+    )
+    for mutated in (
+        replace(approval, version=approval.version + 1),
+        replace(approval, created_at=NOW - timedelta(seconds=1)),
+        replace(approval, updated_at=NOW + timedelta(seconds=1)),
+    ):
+        assert hash_approval(mutated) == approval.approval_hash
+    for mutated in (
+        replace(approval, decision=ApprovalDecision.REJECTED),
+        replace(approval, execution_id=ExecutionId(_uuid("execution:other"))),
+        replace(approval, authorization_version=99),
+        replace(approval, approver_id_hash=Sha256Digest("sha256:" + "6" * 64)),
+        replace(approval, request_key_hash=Sha256Digest("sha256:" + "7" * 64)),
+        replace(approval, expires_at=NOW + timedelta(minutes=16)),
+    ):
+        assert hash_approval(mutated) != approval.approval_hash

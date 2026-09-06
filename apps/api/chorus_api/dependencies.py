@@ -24,9 +24,11 @@ from typing import Annotated
 
 from fastapi import Header, HTTPException, Request
 
+from chorus.application.commands.approve_action import ApproveAction
 from chorus.application.commands.compile_view import CompileView
 from chorus.application.commands.decide_mandate import DecideMandate
 from chorus.application.commands.ingest_messages import IngestMessages
+from chorus.application.commands.invalidate_action import InvalidateAction
 from chorus.application.commands.propose_mandates import ProposeMandates
 from chorus.application.operations import ApplicationOperations
 from chorus.application.queries.current_action import ReadCurrentAction
@@ -96,6 +98,13 @@ class ApiContainer:
     container is a use case no route can call -- which is exactly what it was.
     """
 
+    approve_action: ApproveAction
+    """The one place a human contributes authority, and it contributes exactly one bit."""
+
+    invalidate_action: InvalidateAction
+    """Withdrawal and clearing. Without it the failure matrix's own remedy for a definite send
+    failure -- create and approve a fresh proposal -- has no reachable path."""
+
     dispatcher: OperationDispatchPort
 
 
@@ -142,6 +151,24 @@ def require_case_reader(actor: DemoActor) -> DemoActor:
 
     if actor not in {DemoActor.PRESENTER_ADMIN, DemoActor.CASE_APPROVER}:
         raise HTTPException(status_code=403, detail="This surface requires a case reader role.")
+    return actor
+
+
+def require_case_approver(actor: DemoActor) -> DemoActor:
+    """Restrict the approval, invalidation, and execute routes to the approver persona.
+
+    The presenter is refused here even though they may *read* the case surface. Watching a
+    proposal and authorizing an external message are different powers, and the frozen access
+    model grants the second to ``case_approver`` and to nobody else.
+
+    This resolves a persona, not a person. What it establishes is that somebody holding the
+    demo access token asserted the approver persona -- recorded as ``approver_id_hash`` with
+    ``approver_assurance = DEMO_SHARED_TOKEN`` -- and it is single-presenter demo access
+    control rather than authentication (ADR-023 SS 4).
+    """
+
+    if actor is not DemoActor.CASE_APPROVER:
+        raise HTTPException(status_code=403, detail="This surface requires the approver role.")
     return actor
 
 

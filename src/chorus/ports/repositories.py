@@ -434,6 +434,7 @@ class CoreRepositoryPort(Protocol):
         *,
         expected_version: int,
         expected_authorization_version: int,
+        expected_state: CaseState | None = None,
     ) -> CheckItem:
         """Assert the case still stands at exactly these two versions, writing nothing.
 
@@ -554,15 +555,16 @@ class ShareableRepositoryPort(Protocol):
 
     def stage_append_approval(self, scope: ActionScope, approval: Approval) -> PutItem: ...
 
-    def stage_consume_approval(
-        self, scope: ActionScope, approval: Approval, *, expected: Approval
-    ) -> PutItem:
-        """Record one-time consumption without rewriting the decision.
+    def stage_require_execution(
+        self, scope: ActionScope, execution: ActionExecution, *, expected_version: int
+    ) -> CheckItem:
+        """Assert an execution's exact state and version without writing it (ADR-023 SS 8).
 
-        The caller supplies the record it loaded rather than only its version, because a
-        whole-item put could otherwise carry a different proposal hash, view hash, decision,
-        approver, or expiry alongside the consumption. The adapter compares every other
-        field against ``expected``; the version alone could not detect that.
+        The clearing verb for an already-terminal ``FAILED`` execution moves the pointer and
+        nothing else, so the execution participates as a read-only condition. A ``PutItem``
+        that rewrote the row with its own content would be a second, later record of a
+        failure that already happened -- and monotonic presence exists precisely to refuse
+        that.
         """
 
     def stage_create_execution(self, scope: ActionScope, execution: ActionExecution) -> PutItem: ...

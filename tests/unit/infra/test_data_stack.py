@@ -195,6 +195,11 @@ def test_the_application_synthesizes_every_declared_stack() -> None:
         # Phase 7 synthesizes the application principal, so the ADR-022 negative-capability
         # assertion has a real policy to read rather than a trust-matrix row nothing can check.
         "AmbientChorusApplication",
+        # Phase 8 does the same for the sender, whose documented boundary was until now a
+        # sentence beside a grant that contradicted it: ``W(execution only)`` authorized
+        # rewriting the proposal and the approval, because they shared a partition (ADR-024).
+        # Defined and asserted here; deployed by Phase 11.
+        "AmbientChorusSender",
     }
 
 

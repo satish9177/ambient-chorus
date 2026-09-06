@@ -62,8 +62,9 @@ Lambda async delivery may repeat; the operation/input hash and underlying comman
 | `POST /cases/{case_id}/investigations` | presenter admin | 202 operation | case in candidate/awaiting/investigating/terminal-reopen flow |
 | `POST /cases/{case_id}/views` | presenter admin | 200 ALLOW view or 422 DENY | expected case version; compiler idempotency |
 | `POST /cases/{case_id}/actions` | presenter admin | 202 proposal operation | current non-expired view; state ready; matching `authorization_version`; no live `DRAFT` proposal |
-| `POST /cases/{case_id}/actions/{action_id}/approvals` | case approver | 200 approval/execution | exact proposal/view hashes; state draft |
-| `POST /cases/{case_id}/actions/{action_id}/executions` | case approver | 202 send operation | matching unexpired approval; safe replay by execution ID |
+| `POST /cases/{case_id}/actions/{action_id}/approvals` | case approver | 200 approval/execution | exact proposal/view/preview hashes; pointer `DRAFT`; execution `DRAFT` at the expected version |
+| `POST /cases/{case_id}/actions/{action_id}/invalidation` | case approver | 200 pointer/execution/case | execution `DRAFT`, `APPROVED`, or terminal `FAILED`; refused for `SENDING`, `SENT`, `SEND_UNKNOWN` |
+| `POST /cases/{case_id}/actions/{action_id}/executions` | case approver | 202 send operation | matching unexpired approval; execution `APPROVED` at the expected version; safe replay by execution ID |
 | `POST /demo/external-replies` | presenter admin | 202 investigation operation | demo only; same case/action; message uniqueness |
 | `POST /cases/{case_id}/commitments/{commitment_id}/verification` | affected contributor | 200 commitment/case | commitment DUE; actor is affected contributor |
 | `GET /cases/{case_id}/audit` | presenter admin | 200 page | safe audit only |
@@ -182,15 +183,22 @@ Proposing uses two idempotency records under one `PROPOSE_ACTION` command family
 {
   "decision": "APPROVED",
   "expected_execution_version": 1,
+  "execution_id": "uuid",
   "view_hash": "sha256:...",
   "proposal_hash": "sha256:...",
   "preview_hash": "sha256:..."
 }
 ```
 
-Returns immutable approval and execution `APPROVED`. `preview_hash` is the proposal's immutable preview binding, not the execution's later `rendered_message_hash`; a mismatch is 409. Reject returns the decision and atomically invalidates the current action pointer, moves the `DRAFT` execution to `FAILED`, and returns the case to `READY_FOR_ACTION` if readiness remains — which is the only path that clears a proposal so a new one may be created.
+Returns immutable approval and execution `APPROVED`. `preview_hash` is the proposal's immutable preview binding, not the execution's later `rendered_message_hash`; a mismatch is 409. The body carries **no text field of any kind**, so there is nothing in which an edited body could be submitted: an edit is a rejection followed by a new proposal with a new `action_id`, a new `preview_hash`, and a new decision.
 
-`POST .../actions/{action_id}/executions` body `{execution_id,expected_execution_version,approval_id}` returns 202. It never accepts recipient, subject, body, claim, attachment, or retry flag. Poll operation/case for `SENT|FAILED|SEND_UNKNOWN`.
+A stale browser tab is refused three ways over — an old `proposal_hash`, an old `expected_execution_version`, and an `action_id` the current pointer no longer names — and the transaction repeats all three as participants, so a tab that wins the reads still commits nothing.
+
+`decision: "REJECTED"` records the decision and atomically invalidates the current action pointer, moves the `DRAFT` execution to `FAILED`, and returns the case to `READY_FOR_ACTION` if readiness remains. **A rejection re-checks nothing beyond scope, the pointer, and the execution version**: a human must always be able to say no, including to a proposal that has gone stale ([ADR-023](../adr/ADR-023-approval-binding-and-immutability.md) § 5).
+
+`POST .../actions/{action_id}/invalidation` body `{expected_execution_version, proposal_hash}` is the other path that sets the pointer to `INVALIDATED`. It covers the two cases the approvals route cannot: **withdrawing** an approval whose execution is still `APPROVED`, which races the sender's claim on one row and is resolved by the compare-and-swap; and **clearing** an execution that is already terminal `FAILED`, which is what makes the failure matrix's "create and approve a fresh proposal" remedy reachable after a definite send failure. It refuses `SENDING`, `SENT`, and `SEND_UNKNOWN` with 409.
+
+`POST .../actions/{action_id}/executions` body `{execution_id,expected_execution_version,approval_id}` returns 202. It never accepts recipient, subject, body, claim, attachment, template, or retry flag. Poll operation/case for `SENT|FAILED|SEND_UNKNOWN`. **There is no retry route**, and its absence is a design element: `FAILED` is terminal for an action and `SEND_UNKNOWN` is a quarantine that only reconciliation resolves. Send status is read through the existing case surface's `current_action.execution` and the existing operation poll; no second address for one row is introduced.
 
 ### External reply and verification
 

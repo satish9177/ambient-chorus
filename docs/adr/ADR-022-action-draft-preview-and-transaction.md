@@ -51,12 +51,14 @@ Nothing said what happens to a live `DRAFT` execution when a second proposal is 
 | `execution_id`, `action_id`, `case_id`, `proposal_hash`, `view_hash`, `state`, `attempt_number`, `version`, timestamps | required | required | required | required | required | required |
 | `approval_id` | **null** | required | required | required | may be null | required |
 | `idempotency_key` | **null** | required | required | required | may be null | required |
+| `claim_owner_hash` | **null** | **null** | required | required | may be null | required |
 | `ses_request_token_hash` | **null** | **null** | required | required | may be null | required |
 | `rendered_message_hash` | **null** | **null** | required | required | may be null | required |
 | `started_at` | null | null | required | required | may be null | required |
 | `ses_message_id` | null | null | null | required | null | null until reconciled to `SENT` |
 | `finished_at` | null | null | null | required | required | required |
 | `failure_code` | null | null | null | null | required | null |
+| `failure_detail_safe` | null | null | null | null | may be null | **null** |
 | `reconciled_at` | null | null | null | set only by reconciliation | null | set when reconciled |
 
 **Presence is monotonic.** A field that has been set is never unset and never rewritten. The entity refuses a transition that would clear one.
@@ -64,6 +66,12 @@ Nothing said what happens to a live `DRAFT` execution when a second proposal is 
 The three "may be null" columns under `FAILED` are the honest ones and the reason the table is not a simple ladder. `DRAFT → FAILED` (the proposal was invalidated or expired) reaches a terminal state having never had an approval, and `APPROVED → FAILED` with `STALE_AUTHORIZATION` reaches it having never rendered anything or contacted SES. Requiring a rendered hash on a failure that happened before rendering would have forced a fabricated digest onto the record of a message that was never built.
 
 `idempotency_key` becomes available exactly when `approval_id` does, because the frozen formula depends on it. Its formula is unchanged.
+
+`claim_owner_hash` is added by the Phase-8 repair pass and is the one value on this row that is **not** a pure function of durable state. Every other derivation the send path makes --- `idempotency_key`, `ses_request_token_hash`, the three send idempotency keys --- is recomputable from `{namespace, action_id, execution_id, …}`, so two workers racing one execution compute all of them identically. That is exactly why none of them can answer *which attempt* owns a claim, and a commit proof keyed on the execution therefore reads back as "committed" for a worker whose own transaction was lost. The owner is minted per attempt, written in the same conditional write that moves `APPROVED → SENDING`, and compared against a strongly consistent read before any SES call ([ADR-025](ADR-025-one-deliberate-ses-attempt.md) § 1).
+
+`failure_detail_safe` is `OPTIONAL` at `FAILED` and **`ABSENT` at `SEND_UNKNOWN`**. The first freeze made it optional at both, which cannot hold: presence is monotonic and `SEND_UNKNOWN → SENT` is a legal edge whose target has the field absent, so a quarantined row that exercised the option could never be reconciled. An option only one value is reachable from is not an option. The unknown reason is carried by the `action.send.unknown` audit event instead.
+
+`action-execution/v2` becomes **`action-execution/v3`** for the added field. No data has been deployed at any version, so this is a code change with re-cut fixtures, and the codec accepts neither earlier version.
 
 ### 2. The preview hash belongs to the proposal; the rendered hash belongs to the execution
 

@@ -9,8 +9,8 @@ from uuid import uuid4
 
 import pytest
 from tests.fixtures.persistence import (
-    NOW,
     OTHER_CASE,
+    OTHER_NAMESPACE,
     PRIMARY,
     build_repositories,
     digest,
@@ -35,6 +35,11 @@ from chorus.ports.pagination import PageRequest
 from chorus.ports.records import ActionPointerExpectation, ViewPointerExpectation
 from chorus.ports.storage import CheckItem, PutItem, StorageDriver
 from chorus.ports.unit_of_work import TransactionPlan
+from chorus.privacy.canonical import (
+    APPROVAL_HASH_OMITTED_FIELDS,
+    hash_approval,
+    verify_hash,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -269,36 +274,48 @@ async def test_a_proposal_approval_and_execution_round_trip(storage: StorageDriv
     assert await repositories.shareable.load_execution(scope, execution.execution_id) == execution
 
 
-async def test_an_approval_is_consumed_exactly_once(storage: StorageDriver) -> None:
-    repositories = build_repositories(storage)
-    scope = PRIMARY.action_scope
-    approved = PRIMARY.approval(version=1)
-    await storage.write_item(repositories.shareable.stage_append_approval(scope, approved))
-    consumed = PRIMARY.approval(version=2, consumed=True)
-
-    await storage.write_item(
-        repositories.shareable.stage_consume_approval(scope, consumed, expected=approved)
-    )
-    with pytest.raises(PersistenceConflictError):
-        await storage.write_item(
-            repositories.shareable.stage_consume_approval(scope, consumed, expected=approved)
-        )
-
-    stored = await repositories.shareable.load_approval(scope, consumed.approval_id)
-    assert stored.consumed_at is not None
-
-
-async def test_consuming_an_approval_requires_a_consumption_timestamp(
+async def test_an_approval_is_create_only_and_never_written_twice(
     storage: StorageDriver,
 ) -> None:
-    repositories = build_repositories(storage)
+    """The approval row is written once. There is no second legal write of any kind.
 
-    with pytest.raises(ValueError, match="consumed_at"):
-        repositories.shareable.stage_consume_approval(
-            PRIMARY.action_scope,
-            PRIMARY.approval(version=2),
-            expected=PRIMARY.approval(version=1),
-        )
+    ``consumed_at`` is gone (ADR-023 SS 1): the execution reaching ``SENDING`` *is* the
+    consumption, it is one-time by compare-and-swap on the execution's row version, and it is
+    already durable in the state the sender must write anyway. Recording it here a second time
+    put a mutable field inside an authorization digest and required its writer to hold a write
+    grant on the immutable proposal's own partition.
+    """
+
+    repositories = build_repositories(storage)
+    scope = PRIMARY.action_scope
+    approval = PRIMARY.approval()
+
+    await storage.write_item(repositories.shareable.stage_append_approval(scope, approval))
+    with pytest.raises(PersistenceConflictError):
+        await storage.write_item(repositories.shareable.stage_append_approval(scope, approval))
+
+    assert await repositories.shareable.load_approval(scope, approval.approval_id) == approval
+
+
+async def test_approval_hash_survives_every_legal_later_write(storage: StorageDriver) -> None:
+    """There are none, and that is the assertion (T32).
+
+    An integrity check that a legitimate write invalidates cannot prove anything, and it gets
+    deleted by the second person who meets it. So the digest is recomputed here from the row as
+    stored, through the production authority, and the reason it still matches is that the only
+    write this row ever accepts is the one that created it.
+    """
+
+    repositories = build_repositories(storage)
+    scope = PRIMARY.action_scope
+    approval = PRIMARY.approval()
+    await storage.write_item(repositories.shareable.stage_append_approval(scope, approval))
+
+    stored = await repositories.shareable.load_approval(scope, approval.approval_id)
+    assert hash_approval(stored) == stored.approval_hash
+    assert verify_hash(stored, stored.approval_hash, omit_fields=APPROVAL_HASH_OMITTED_FIELDS)
+    assert not hasattr(stored, "consumed_at")
+    assert not hasattr(repositories.shareable, "stage_consume_approval")
 
 
 async def test_an_execution_advances_under_optimistic_concurrency(
@@ -357,96 +374,81 @@ async def test_commitments_page_within_their_case(storage: StorageDriver) -> Non
     assert {item.commitment_id for item in page.items} == set(ids)
 
 
-IMMUTABLE_APPROVAL_MUTATIONS: tuple[tuple[str, Callable[[Approval], Approval]], ...] = (
+APPROVAL_DECISION_FIELDS: tuple[tuple[str, Callable[[Approval], Approval]], ...] = (
     ("proposal_hash", lambda a: replace(a, proposal_hash=digest("another-proposal"))),
     ("view_hash", lambda a: replace(a, view_hash=digest("another-view"))),
     ("decision", lambda a: replace(a, decision=ApprovalDecision.REJECTED)),
-    ("approver_id", lambda a: replace(a, approver_id=OTHER_CASE.contributor_id)),
-    ("expires_at", lambda a: replace(a, expires_at=NOW + timedelta(days=30))),
-    ("approval_hash", lambda a: replace(a, approval_hash=digest("another-approval"))),
-    ("idempotency_key", lambda a: replace(a, idempotency_key="approve-something-else")),
+    ("approver_id_hash", lambda a: replace(a, approver_id_hash=digest("another-approver"))),
+    ("expires_at", lambda a: replace(a, expires_at=a.expires_at + timedelta(minutes=1))),
+    ("request_key_hash", lambda a: replace(a, request_key_hash=digest("another-key"))),
     ("approved_at", lambda a: replace(a, approved_at=a.approved_at - timedelta(hours=1))),
     ("approval_id", lambda a: replace(a, approval_id=ApprovalId(PRIMARY.uuid("approval:other")))),
     ("case_id", lambda a: replace(a, case_id=OTHER_CASE.case_id)),
-    ("created_at", lambda a: replace(a, created_at=a.created_at - timedelta(seconds=1))),
-    ("schema_version", lambda a: replace(a, schema_version="approval/v2")),
+    ("action_id", lambda a: replace(a, action_id=OTHER_CASE.action_id)),
+    ("execution_id", lambda a: replace(a, execution_id=OTHER_CASE.execution_id)),
+    ("authorization_version", lambda a: replace(a, authorization_version=99)),
+    ("namespace", lambda a: replace(a, namespace=OTHER_NAMESPACE)),
+    ("schema_version", lambda a: replace(a, schema_version="approval/v3")),
 )
+"""Every field that is part of the *decision*, and therefore inside the digest."""
+
+APPROVAL_BOOKKEEPING_FIELDS: tuple[tuple[str, Callable[[Approval], Approval]], ...] = (
+    ("version", lambda a: replace(a, version=a.version + 1)),
+    ("created_at", lambda a: replace(a, created_at=a.created_at - timedelta(seconds=1))),
+    ("updated_at", lambda a: replace(a, updated_at=a.updated_at + timedelta(seconds=1))),
+)
+"""The three fields the omit set covers, beside ``approval_hash`` itself.
+
+They describe the *row* -- which revision it is and when it was touched -- rather than the
+decision. Nothing ever moves them, because the row is written once; the omit set states what
+the digest is about rather than licensing a write.
+"""
 
 
 @pytest.mark.parametrize(
     ("field_name", "mutate"),
-    IMMUTABLE_APPROVAL_MUTATIONS,
-    ids=[name for name, _ in IMMUTABLE_APPROVAL_MUTATIONS],
+    APPROVAL_DECISION_FIELDS,
+    ids=[name for name, _ in APPROVAL_DECISION_FIELDS],
 )
-async def test_consuming_an_approval_cannot_rewrite_the_decision(
-    storage: StorageDriver, field_name: str, mutate: Callable[[Approval], Approval]
+def test_every_decision_field_is_inside_the_approval_digest(
+    field_name: str, mutate: Callable[[Approval], Approval]
 ) -> None:
-    """An approval is one immutable human decision; consumption records a timestamp only.
+    """Changing any part of the decision changes the digest.
 
-    A whole-item put could otherwise carry a different proposal, view, approver, or expiry
-    alongside ``consumed_at``, and the version condition alone would happily accept it.
+    Parameterized over the whole field list rather than spot-checked, so a field added to the
+    entity without being covered fails here rather than silently escaping the binding.
     """
 
-    repositories = build_repositories(storage)
-    scope = PRIMARY.action_scope
-    approved = PRIMARY.approval(version=1)
-    await storage.write_item(repositories.shareable.stage_append_approval(scope, approved))
-    tampered = mutate(PRIMARY.approval(version=2, consumed=True))
-
-    with pytest.raises(ValueError, match="rewrite the decision"):
-        repositories.shareable.stage_consume_approval(scope, tampered, expected=approved)
-
-    stored = await repositories.shareable.load_approval(scope, approved.approval_id)
-    assert stored == approved
+    approval = PRIMARY.approval()
+    assert hash_approval(mutate(approval)) != approval.approval_hash
 
 
-async def test_consuming_an_approval_twice_is_refused_before_persistence(
-    storage: StorageDriver,
+@pytest.mark.parametrize(
+    ("field_name", "mutate"),
+    APPROVAL_BOOKKEEPING_FIELDS,
+    ids=[name for name, _ in APPROVAL_BOOKKEEPING_FIELDS],
+)
+def test_row_bookkeeping_is_outside_the_approval_digest(
+    field_name: str, mutate: Callable[[Approval], Approval]
 ) -> None:
-    """One-time consumption is a local invariant, not only a race the condition loses."""
+    """The omit set is exactly ``{approval_hash, version, created_at, updated_at}``.
 
-    repositories = build_repositories(storage)
-    consumed = PRIMARY.approval(version=2, consumed=True)
+    This is what makes recomputation meaningful at any later instant: the digest covers only
+    fields that never move, so a check performed at send time is checking the decision rather
+    than the storage layer's opinion of the row.
+    """
 
-    with pytest.raises(ValueError, match="consumed exactly once"):
-        repositories.shareable.stage_consume_approval(
-            PRIMARY.action_scope, PRIMARY.approval(version=3, consumed=True), expected=consumed
-        )
-
-
-async def test_consuming_an_approval_must_increment_the_version_by_one(
-    storage: StorageDriver,
-) -> None:
-    repositories = build_repositories(storage)
-
-    with pytest.raises(ValueError, match="increment the version"):
-        repositories.shareable.stage_consume_approval(
-            PRIMARY.action_scope,
-            PRIMARY.approval(version=5, consumed=True),
-            expected=PRIMARY.approval(version=1),
-        )
+    approval = PRIMARY.approval()
+    assert hash_approval(mutate(approval)) == approval.approval_hash
 
 
-async def test_consumption_is_bound_to_the_stored_approval_hash(
-    storage: StorageDriver,
-) -> None:
-    """The condition names the hash as well as the version, so a swapped row cannot be consumed."""
+def test_the_approval_omit_set_is_exactly_the_four_bookkeeping_fields() -> None:
+    """Asserted against the constant the production hasher actually uses."""
 
-    repositories = build_repositories(storage)
-    scope = PRIMARY.action_scope
-    approved = PRIMARY.approval(version=1)
-    await storage.write_item(
-        repositories.shareable.stage_append_approval(
-            scope, replace(approved, approval_hash=digest("a-different-decision"))
-        )
+    assert (
+        frozenset({"approval_hash", "version", "created_at", "updated_at"})
+        == APPROVAL_HASH_OMITTED_FIELDS
     )
-
-    with pytest.raises(PersistenceConflictError):
-        await storage.write_item(
-            repositories.shareable.stage_consume_approval(
-                scope, PRIMARY.approval(version=2, consumed=True), expected=approved
-            )
-        )
 
 
 # ---------------------------------------------------------------------------------------
