@@ -29,6 +29,7 @@ from chorus.domain.state import (
     ACTION_EXECUTION_EDGES,
     CASE_EDGES,
     COMMITMENT_EDGES,
+    HUMAN_ONLY_COMMITMENT_STATUSES,
     MANDATE_MUTABLE_CASE_STATES,
     CaseTransitionContext,
     bump_case_authorization,
@@ -220,7 +221,10 @@ def test_commitment_legal_edges_are_guarded(
         target,
         expected_version=1,
         now=NOW,
-        actor_is_human=target is CommitmentStatus.CANCELLED,
+        # ``FULFILLED`` and ``MISSED`` joined ``CANCELLED`` on the human-only list (ADR-027 § 5).
+        # The documents always said both outcomes were the affected contributor's; the guard only
+        # ever enforced the third, which left ``DUE -> FULFILLED`` reachable by a system actor.
+        actor_is_human=target in HUMAN_ONLY_COMMITMENT_STATUSES,
     )
 
     assert updated.status is target

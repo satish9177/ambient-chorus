@@ -93,6 +93,23 @@ def _pseudonym(pseudonyms: dict[ContributorId, str], contributor_id: Contributor
     return pseudonym
 
 
+def _resident_owner(item: EvidenceItem) -> ContributorId:
+    """The resident who submitted this evidence, or refuse the whole projection.
+
+    An authenticated **inbound** artifact carries an external source binding and no owner
+    (ADR-026 § 5), and the Investigator contract requires a pseudonym. There is no contributor
+    to pseudonymize, so there is no honest value to put there -- and the fail-closed answer is
+    also the right one on the merits: the Investigator runs on ``INVESTIGATING`` cases and an
+    inbound artifact only ever lands on an ``ACTIONED`` or ``VERIFYING`` one, so a stranger's
+    email has no business in a payload assembled for neighbours.
+    """
+
+    owner = item.submitted_by_contributor_id
+    if owner is None:
+        raise InvestigationProjectionError("cited evidence has no resident owner")
+    return owner
+
+
 def _issue_type(case: CommunityCase) -> IssueType:
     try:
         return IssueType(case.issue_type.strip().upper())
@@ -157,6 +174,7 @@ def project_investigation_input(
             # answering about the fact anyway would be answering about a case nobody has seen
             # whole.
             raise InvestigationProjectionError("cited evidence is unavailable")
+        _resident_owner(item)
         projected_items.append(item)
     if len(projected_items) > MAX_INVESTIGATION_EVIDENCE:
         raise InvestigationProjectionError("case evidence exceeds the frozen investigation bound")
@@ -197,7 +215,7 @@ def project_investigation_input(
             InvestigationEvidence(
                 evidence_id=item.evidence_id.value,
                 root_id=item.root_id.value,
-                submitted_by_pseudonym_id=_pseudonym(pseudonyms, item.submitted_by_contributor_id),
+                submitted_by_pseudonym_id=_pseudonym(pseudonyms, _resident_owner(item)),
                 media_type=item.media_type,
                 sha256=item.sha256.value,
                 derived_from_evidence_id=(

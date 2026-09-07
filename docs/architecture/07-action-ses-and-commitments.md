@@ -232,16 +232,19 @@ Reconciliation is **one application command, `ReconcileSendOutcome`, with two na
 
 ## External reply and commitment creation
 
-A manager email is ingested as private `EvidenceItem` and `ExternalReplyReceived`; no email text enters the shareable table. The Investigator receives the bounded reply text as untrusted evidence and may return a cited `proposed_commitment`. Deterministic validation requires:
+A manager email becomes a private `EvidenceItem` and an `ExternalReplyReceived` event; no email text enters the shareable table. **A reply is not a reply until an authenticated transport delivered it and it correlated to exactly one `SENT` execution** — the trust boundary, the `In-Reply-To` correlation against the immutable outbound message locator, the SES receipt-verdict gate, the sender and recipient digest comparisons, the body extraction rules, and the immutable external-source binding are all normative in [ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md). Nothing below is reached by an unauthenticated or uncorrelated delivery.
 
-- source evidence belongs to the same case and is an approved destination reply;
-- obligor matches the destination's safe organization label;
-- due time is explicitly supported by the cited reply, in UTC after timezone conversion, between 1 hour and 30 days after receipt;
-- action text is 1–500 characters and contains no private resident data, instruction/control text, URL, or unsupported date/number;
-- verification method is V1 fixed `AFFECTED_CONTRIBUTOR_CONFIRMATION`;
-- at most one active commitment per action/due term; duplicate evidence/root returns existing commitment.
+The `EXTRACT_COMMITMENT` operation then receives that one artifact's bounded normalized text as untrusted evidence and may return proposed commitments that cite **character spans** into it. Deterministic validation, normative in [ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 3, requires:
 
-The application, not the agent, assigns the commitment ID, stores safe terms, and moves `ACTIONED→VERIFYING`. A malicious reply can at most fail validation; it cannot change policy, close a case, trigger SES, or choose an arbitrary target.
+- every cited span lies inside the stored text and is at most 200 characters;
+- `obligor` equals the safe organization label of the destination the correlated execution sent to — asserted by the correlation, never extracted;
+- `action_text` passes the [ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) structural scanner and is lexically grounded against the reply: every risk token by match equality, every proper-name candidate by normalized substring;
+- the cited due-date span is exactly one `YYYY-MM-DD`; every other date construct is rejected outright, so there is no timezone to convert and no relative expression to resolve. `due_at` is that date at `T23:59:59.999999Z`, between 1 hour and 30 days after receipt;
+- the sentence containing the action span carries none of the frozen conditional or refusal tokens, so "we'll look into it" is not a commitment;
+- verification method is the V1 constant `AFFECTED_CONTRIBUTOR_CONFIRMATION`, for which the model has no field;
+- at most one `PENDING` or `DUE` commitment per action; a duplicate returns the existing commitment.
+
+The application, not the agent, derives the commitment ID, stores safe terms, and moves `ACTIONED→VERIFYING` in the same transaction that creates the commitment. The model's own `due_at` is measured and never read. A malicious reply can at most fail validation; it cannot change policy, close a case, trigger SES, or choose an arbitrary target.
 
 ## Scheduler flow
 
@@ -282,19 +285,19 @@ Schedule name is `chorus-{env}-{namespace_hash8}-{commitment_id}-{generation}`. 
 }
 ```
 
-The watcher strongly loads the commitment, verifies namespace/case/generation/due time, records the event ID, and conditionally changes `PENDING→DUE`. Duplicate or late delivery after `DUE/FULFILLED/MISSED/CANCELLED` returns success with an audit replay marker. A scheduler failure leaves the commitment visibly `PENDING_SCHEDULE` (an operational projection) and retries creation by same name/token; it does not pretend verification is scheduled. DLQ depth and dropped invocations alarm.
+The watcher strongly loads the commitment, verifies namespace/case/generation/due time, records the event ID, and conditionally changes `PENDING→DUE`. Duplicate or late delivery after `DUE/FULFILLED/MISSED/CANCELLED` returns success with an audit replay marker. A scheduler failure leaves the commitment `PENDING` with its schedule projection visibly `PENDING_SCHEDULE` — an operational value on the `COMMITMENT_SCHEDULE#c` item, **not** a `CommitmentStatus` — and retries creation by the same name and client token; it does not pretend verification is scheduled ([ADR-028](../adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) § 4). DLQ depth and dropped invocations alarm.
 
 ## Demo clock without scheduler theater
 
 Reset seeds fixed logical timestamps. In `demo`, the scheduler adapter maps logical delay to a real future wall time (`actual_now + max(10 minutes, logical_due-logical_now)`) and records both values. Thus a real EventBridge schedule is created, but demo success does not depend on a precise firing window.
 
-The presenter advances the demo clock through an access-controlled `/v1/demo/clock/advance` command. That command invokes the same watcher Lambda with the same signed `CommitmentDueEvent` and a `trigger=DEMO_CLOCK` audit field; it does not mutate commitment outcome directly. The real later schedule invocation is a harmless replay. Fulfilled/missed still requires the contributor verification endpoint. This preserves a live watcher path and deterministic timing.
+The presenter advances the demo clock through an access-controlled `/v1/demo/clock/advance` command. That command invokes the same watcher Lambda with the same `CommitmentDueEvent` and a `trigger=DEMO_CLOCK` audit field; it does not mutate commitment outcome directly. **The event is not signed and is not trusted**: it names which commitment to load, and every field is re-verified against the strongly-loaded row before anything moves ([ADR-028](../adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) § 2). The real later schedule invocation is a harmless replay. Fulfilled/missed still requires the contributor verification endpoint. This preserves a live watcher path and deterministic timing.
 
 ## Resolution semantics
 
 - `SENT` moves the case to `ACTIONED`, never `RESOLVED`.
 - Creating a commitment or explicit verification request moves it to `VERIFYING`.
 - Due time requests verification; time passage alone does not prove failure.
-- An affected contributor's `FULFILLED` decision resolves the case.
-- A `MISSED` decision moves the commitment to `MISSED` and case to `READY_FOR_ACTION`; a subsequent action needs a fresh view/proposal/approval.
+- An affected contributor's `FULFILLED` decision resolves the case, and it is the **only** source that may. Not the model, not a later reply, not new ambient evidence, not the deadline ([ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 8).
+- An affected contributor's `MISSED` decision moves the commitment to `MISSED` and the case to `READY_FOR_ACTION`, and invalidates the current action pointer in the same transaction; a subsequent action needs a fresh view, proposal, and approval.
 - No manager message, agent output, scheduler event, or absence of reports can mark `RESOLVED`.

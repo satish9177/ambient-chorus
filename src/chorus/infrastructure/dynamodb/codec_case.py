@@ -7,12 +7,15 @@ from typing import Final
 from chorus.domain.entities import (
     ASSESSMENT_SCHEMA_VERSION_V1,
     ASSESSMENT_SCHEMA_VERSION_V2,
+    EVIDENCE_ITEM_SCHEMA_VERSION_V1,
+    EVIDENCE_ITEM_SCHEMA_VERSION_V2,
     AssessmentAlternative,
     AssessmentContradiction,
     ContradictionMateriality,
     EvidenceFinding,
     EvidenceItem,
     EvidenceStatus,
+    ExternalSourceBinding,
     ExtractionStatus,
     FactType,
     InvestigationAssessment,
@@ -42,10 +45,12 @@ from chorus.domain.facts import (
     UnitLocation,
 )
 from chorus.domain.ids import (
+    ActionId,
     AssessmentId,
     ContributorId,
     EvidenceItemId,
     EvidenceRootId,
+    ExecutionId,
     FactId,
     MessageId,
     ReportId,
@@ -74,7 +79,17 @@ _CORE: Final = TableName.CORE
 
 REPORT_SCHEMA_VERSIONS: Final = frozenset({"report/v1"})
 FACT_SCHEMA_VERSIONS: Final = frozenset({"fact/v1"})
-EVIDENCE_ITEM_SCHEMA_VERSIONS: Final = frozenset({"evidence-item/v1"})
+EVIDENCE_ITEM_SCHEMA_VERSIONS: Final = frozenset(
+    {EVIDENCE_ITEM_SCHEMA_VERSION_V1, EVIDENCE_ITEM_SCHEMA_VERSION_V2}
+)
+"""Readers accept v1 and v2; writers emit v2 (ADR-026 § 5).
+
+A ``/v1`` row carries a required resident owner and no external binding, which is exactly one
+of the two combinations ``/v2`` admits -- so no stored row is rewritten and no value is
+invented. The decoder branches on the stored version rather than probing for an attribute,
+because ``ItemReader`` refuses both a missing required attribute and an unread present one, and
+"which shape is this" is a question the envelope already answers.
+"""
 ASSESSMENT_SCHEMA_VERSIONS: Final = frozenset(
     {ASSESSMENT_SCHEMA_VERSION_V1, ASSESSMENT_SCHEMA_VERSION_V2}
 )
@@ -376,6 +391,71 @@ def decode_fact(item: StoredItem) -> tuple[DecodedScope, Fact]:
     return scope, fact
 
 
+def _encode_external_source_binding(binding: ExternalSourceBinding | None) -> StoredValue:
+    """Serialize the immutable inbound binding, or ``None`` for a resident upload.
+
+    It is a nested map rather than a flattened set of prefixed attributes, because the binding
+    is created once and never partially updated: a shape that could be half-written is a shape
+    somebody eventually half-writes.
+    """
+
+    if binding is None:
+        return None
+    return {
+        "schema_version": binding.schema_version,
+        "destination_id": binding.destination_id,
+        "registry_version": binding.registry_version,
+        "routing_token": str(binding.routing_token),
+        "correlated_action_id": identifier(binding.correlated_action_id),
+        "correlated_execution_id": identifier(binding.correlated_execution_id),
+        "inbound_message_id_hash": binding.inbound_message_id_hash.value,
+        "sender_address_digest": binding.sender_address_digest.value,
+        "recipient_address_digest": binding.recipient_address_digest.value,
+        "transport": binding.transport,
+        "transport_source_arn": binding.transport_source_arn,
+        "spf": binding.spf,
+        "dkim": binding.dkim,
+        "dmarc": binding.dmarc,
+        "spam": binding.spam,
+        "virus": binding.virus,
+        "received_at": instant(binding.received_at),
+        "correlation_proof": binding.correlation_proof,
+    }
+
+
+def _decode_external_source_binding(reader: ItemReader) -> ExternalSourceBinding | None:
+    """Read the binding an ``evidence-item/v2`` row carries, or ``None`` when it has none."""
+
+    raw = reader.optional_mapping("external_source_binding")
+    if raw is None:
+        return None
+    child = reader.child(raw, "binding")
+    binding = build_entity(
+        child.entity_ref,
+        ExternalSourceBinding,
+        schema_version=child.text("schema_version"),
+        destination_id=child.text("destination_id"),
+        registry_version=child.number("registry_version"),
+        routing_token=child.uuid("routing_token"),
+        correlated_action_id=child.identifier("correlated_action_id", ActionId),
+        correlated_execution_id=child.identifier("correlated_execution_id", ExecutionId),
+        inbound_message_id_hash=child.digest("inbound_message_id_hash"),
+        sender_address_digest=child.digest("sender_address_digest"),
+        recipient_address_digest=child.digest("recipient_address_digest"),
+        transport=child.text("transport"),
+        transport_source_arn=child.text("transport_source_arn"),
+        spf=child.text("spf"),
+        dkim=child.text("dkim"),
+        dmarc=child.text("dmarc"),
+        spam=child.text("spam"),
+        virus=child.text("virus"),
+        received_at=child.instant("received_at"),
+        correlation_proof=child.text("correlation_proof"),
+    )
+    child.finish()
+    return binding
+
+
 def evidence_item_key(scope: CaseScope, evidence_id: EvidenceItemId) -> ItemKey:
     return ItemKey(
         table=_CORE,
@@ -398,7 +478,12 @@ def encode_evidence_item(scope: CaseScope, evidence: EvidenceItem) -> StoredItem
         {
             "evidence_id": identifier(evidence.evidence_id),
             "root_id": identifier(evidence.root_id),
-            "submitted_by_contributor_id": identifier(evidence.submitted_by_contributor_id),
+            "submitted_by_contributor_id": optional_identifier(
+                evidence.submitted_by_contributor_id
+            ),
+            "external_source_binding": _encode_external_source_binding(
+                evidence.external_source_binding
+            ),
             "source_message_id": optional_identifier(evidence.source_message_id),
             "private_object_key": sensitive(evidence.private_object_key),
             "media_type": evidence.media_type,
@@ -435,7 +520,14 @@ def decode_evidence_item(item: StoredItem) -> tuple[DecodedScope, EvidenceItem]:
         community_id=scope.community_id,
         case_id=scope.case_id,
         namespace=scope.namespace,
-        submitted_by_contributor_id=reader.identifier("submitted_by_contributor_id", ContributorId),
+        submitted_by_contributor_id=reader.optional_identifier(
+            "submitted_by_contributor_id", ContributorId
+        ),
+        external_source_binding=(
+            None
+            if schema_version == EVIDENCE_ITEM_SCHEMA_VERSION_V1
+            else _decode_external_source_binding(reader)
+        ),
         source_message_id=reader.optional_identifier("source_message_id", MessageId),
         private_object_key=reader.sensitive("private_object_key"),
         media_type=reader.text("media_type"),

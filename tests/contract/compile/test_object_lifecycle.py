@@ -351,6 +351,30 @@ async def test_a_precondition_conflict_whose_object_then_vanishes_fails_closed(
                 evidence_id=evidence_id,
             )
 
+        async def head_inbound_reply(
+            self,
+            *,
+            namespace: Namespace,
+            community_id: CommunityId,
+            case_id: CaseId,
+            raw_sha256: Sha256Digest,
+        ) -> ExportObjectDescriptor | None:
+            # The inbound reply half of the port, present so this stub still satisfies it. The
+            # compile path never touches it, and a stub that silently narrowed the protocol would
+            # be a stub that stops catching a widened one.
+            raise AssertionError("a compile never reads an inbound reply")
+
+        async def put_inbound_reply(
+            self,
+            *,
+            namespace: Namespace,
+            community_id: CommunityId,
+            case_id: CaseId,
+            raw_sha256: Sha256Digest,
+            content: bytes,
+        ) -> None:
+            raise AssertionError("a compile never writes an inbound reply")
+
         async def head_export_evidence(
             self,
             *,

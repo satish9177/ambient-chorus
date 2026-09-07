@@ -388,7 +388,14 @@ class SendHarness:
             evidence_trust=self.ses_trust()[1] if trusted else None,
         )
 
-    def project(self) -> ProjectActionOutcome:
+    def project(self, *, destination: StoredSafeDestination | None = None) -> ProjectActionOutcome:
+        """``destination`` overrides the registry entry recorded on the outbound locator.
+
+        Address-free, like the entry the approval binds. It is overridable for the same reason
+        the approval's is: the locator records the registry as it stood *at the send*, and a
+        test that moves it is testing exactly that.
+        """
+
         return ProjectActionOutcome(
             core=self.action.compile.core,
             shareable=self.action.compile.shareable,
@@ -397,6 +404,7 @@ class SendHarness:
             unit_of_work=self.action.unit_of_work,  # type: ignore[arg-type]
             clock=self.action.compile.clock,
             ids=Uuid4Generator(),
+            destination=destination or self.action.compile.stored_destination(),
         )
 
     def operations(self) -> ApplicationOperations:

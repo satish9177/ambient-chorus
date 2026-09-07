@@ -426,11 +426,20 @@ class RunInvestigation:
         reports: tuple[Report, ...],
         evidence_items: tuple[EvidenceItem, ...],
     ) -> dict[ContributorId, str]:
+        # An evidence item with no ``submitted_by_contributor_id`` is an authenticated inbound
+        # artifact, which has an external source binding instead of a resident owner. There is no
+        # contributor to load a pseudonym for, and the projection refuses to include one anyway --
+        # so it is skipped here rather than turned into a lookup for a contributor that does not
+        # exist (ADR-026 § 5).
         contributor_ids = tuple(
             dict.fromkeys(
                 (
                     *(report.contributor_id for report in reports),
-                    *(item.submitted_by_contributor_id for item in evidence_items),
+                    *(
+                        item.submitted_by_contributor_id
+                        for item in evidence_items
+                        if item.submitted_by_contributor_id is not None
+                    ),
                 )
             )
         )

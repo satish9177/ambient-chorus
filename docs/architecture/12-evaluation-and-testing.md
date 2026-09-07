@@ -33,7 +33,7 @@ Dataset `demo/evaluation/elevator-v1/` contains exact inputs and expected struct
 | 12 | aggregate below privacy threshold | 2 contributors cannot produce aggregate even when evidence corroboration is 2 |
 | 13 | prompt injection | instruction is treated as evidence data; Action input lacks requested secrets; no policy bypass |
 | 14 | cross-case reference | one foreign fact/evidence/citation denies the whole compile/proposal; nothing silently skipped |
-| 15 | missed commitment | due event is replay-safe; resident marks missed; case returns `READY_FOR_ACTION`, not resolved |
+| 15 | missed commitment | due event is replay-safe; **a resident** marks missed; case returns `READY_FOR_ACTION` with the action pointer invalidated, not resolved |
 
 Additional parameterized variants cover mandate expiry equality, identity false/true pairs, policy change after approval, duplicate send, SES ambiguity, and scheduler generation replay.
 
@@ -124,7 +124,9 @@ Static policy tests are necessary but insufficient. Post-deploy canaries assume/
 - compiler cannot invoke Bedrock/SES; it can write only the view prefixes, the audit table, and the `NS#*#FENCE#*` partition, and an attempt to put or delete any case-partition item must return `AccessDenied` ([ADR-019](../adr/ADR-019-send-fence-partition-isolation.md));
 - the application can condition on, and never write, the view prefixes: a `ConditionCheckItem` on `NS#*#VIEW_CURRENT#*` succeeds while a `PutItem`, `UpdateItem`, or `DeleteItem` on either view prefix must return `AccessDenied` ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 7);
 - sender cannot read Core or private S3 and can send only through the configured identity/configuration set; it can put an item in `NS#*#EXECUTION#*` while a put or delete against `NS#*#ACTION#*`, `NS#*#ACTION_CURRENT#*`, either view prefix, or `NS#*#CASE#*` must return `AccessDenied` ([ADR-024](../adr/ADR-024-execution-partition-and-sender-boundary.md)); and no statement anywhere in the synthesized template contains an address-shaped string;
-- watcher cannot call agents/compiler/SES or private resources.
+- watcher cannot call agents/compiler/SES or private resources: its synthesized role contains no `bedrock:*`, no `ses:*`, no `scheduler:*`, no Core-table action, and no S3 action, and a put against Core or against any Shareable partition outside `NS#*#CASE#*` must return `AccessDenied` ([ADR-028](../adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) § 6);
+- the application's scheduler statement contains `CreateSchedule` and `GetSchedule` and neither `DeleteSchedule` nor `UpdateSchedule`, and names the one `chorus-{env}` schedule group;
+- the inbound reply composition root constructs no SES port, no Bedrock client, no compiler client, and no scheduler client, and the AWS composition root passes `authenticator=None` to `inbound_mail_trust_boundary` ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md) § 1).
 
 An expected AccessDenied is success. A surprising allow fails deployment.
 
@@ -173,6 +175,37 @@ Playwright covers exactly three surfaces: discovery, Resident B adjust/revoke, p
 35. `test_action_proposal_does_not_stale_its_own_bound_view` — the apply moves `version` and carries `authorization_version` forward, so the view, the proposal, and a subsequent fence acquisition all still agree. This is the regression test for the defect [ADR-020](../adr/ADR-020-case-authorization-version.md) fixed; written before the fix, it must fail.
 36. `test_lifecycle_transition_never_bumps_authorization_version` — asserted over the whole edge set, so a future edge cannot quietly acquire an authorization bump.
 37. `test_authorization_sensitive_command_bumps_both_counters` — the mirror of 36, over every command in [ADR-020](../adr/ADR-020-case-authorization-version.md) § 2.
+38. `test_reply_without_authenticator_is_never_evidence` — with no `InboundMailTransportAuthenticator` wired, every delivery raises `TRANSPORT_UNAVAILABLE`; no evidence item, no root, no case write, no operation.
+39. `test_hand_built_attested_reply_is_refused_by_the_verifier` — a constructed `AttestedInboundReply` with a plausible attestation fails the MAC comparison, as does one replayed from another deployment's `source_arn`.
+40. `test_forged_in_reply_to_from_a_foreign_sender_is_refused` — a DMARC-passing message from a domain that is not the correlated destination is `REPLY_SENDER_NOT_DESTINATION`, whatever its `In-Reply-To` says.
+41. `test_reply_to_a_send_unknown_execution_does_not_correlate` — a `SEND_UNKNOWN` execution has no outbound message locator, so the reply is `REPLY_UNCORRELATED` and nothing is written.
+42. `test_reply_to_a_terminal_case_is_refused` — `RESOLVED` and `CLOSED_UNRESOLVED` answer `REPLY_CASE_TERMINAL`; a reply cannot reopen a case.
+43. `test_duplicate_delivery_stores_one_artifact_and_calls_the_model_once` — the same `messageId` twice replays the recorded outcome; one evidence item, one root, one audit event, **zero** additional model calls.
+44. `test_quoted_outbound_text_grounds_no_commitment` — a reply consisting only of our own quoted message yields no commitment, because every line of it is removed before extraction.
+45. `test_reply_ingestion_creates_no_report_and_no_fact` — asserted over the whole staged plan, so `corroboration_source_count` and every fact's `evidence_status` are untouched.
+46. `test_reply_ingestion_bumps_both_counters` — [ADR-020](../adr/ADR-020-case-authorization-version.md) § 2 row 13, and the case `state` is unchanged.
+47. `test_reply_ingestion_is_refused_while_a_send_fence_is_live`
+48. `test_oversized_or_attachment_bearing_reply_is_refused_whole` — over 256 KiB raw, over 8 KiB extracted, a non-text part, or truncated headers; no bytes retained, no metadata recorded.
+49. `test_uncited_commitment_is_rejected` — a span outside the stored text, or an `action_text` risk token or proper name the reply does not contain, is `COMMITMENT_UNGROUNDED`.
+50. `test_model_invented_deadline_is_never_read` — the model's `due_at` disagrees with the cited span; the derived value wins and the model's is not consulted.
+51. `test_relative_and_weekday_dates_yield_no_commitment` — "within 3 days", "Wednesday", "14 January 2030", `01/14/2030`.
+52. `test_conditional_reply_is_not_a_commitment` — "we'll look into it" and "we may repair elevator B by 2030-01-14" both fail; "we will repair elevator B by 2030-01-14" passes.
+53. `test_wrong_obligor_is_rejected` — `obligor` is compared to the correlated destination's safe label and never extracted from the reply.
+54. `test_one_bad_proposal_does_not_discard_a_valid_sibling`
+55. `test_duplicate_commitment_returns_the_existing_one` — one `PENDING`/`DUE` commitment per action; the derived `commitment_id` re-stages one identical create-only row.
+56. `test_extraction_success_with_lost_apply_commit_recovers_without_a_second_model_call` — the ambiguous commit resolves against the plan's own commit proof and the durable agent-invocation record.
+57. `test_watcher_fires_early_changes_nothing` and `test_watcher_stale_generation_changes_nothing`
+58. `test_watcher_after_fulfilment_is_a_replay_no_op`
+59. `test_duplicate_watcher_invocation_requests_verification_once` — the create-only verification-request item is the proof.
+60. `test_watcher_takes_no_case_edge` — asserted over the staged plan in both tables.
+61. `test_model_cannot_mark_a_commitment_verified` — the extraction contract has no field for it and `transition_commitment` refuses a non-human `FULFILLED`.
+62. `test_missed_and_fulfilled_require_a_human_actor` — the two guard corrections of [ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 5; written before the fix, they must fail.
+63. `test_non_affected_contributor_cannot_verify` — the actor must own an `ACTIVE` fact in the case, checked against loaded facts and never against the request body.
+64. `test_missed_invalidates_the_current_action_pointer` — and `test_verification_participant_count_is_five_on_both_branches`.
+65. `test_late_reply_after_resolution_changes_nothing`
+66. `test_concurrent_reply_and_verification_leave_one_consistent_outcome`
+67. `test_cross_case_artifact_or_proof_replay_is_refused` — an attested reply, a commit proof, or a due event from another case or namespace.
+68. `test_no_command_constructs_a_commitment_cancellation` and `test_no_command_constructs_actioned_to_ready_for_action`
 38. `test_send_fence_ignores_core_occ_version_and_checks_state_and_authorization_version`
 39. `test_current_view_pointer_move_during_invocation_persists_nothing` — the Phase-7 twin of 25: the pointer moves *while the model is answering*, so only the apply transaction's `VIEW_CURRENT` condition can refuse, and no second invocation follows.
 40. `test_draft_execution_round_trips_through_codec` — the `DRAFT` shape carries no approval, send key, rendered hash, or SES token, and presence is monotonic across every transition.

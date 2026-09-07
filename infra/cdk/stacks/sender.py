@@ -56,6 +56,7 @@ EXECUTION_KEY_PREFIX = "NS#*#EXECUTION#*"
 FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#ACTION#*",
     "NS#*#ACTION_CURRENT#*",
+    "NS#*#OUTBOUND_MESSAGE#*",
     "NS#*#VIEW#*",
     "NS#*#VIEW_CURRENT#*",
     "NS#*#CASE#*",
@@ -66,6 +67,11 @@ FORBIDDEN_WRITE_PREFIXES = (
 deny: a transaction naming *any* proposal- or approval-partition item alongside legitimate
 execution items is refused whole, rather than permitted because most of its keys were
 acceptable.
+
+``NS#*#OUTBOUND_MESSAGE#*`` joins the list in Phase 9. The correlation locator is a participant
+of the action case *projection*, which the application worker runs -- the sender's send-outcome
+transaction never writes one. A sender that could write a locator could point a reply at an
+execution it chose (ADR-026 § 3).
 """
 
 READ_ACTIONS = ("dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query")

@@ -39,7 +39,7 @@ The frontend shell may begin after Phase 3 contracts, but no surface is complete
 | 6→7 | compiler sole-writer IAM, zero sentinel leaks, current safe view/hash |
 | 7→8 | Action payload capture safe; citation validator/artifact canaries green |
 | 8→9 | SES call count 1; stale race prevented; unknown quarantined |
-| 9→10 | real schedule plus same watcher demo-clock path; only human resolves |
+| 9→10 | an attested fixture reply yields one commitment, one schedule request, one `PENDING→DUE` across duplicates and early firings, and one verification request; only a human resolves. The **live** schedule moves to Phase 11 with every other live AWS resource ([ADR-028](../adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) § 7) |
 | 10→11 | exactly three usable accessible surfaces and full local smoke |
 | 11→12 | reproducible deploy, service prerequisites, IAM canaries, observability |
 | 12→13 | all binary gates zero and quality thresholds passed |

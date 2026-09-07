@@ -907,5 +907,7 @@ async def test_send_transaction_participant_counts_are_three_three_and_four(
     plans = send_harness.action.unit_of_work
     assert len(plans.plan("send-action-claim").operations) == CLAIM_PARTICIPANTS == 3
     assert len(plans.plan("send-action-result").operations) == RESULT_PARTICIPANTS == 3
-    assert len(plans.plan("project-action-outcome").operations) == PROJECTION_PARTICIPANTS == 4
+    # Five since ADR-026 § 3 amended ADR-025 § 11: the projection also writes the immutable
+    # outbound message locator, which is the only channel from a send back to a reply.
+    assert len(plans.plan("project-action-outcome").operations) == PROJECTION_PARTICIPANTS == 5
     assert isinstance(ProjectActionOutcome, type)

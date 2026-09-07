@@ -138,6 +138,20 @@ class EventName:
     EXECUTION_UNKNOWN: Final = "execution.unknown"
     EXECUTION_RECONCILED: Final = "execution.reconciled"
 
+    REPLY_RECEIVED: Final = "reply.received"
+    REPLY_REJECTED: Final = "reply.rejected"
+
+    COMMITMENT_EXTRACTED: Final = "commitment.extracted"
+    COMMITMENT_CREATED: Final = "commitment.created"
+    COMMITMENT_REJECTED: Final = "commitment.rejected"
+    COMMITMENT_DUE: Final = "commitment.due"
+    COMMITMENT_REPLAYED: Final = "commitment.replayed"
+    COMMITMENT_FULFILLED: Final = "commitment.fulfilled"
+    COMMITMENT_MISSED: Final = "commitment.missed"
+
+    SCHEDULE_CREATED: Final = "schedule.created"
+    SCHEDULE_FAILED: Final = "schedule.failed"
+
 
 def _emit(
     event_name: str,
@@ -1488,4 +1502,288 @@ def execution_reconciled(
         entity_id=execution_id,
         outcome=outcome,
         reason_codes=reason_codes,
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# Phase 9: the inbound reply, the commitment, and the deadline watcher
+# ---------------------------------------------------------------------------------------
+
+
+def reply_received(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    evidence_id: UUID,
+    execution_id: UUID,
+    inbound_message_id_hash: Sha256Digest,
+) -> None:
+    """Record that one authenticated, correlated reply became a private artifact.
+
+    The frozen observability table admits the closed refusal code, the inbound message-ID
+    **hash**, and the correlated execution -- and **never** the sender, the recipient, the
+    subject, the body, or any part of the raw MIME. There is no parameter here through which
+    one of those could be passed even by mistake.
+    """
+
+    _emit(
+        EventName.REPLY_RECEIVED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="EVIDENCE_ITEM",
+        entity_id=evidence_id,
+        input_hash=inbound_message_id_hash,
+        output_hash=None,
+        outcome="RECEIVED",
+        causation_id=execution_id,
+    )
+
+
+def reply_rejected(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId | None,
+    case_id: CaseId | None,
+    correlation_id: UUID | None,
+    reason_codes: tuple[str, ...],
+    inbound_message_id_hash: Sha256Digest | None = None,
+    execution_id: UUID | None = None,
+) -> None:
+    """Record one closed refusal. ``WARNING``, because somebody may be probing the boundary.
+
+    ``case_id`` and ``execution_id`` are present only when correlation got that far; a delivery
+    refused at the transport has no case to name, and inventing one would attribute a stranger's
+    probe to a real case.
+    """
+
+    _emit(
+        EventName.REPLY_REJECTED,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="ACTION_EXECUTION" if execution_id is not None else None,
+        entity_id=execution_id,
+        input_hash=inbound_message_id_hash,
+        outcome="REJECTED",
+        reason_codes=reason_codes,
+        retryable=False,
+    )
+
+
+def commitment_extracted(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    invocation_id: UUID,
+    prompt_version: str,
+    proposed: int,
+) -> None:
+    """Record that the extraction answered, and how many proposals it made. Never their text."""
+
+    _emit(
+        EventName.COMMITMENT_EXTRACTED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        invocation_id=invocation_id,
+        prompt_version=prompt_version,
+        counts={"proposed": proposed},
+    )
+
+
+def commitment_created(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    commitment_id: UUID,
+    case_version: int,
+) -> None:
+    """Record one created commitment. No obligor label, no action text, no cited span."""
+
+    _emit(
+        EventName.COMMITMENT_CREATED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        entity_type="COMMITMENT",
+        entity_id=commitment_id,
+        outcome="PENDING",
+    )
+
+
+def commitment_rejected(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    reason_codes: tuple[str, ...],
+    proposed: int,
+) -> None:
+    """Record an extraction that produced no valid commitment, with its per-proposal codes."""
+
+    _emit(
+        EventName.COMMITMENT_REJECTED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        outcome="REJECTED",
+        reason_codes=reason_codes,
+        counts={"proposed": proposed},
+    )
+
+
+def schedule_created(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    commitment_id: UUID,
+    generation: int,
+) -> None:
+    """Record that the deterministic one-time schedule now exists under its derived name."""
+
+    _emit(
+        EventName.SCHEDULE_CREATED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="COMMITMENT",
+        entity_id=commitment_id,
+        outcome="CREATED",
+        counts={"generation": generation},
+    )
+
+
+def schedule_failed(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    commitment_id: UUID,
+    attempts: int,
+    reason_codes: tuple[str, ...],
+) -> None:
+    """Record that the alarm clock is not set. The promise is still ``PENDING``.
+
+    ``WARNING`` rather than ``ERROR``: nothing is wrong with the commitment, and the case shows
+    a visibly unscheduled banner. Retry uses the same name and the same client token.
+    """
+
+    _emit(
+        EventName.SCHEDULE_FAILED,
+        level=logging.WARNING,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="COMMITMENT",
+        entity_id=commitment_id,
+        outcome="PENDING_SCHEDULE",
+        reason_codes=reason_codes,
+        counts={"attempts": attempts},
+        retryable=True,
+    )
+
+
+def commitment_due(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    commitment_id: UUID,
+    generation: int,
+) -> None:
+    """Record the watcher's one edge, and the verification request it created with it."""
+
+    _emit(
+        EventName.COMMITMENT_DUE,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="COMMITMENT",
+        entity_id=commitment_id,
+        outcome="DUE",
+        counts={"generation": generation},
+    )
+
+
+def commitment_replayed(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId | None,
+    case_id: CaseId | None,
+    correlation_id: UUID | None,
+    commitment_id: UUID,
+    reason_codes: tuple[str, ...],
+    trigger: str,
+) -> None:
+    """Record a watcher invocation that changed nothing, and why.
+
+    ``INFO``, because every branch it covers is an ordinary outcome: an early firing, a stale
+    generation, an unknown commitment, and a duplicate delivery are all things a one-time
+    schedule and an at-least-once transport produce in normal operation. ``trigger`` separates
+    the real schedule from the demo clock.
+    """
+
+    _emit(
+        EventName.COMMITMENT_REPLAYED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        correlation_id=correlation_id,
+        entity_type="COMMITMENT",
+        entity_id=commitment_id,
+        outcome=trigger,
+        reason_codes=reason_codes,
+    )
+
+
+def commitment_verified(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    correlation_id: UUID | None,
+    commitment_id: UUID,
+    actor_id_hash: Sha256Digest,
+    fulfilled: bool,
+    case_version: int,
+) -> None:
+    """Record the one human decision that can satisfy or miss a promise.
+
+    The actor is a hash, and the note the contributor may have written is **not** a parameter:
+    it lives on the commitment row and has no business in a log line.
+    """
+
+    _emit(
+        EventName.COMMITMENT_FULFILLED if fulfilled else EventName.COMMITMENT_MISSED,
+        namespace=namespace,
+        community_id=community_id,
+        case_id=case_id,
+        case_version=case_version,
+        correlation_id=correlation_id,
+        actor_id_hash=actor_id_hash,
+        entity_type="COMMITMENT",
+        entity_id=commitment_id,
+        outcome="FULFILLED" if fulfilled else "MISSED",
     )

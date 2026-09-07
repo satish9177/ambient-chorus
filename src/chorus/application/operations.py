@@ -40,7 +40,14 @@ from chorus.domain.entities import (
     ApplicationOperationStatus,
 )
 from chorus.domain.errors import StateTransitionError
-from chorus.domain.ids import CaseId, IdGenerator, Namespace, OperationId, Sha256Digest
+from chorus.domain.ids import (
+    CaseId,
+    EvidenceItemId,
+    IdGenerator,
+    Namespace,
+    OperationId,
+    Sha256Digest,
+)
 from chorus.domain.time import Clock, epoch_seconds_ceiling, format_utc
 from chorus.ports.errors import (
     IdempotencyConflictError,
@@ -133,6 +140,7 @@ def monitor_locator_hash(locators: tuple[MessageFeedEntry, ...]) -> Sha256Digest
 INVESTIGATE_BINDING_SCHEMA = "investigate-binding/v1"
 PROPOSE_ACTION_BINDING_SCHEMA = "propose-action-binding/v1"
 PROPOSE_ACTION_HTTP_REQUEST_SCHEMA = "propose-action-http-request/v1"
+EXTRACT_COMMITMENT_BINDING_SCHEMA = "extract-commitment-binding/v1"
 
 
 def investigate_binding_hash(
@@ -219,6 +227,29 @@ def propose_action_request_hash(
             "expected_case_version": expected_case_version,
             "view_id": str(view_id),
             "view_hash": view_hash.value,
+        }
+    )
+
+
+def extract_commitment_binding_hash(
+    *, case_id: CaseId, evidence_id: EvidenceItemId, evidence_sha256: Sha256Digest
+) -> Sha256Digest:
+    """Digest the frozen identity of one extraction request (ADR-027 § 1).
+
+    ``{case_id, evidence_id, evidence_sha256}`` -- which case, which artifact, and the digest of
+    the bytes that artifact is. The content digest is in the binding and not merely the
+    identifier, because an extraction is authorized over *one exact reply*: a job that kept a
+    valid operation and named a different artifact under it would otherwise reach a worker with
+    nothing to disagree with, and the model would read somebody else's email under an
+    invocation identity that had already been recorded.
+    """
+
+    return hash_value(
+        {
+            "schema": EXTRACT_COMMITMENT_BINDING_SCHEMA,
+            "case_id": str(case_id),
+            "evidence_id": str(evidence_id),
+            "evidence_sha256": evidence_sha256.value,
         }
     )
 

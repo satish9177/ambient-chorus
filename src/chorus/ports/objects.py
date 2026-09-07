@@ -37,6 +37,18 @@ from chorus.domain.ids import CaseId, CommunityId, EvidenceItemId, Namespace, Sh
 PRIVATE_OBJECT_VERSION_SEGMENT = "v1"
 """The frozen private-object revision segment; ingestion writes ``.../v1/original``."""
 
+INBOUND_REPLY_MEDIA_TYPE = "message/rfc822"
+"""The one media type an inbound reply object is ever stored under."""
+
+MAX_INBOUND_REPLY_BYTES = 256 * 1024
+"""The frozen raw-MIME bound for one inbound reply, in bytes exactly (ADR-026 § 4).
+
+Deliberately far below :data:`MAX_EVIDENCE_SOURCE_BYTES`: a resident may upload a photograph,
+and a stranger's email is a text message this system refuses attachments in. The cap is
+checked before the bytes are parsed and before anything is written, and a reply that exceeds
+it is refused whole with ``REPLY_TOO_LARGE`` and its bytes are not retained.
+"""
+
 MAX_EVIDENCE_SOURCE_BYTES = 10_000_000
 """The frozen V1 source bound, in bytes exactly.
 
@@ -75,6 +87,42 @@ def private_evidence_key(
             _segment(str(evidence_id)),
             PRIVATE_OBJECT_VERSION_SEGMENT,
             "original",
+        )
+    )
+
+
+def inbound_reply_key(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    raw_sha256: Sha256Digest,
+) -> str:
+    """Build the frozen content-addressed key for one inbound reply's raw MIME.
+
+    Under a ``reply`` prefix of its own rather than beside resident uploads, so the two are
+    distinguishable by address and a bucket policy or a lifecycle rule can name one without
+    naming the other.
+
+    **Content-addressed**, like an export derivative and unlike a resident upload: the address
+    is the digest of the bytes, so writing the same delivery twice is the same write. That is
+    what makes the pre-transaction write safe to repeat after an ambiguous outcome, and it is
+    why an object written before its transaction commits confers no authority -- nothing
+    references it until an ``EvidenceItem`` does (ADR-018's precedent).
+    """
+
+    digest = raw_sha256.value.removeprefix("sha256:")
+    return "/".join(
+        (
+            "ns",
+            _segment(namespace.value),
+            "community",
+            _segment(str(community_id)),
+            "case",
+            _segment(str(case_id)),
+            "reply",
+            _segment(digest),
+            "content",
         )
     )
 
@@ -132,6 +180,38 @@ class ObjectStorePort(Protocol):
 
         The key is derived from these identifiers; there is no key parameter. A source larger
         than ``MAX_EVIDENCE_SOURCE_BYTES`` is refused before its bytes are returned.
+        """
+
+    async def head_inbound_reply(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        raw_sha256: Sha256Digest,
+    ) -> ExportObjectDescriptor | None:
+        """Describe the stored raw MIME at this content address, or ``None`` if absent."""
+
+    async def put_inbound_reply(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        raw_sha256: Sha256Digest,
+        content: bytes,
+    ) -> None:
+        """**Create** one raw inbound message at its content address, in the private bucket.
+
+        Create-if-absent, exactly as the export derivative is, and for the same reason: a
+        redelivery of one message writes the same bytes to the same address, so an ambiguous
+        PUT is repeatable rather than duplicable. An object already there raises
+        ``PersistenceConflictError`` and is never overwritten -- the caller heads the exact key
+        and decides whether what it found is the same object.
+
+        The media type is not a parameter. There is exactly one, ``message/rfc822``, and a
+        caller that could choose it could store a reply as something a later reader would try
+        to render.
         """
 
     async def head_export_evidence(

@@ -65,8 +65,8 @@ Lambda async delivery may repeat; the operation/input hash and underlying comman
 | `POST /cases/{case_id}/actions/{action_id}/approvals` | case approver | 200 approval/execution | exact proposal/view/preview hashes; pointer `DRAFT`; execution `DRAFT` at the expected version |
 | `POST /cases/{case_id}/actions/{action_id}/invalidation` | case approver | 200 pointer/execution/case | execution `DRAFT`, `APPROVED`, or terminal `FAILED`; refused for `SENDING`, `SENT`, `SEND_UNKNOWN` |
 | `POST /cases/{case_id}/actions/{action_id}/executions` | case approver | 202 send operation | matching unexpired approval; execution `APPROVED` at the expected version; safe replay by execution ID |
-| `POST /demo/external-replies` | presenter admin | 202 investigation operation | demo only; same case/action; message uniqueness |
-| `POST /cases/{case_id}/commitments/{commitment_id}/verification` | affected contributor | 200 commitment/case | commitment DUE; actor is affected contributor |
+| `POST /demo/external-replies` | presenter admin | 202 extraction operation | demo only; body is a **fixture selector**, never a reply; the fixture is delivered through the same inbound attester ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md)) |
+| `POST /cases/{case_id}/commitments/{commitment_id}/verification` | affected contributor | 200 commitment/case | commitment `DUE`; actor owns an `ACTIVE` fact in the case |
 | `GET /cases/{case_id}/audit` | presenter admin | 200 page | safe audit only |
 
 These endpoints support exactly the three UI surfaces; route count does not imply extra screens.
@@ -202,9 +202,9 @@ A stale browser tab is refused three ways over — an old `proposal_hash`, an ol
 
 ### External reply and verification
 
-`POST /v1/demo/external-replies` body `{case_id,action_id,channel_message_id,received_at,from_destination_id,subject,text}`. It stores private evidence and starts an Investigator operation. Only the deterministic commitment validator/scheduler may turn cited terms into a commitment.
+`POST /v1/demo/external-replies` body is `{"fixture_id": "..."}` **and nothing else**. It names a reviewed RFC 822 message in the repository; the route reads no case, action, destination, sender, subject, or body from the caller, because a caller-supplied reply is not a reply ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md) § Context). The fixture is fed through the same `InboundMailAttester` a deployed delivery uses, over the local transport authenticator, so the demo exercises the trust boundary instead of bypassing it. Correlation to exactly one `SENT` execution, the receipt verdicts, the sender/recipient digest comparisons, and every closed refusal code all apply unchanged. On success it stores the immutable inbound artifact and starts an `EXTRACT_COMMITMENT` operation; only the deterministic commitment validator may turn a cited span into a commitment ([ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md)).
 
-`POST .../commitments/{id}/verification` body `{expected_version,outcome:'FULFILLED'|'MISSED',note?,fixture_evidence_id?}`. Actor must own an active fact/report in the case; V1 presenter cannot impersonate the response except by selecting the seeded resident persona. `FULFILLED` resolves; `MISSED` returns case to ready-for-action.
+`POST .../commitments/{id}/verification` body `{expected_version,outcome:'FULFILLED'|'MISSED',note?,fixture_evidence_id?}`. The commitment must be `DUE`, and the actor must own an `ACTIVE` fact in the case — a deterministic check against loaded case facts, never a claim in the body. V1 presenter cannot impersonate the response except by selecting the seeded resident persona. `FULFILLED` resolves the case; `MISSED` returns it to `READY_FOR_ACTION` and moves the current action pointer to `INVALIDATED` in the same transaction, so a subsequent action needs a fresh view, proposal, and approval. **This endpoint is the only path by which a commitment is satisfied or missed and the only path by which a case is resolved** ([ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 8). There is no cancellation route in V1.
 
 ### Audit
 
