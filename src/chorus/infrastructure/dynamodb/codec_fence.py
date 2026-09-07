@@ -116,6 +116,7 @@ def _invocation_body(result: AgentInvocationResult) -> dict[str, StoredValue]:
         "failure_code": result.failure_code,
         "operation_id": None if result.operation_id is None else identifier(result.operation_id),
         "result_refs": encode_entity_refs(result.result_refs),
+        "reason_codes": tuple(result.reason_codes),
         "created_at": instant(result.created_at),
     }
 
@@ -175,6 +176,7 @@ def _decode_invocation(
         failure_code=reader.optional_text("failure_code"),
         operation_id=reader.optional_identifier("operation_id", OperationId),
         result_refs=decode_entity_refs(reader, "result_refs"),
+        reason_codes=reader.texts("reason_codes"),
         created_at=reader.instant("created_at"),
         schema_version=schema_version,
     )

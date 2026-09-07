@@ -1,6 +1,6 @@
 # ADR-025: One deliberate SES attempt — the send order, the fence's real job, and the honest unknown
 
-**Status:** Accepted
+**Status:** Accepted (amended by [ADR-026](ADR-026-inbound-reply-trust-and-correlation.md) § 3: the action case projection gains a fifth participant, the immutable outbound message locator, so a reply has something to correlate against. Additive — no existing participant, field, or condition changes, and `SENT` is the only state that reaches it.)
 **Date:** 2026-09-06
 **Deciders:** Ambient CHORUS maintainers and product owner
 **Amends:** [04-domain-state-and-events.md](../architecture/04-domain-state-and-events.md) § ActionExecution; [05-privacy-compiler-and-shareable-view.md](../architecture/05-privacy-compiler-and-shareable-view.md) § Freshness and send authorization fence; [06-persistence-and-evidence.md](../architecture/06-persistence-and-evidence.md) § Transaction boundaries; [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md) § Action pipeline, § Deterministic rendering, § Destination and SES controls, § Idempotency and ambiguous sends, § Failure/retry classification; [08-api-design.md](../architecture/08-api-design.md) § Endpoint summary, § Propose, approve, execute; [09-observability-errors-and-failures.md](../architecture/09-observability-errors-and-failures.md) § Required events, § Complete failure matrix; [10-security-threat-model.md](../architecture/10-security-threat-model.md) § Threat register; [ADR-022](ADR-022-action-draft-preview-and-transaction.md) § 1's presence table

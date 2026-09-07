@@ -29,6 +29,7 @@ from chorus.domain.entities import (
     AuditEvent,
     CaseState,
     Commitment,
+    CommitmentStatus,
     Community,
     CommunityCase,
     CommunityMessage,
@@ -39,6 +40,7 @@ from chorus.domain.entities import (
 )
 from chorus.domain.facts import Fact, Report
 from chorus.domain.ids import (
+    ActionId,
     ApprovalId,
     AssessmentId,
     CommitmentId,
@@ -68,6 +70,7 @@ from chorus.ports.records import (
     ActionPointerExpectation,
     AgentInvocationResult,
     ChannelUniquenessLock,
+    CommitmentScheduleProjection,
     CompilerAuditProjection,
     CurrentActionPointer,
     CurrentViewPointer,
@@ -80,9 +83,11 @@ from chorus.ports.records import (
     MonitorSnapshotChunk,
     MonitorSnapshotKind,
     MonitorSnapshotManifest,
+    OutboundMessageLocator,
     SendFence,
     StoredCurrentMandatePointer,
     StoredShareableView,
+    VerificationRequest,
     ViewHistoryLocator,
     ViewPointerExpectation,
 )
@@ -585,11 +590,90 @@ class ShareableRepositoryPort(Protocol):
         self, scope: CaseScope, locator: ActionHistoryLocator
     ) -> PutItem: ...
 
+    async def load_outbound_message_locators(
+        self, scope: NamespaceScope, ses_message_ids: tuple[str, ...]
+    ) -> tuple[OutboundMessageLocator, ...]:
+        """Resolve message identifiers to locators by direct key, in one batch get.
+
+        The whole of an inbound reply's correlation input is a set of RFC 5322 message
+        identifiers, so this is the one read in the system addressed by a value an outside
+        party supplied -- and it is still a direct-key batch get, because the address is a
+        digest of that value. There is no scan, no prefix walk, and no GSI (ADR-026 § 3).
+
+        Identifiers that resolve nothing are simply absent from the result. That is the
+        ordinary case: a reply's ``References`` names every message in the thread, most of
+        which this system never sent.
+        """
+
+    async def load_commitment_schedule(
+        self, scope: CaseScope, commitment_id: CommitmentId
+    ) -> CommitmentScheduleProjection | None:
+        """Strongly read whether one commitment's schedule exists yet, or ``None``."""
+
+    async def load_verification_request(
+        self, scope: CaseScope, commitment_id: CommitmentId, *, generation: int
+    ) -> VerificationRequest | None:
+        """Strongly read the create-only verification request for one generation, or ``None``."""
+
+    async def load_live_commitment(
+        self, scope: CaseScope, action_id: ActionId
+    ) -> Commitment | None:
+        """The one ``PENDING`` or ``DUE`` commitment for this action, or ``None`` (ADR-027 § 3).
+
+        A bounded query over the case partition's ``COMMITMENT#`` prefix, filtered in code
+        rather than by a key: the frozen per-case cap is twenty, so the whole collection is one
+        page and a status-keyed index would be a second address for a value that moves.
+        """
+
+    def stage_create_outbound_message_locator(self, locator: OutboundMessageLocator) -> PutItem:
+        """Stage the create-only locator that the action case projection writes at ``SENT``.
+
+        It takes no scope, because its address is derived from the namespace and the SES
+        message identifier alone -- which is what lets a reply that knows only an
+        ``In-Reply-To`` find it.
+        """
+
     def stage_create_commitment(self, scope: CaseScope, commitment: Commitment) -> PutItem: ...
 
-    def stage_update_commitment(
-        self, scope: CaseScope, commitment: Commitment, *, expected_version: int
+    def stage_create_commitment_schedule(
+        self, scope: CaseScope, projection: CommitmentScheduleProjection
     ) -> PutItem: ...
+
+    def stage_update_commitment_schedule(
+        self, scope: CaseScope, projection: CommitmentScheduleProjection, *, expected_version: int
+    ) -> PutItem: ...
+
+    def stage_create_verification_request(
+        self, scope: CaseScope, request: VerificationRequest
+    ) -> PutItem: ...
+
+    def stage_require_current_action_pointer(
+        self, scope: CaseScope, *, expected: ActionPointerExpectation
+    ) -> CheckItem:
+        """Assert the current action pointer still stands, writing nothing.
+
+        The ``FULFILLED`` branch of verification takes no pointer edge, and its participant is
+        this condition rather than a rewrite of a row it does not change -- which is what keeps
+        the transaction's participant count identical on both branches (ADR-027 § 7).
+        """
+
+    def stage_update_commitment(
+        self,
+        scope: CaseScope,
+        commitment: Commitment,
+        *,
+        expected_version: int,
+        expected_status: CommitmentStatus | None = None,
+        expected_due_event_id: UUID | None = None,
+    ) -> PutItem:
+        """Stage an optimistic commitment replace, optionally guarded on more than the version.
+
+        The two optional expectations are the watcher's (ADR-028 § 3): its ``PENDING -> DUE``
+        write is conditioned on the exact ``version``, on ``status == PENDING``, and on
+        ``due_event_id`` equalling the event's own identifier. That last condition is the
+        transaction's **whole commit proof** -- there is no idempotency record, because the
+        commitment row conditioned on its own due event already settles the question a fourth
+        participant would be asked."""
 
 
 class AuditRepositoryPort(Protocol):

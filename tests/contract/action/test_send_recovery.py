@@ -320,7 +320,7 @@ async def test_a_sent_execution_projects_the_case_to_actioned(
     assert result.case_version == before.version + 1
     assert result.authorization_version == before.authorization_version
     plan = send_harness.action.unit_of_work.plan("project-action-outcome")
-    assert len(plan.operations) == PROJECTION_PARTICIPANTS == 4
+    assert len(plan.operations) == PROJECTION_PARTICIPANTS == 5
     # The execution is a read-only condition: it is the sender's row, and the worker has no
     # business changing it.
     assert isinstance(plan.operations[1], CheckItem)

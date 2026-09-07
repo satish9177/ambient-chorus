@@ -38,6 +38,8 @@
 | SEC-19 | Private URI or sensitive field cannot serialize in safe types. | Separate Pydantic models with `extra='forbid'` | serialization negative tests |
 | SEC-20 | Logs omit private content. | allowlisted event schema/redaction processor | log-capture tests |
 | SEC-21 | A model-proposed evidence status may lower a fact's status and may never raise it. | evidence-status ladder and deterministic recomputation ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md)) | ladder and overclaim-downgrade tests |
+| SEC-22 | An inbound artifact exists only if an authenticated transport delivered it and it correlated to exactly one `SENT` execution. | transport authenticator port, attester/verifier split, receipt-verdict gate, and the immutable outbound message locator ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md)) | forged, foreign-transport, wrong-sender, wrong-recipient, uncorrelated, and replay tests |
+| SEC-23 | A commitment's obligor is the correlated destination's safe label and its deadline is a cited ISO date; neither is ever a model-authored value. | span-cited extraction, obligor equality against the correlation, and a derived `due_at` that never reads the model's own ([ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md)) | ungrounded, wrong-obligor, and invented-deadline tests |
 
 There is no privacy-threshold exception in V1. The phrase “unless an explicit policy exception exists” is reserved for a future accepted policy version and ADR; `policy/v1` has none.
 

@@ -12,6 +12,7 @@ failure here means an upstream invariant broke rather than that a caller supplie
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha256
 from uuid import UUID
 
 from chorus.domain.ids import (
@@ -349,3 +350,80 @@ MANDATE_CURRENT_SORT_KEY_PREFIX = "MANDATE_CURRENT#"
 COMMITMENT_SORT_KEY_PREFIX = "COMMITMENT#"
 MESSAGE_SORT_KEY_PREFIX = "MESSAGE#"
 FEED_SIGNAL_SORT_KEY_PREFIX = "MESSAGE_SIGNAL#"
+
+
+def outbound_message_digest(namespace: Namespace, ses_message_id: str) -> str:
+    """``sha256(namespace | ses_message_id)`` -- the locator's whole address, as hex.
+
+    The identifier is **hashed** rather than placed in a key segment, for the reason the whole
+    key grammar exists: an SES message identifier is a value produced outside this system, and
+    provider- or user-supplied text never enters a key. Hashing also fixes the segment length,
+    so a long identifier cannot approach the key bound.
+
+    The namespace is inside the digest as well as in the partition key, so a locator derived in
+    one namespace can never address a row in another even if a caller assembled the key by hand.
+    """
+
+    if not ses_message_id:
+        raise ValueError("an SES message identifier is required")
+    return sha256(f"{namespace.value}\x1f{ses_message_id}".encode()).hexdigest()
+
+
+def outbound_message_partition(namespace: Namespace, ses_message_id: str) -> str:
+    """``NS#{namespace}#OUTBOUND_MESSAGE#{sha256(namespace | ses_message_id)}``.
+
+    **This partition is a deliberate, minimal correction to the key ADR-026 § 3 prints**, and
+    the reason is that the frozen pair cannot express the frozen access pattern. The ADR gives
+    the locator ``NS#n#EXECUTION#a`` as its partition and the digest as its sort key, and it
+    gives correlation a ``BatchGetItem`` "on the exact ``OUTBOUND_MESSAGE#{...}`` keys derived
+    from the reply's ``In-Reply-To``/``References``". A batch get names whole keys, and ``a`` is
+    the *action* identifier -- which is precisely what a reply does not carry and precisely what
+    correlation exists to discover. Under the printed key the only way to find the row would be
+    a scan or the GSI the same ADR rejects by name.
+
+    Moving the digest into the partition key is the smallest change that keeps every property
+    the ADR actually argues for: the locator is still immutable and create-only, still written
+    only as a participant of the action case projection at ``SENT``, still holds no address, no
+    subject, and no body, still requires no GSI and no scan, and a ``SEND_UNKNOWN`` execution
+    still gets none -- so no reply can attach to one.
+
+    It costs one thing, stated plainly: the locator no longer sits inside the execution's
+    ``LeadingKeys`` prefix, so the application's Shareable write grant names
+    ``NS#*#OUTBOUND_MESSAGE#*`` explicitly and the sender is denied it explicitly. That is a
+    grant the sender never had, because the projection is the worker's transaction and never
+    the sender's.
+    """
+
+    digest = outbound_message_digest(namespace, ses_message_id)
+    return _join("NS", namespace.value, "OUTBOUND_MESSAGE", digest)
+
+
+def outbound_message_sort_key() -> str:
+    """The single item in an outbound-message-locator partition."""
+
+    return "OUTBOUND_MESSAGE"
+
+
+def commitment_schedule_sort_key(commitment_id: CommitmentId) -> str:
+    """``COMMITMENT_SCHEDULE#{commitment_id}`` beside the commitment it describes."""
+
+    return _join("COMMITMENT_SCHEDULE", str(commitment_id))
+
+
+def verification_request_sort_key(commitment_id: CommitmentId, generation: int) -> str:
+    """``VERIFICATION_REQUEST#{commitment_id}#{generation}``, create-only.
+
+    The generation is in the key rather than in the body, which is what makes "exactly one
+    verification request per commitment generation" an address rather than a condition to
+    remember to write.
+    """
+
+    if generation < 1 or len(str(generation)) > MANDATE_VERSION_WIDTH:
+        raise ValueError("verification request generation exceeds the fixed key width")
+    return _join(
+        "VERIFICATION_REQUEST", str(commitment_id), str(generation).zfill(MANDATE_VERSION_WIDTH)
+    )
+
+
+COMMITMENT_SCHEDULE_SORT_KEY_PREFIX = "COMMITMENT_SCHEDULE#"
+VERIFICATION_REQUEST_SORT_KEY_PREFIX = "VERIFICATION_REQUEST#"

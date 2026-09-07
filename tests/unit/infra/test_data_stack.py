@@ -200,6 +200,11 @@ def test_the_application_synthesizes_every_declared_stack() -> None:
         # rewriting the proposal and the approval, because they shared a partition (ADR-024).
         # Defined and asserted here; deployed by Phase 11.
         "AmbientChorusSender",
+        # Phase 9 does the same for the watcher, the smallest principal in the system, and for
+        # the schedule group, the DLQ, and the alarm around it. Its trust-matrix row was wrong
+        # until now -- ``Share: R/W(commitment/case projection)`` mislocated the case row into a
+        # table the watcher is denied outright (ADR-028 § 6). Deployed by Phase 11.
+        "AmbientChorusWatcher",
     }
 
 

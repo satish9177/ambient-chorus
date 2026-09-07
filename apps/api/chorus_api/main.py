@@ -31,16 +31,18 @@ from chorus_api.routes import (
     actions,
     approvals,
     cases,
+    commitments,
     feed,
     ingest,
     investigations,
     mandates,
+    replies,
     views,
 )
 
 API_PREFIX = "/v1"
 API_TITLE = "Ambient CHORUS"
-API_VERSION = "0.8.0"
+API_VERSION = "0.9.0"
 
 
 def build_app(container: ApiContainer) -> FastAPI:
@@ -79,6 +81,10 @@ def build_app(container: ApiContainer) -> FastAPI:
     app.include_router(actions.router, prefix=API_PREFIX)
     app.include_router(approvals.router, prefix=API_PREFIX)
     app.include_router(cases.router, prefix=API_PREFIX)
+    # The Phase-9 surfaces: one fixture selector in, and the one human decision that can
+    # satisfy a promise or resolve a case.
+    app.include_router(replies.router, prefix=API_PREFIX)
+    app.include_router(commitments.router, prefix=API_PREFIX)
     return app
 
 

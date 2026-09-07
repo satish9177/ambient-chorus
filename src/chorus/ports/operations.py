@@ -185,6 +185,17 @@ class OperationDispatchPort(Protocol):
     async def dispatch_propose_action(self, job: ProposeActionOperationJob) -> None:
         """Deliver the proposal job at least once, with the same guarantees."""
 
+    async def dispatch_extract_commitment(self, job: object) -> None:
+        """Deliver one extraction job at least once, with the same guarantees.
+
+        Typed as ``object`` here for one reason: the job is declared beside its command in
+        :mod:`chorus.application.commands.extract_commitment_operation`, and a port may not
+        import the application layer. Every implementation narrows it, and the worker's binding
+        check -- kind, namespace, operation, actor, request hash, invocation, and the binding
+        digest recomputed from the job's own fields -- is what actually decides whether a
+        delivered job belongs to the operation it names.
+        """
+
     async def dispatch_send_action(self, job: SendActionOperationJob) -> None:
         """Deliver the send job at least once.
 

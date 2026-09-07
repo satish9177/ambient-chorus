@@ -23,9 +23,12 @@ from chorus.ports.errors import (
     PersistenceConflictError,
 )
 from chorus.ports.objects import (
+    INBOUND_REPLY_MEDIA_TYPE,
     MAX_EVIDENCE_SOURCE_BYTES,
+    MAX_INBOUND_REPLY_BYTES,
     ExportObjectDescriptor,
     export_evidence_key,
+    inbound_reply_key,
     private_evidence_key,
 )
 
@@ -92,6 +95,59 @@ class InMemoryObjectStore:
         if len(stored.content) > MAX_EVIDENCE_SOURCE_BYTES:
             raise ExternalDependencyError("PRIVATE_EVIDENCE_OBJECT", retryable=False)
         return stored.content
+
+    async def head_inbound_reply(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        raw_sha256: Sha256Digest,
+    ) -> ExportObjectDescriptor | None:
+        self.head_calls += 1
+        stored = self.private.get(
+            inbound_reply_key(
+                namespace=namespace,
+                community_id=community_id,
+                case_id=case_id,
+                raw_sha256=raw_sha256,
+            )
+        )
+        if stored is None:
+            return None
+        return ExportObjectDescriptor(
+            media_type=stored.media_type,
+            byte_length=len(stored.content),
+            sha256=Sha256Digest(f"sha256:{sha256(stored.content).hexdigest()}"),
+        )
+
+    async def put_inbound_reply(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        raw_sha256: Sha256Digest,
+        content: bytes,
+    ) -> None:
+        self.put_calls += 1
+        if len(content) > MAX_INBOUND_REPLY_BYTES:
+            raise ExternalDependencyError("INBOUND_REPLY_OBJECT", retryable=False)
+        if self.fail_puts > 0:
+            self.fail_puts -= 1
+            raise ExternalDependencyError("INBOUND_REPLY_OBJECT")
+        key = inbound_reply_key(
+            namespace=namespace,
+            community_id=community_id,
+            case_id=case_id,
+            raw_sha256=raw_sha256,
+        )
+        if key in self.private:
+            raise PersistenceConflictError("INBOUND_REPLY_OBJECT")
+        self.private[key] = _StoredObject(content=content, media_type=INBOUND_REPLY_MEDIA_TYPE)
+        if self.ambiguous_next_put:
+            self.ambiguous_next_put = False
+            raise ExternalDependencyError("INBOUND_REPLY_OBJECT")
 
     async def head_export_evidence(
         self,

@@ -53,14 +53,23 @@ APPLICATION_SHAREABLE_PREFIXES = (
     "NS#*#ACTION#*",
     "NS#*#ACTION_CURRENT#*",
     "NS#*#EXECUTION#*",
+    "NS#*#OUTBOUND_MESSAGE#*",
     "NS#*#CASE#*",
 )
 """The only Shareable partitions the application may write.
 
 ``ACTION#`` holds the immutable proposals and approvals; ``ACTION_CURRENT#`` holds the current
 action pointer, the action history locators, and the action-apply idempotency record;
-``EXECUTION#`` holds the send execution and the send-command records; ``CASE#`` holds
-commitments.
+``EXECUTION#`` holds the send execution and the send-command records; ``OUTBOUND_MESSAGE#``
+holds the immutable correlation locator the action case projection writes at ``SENT``; ``CASE#``
+holds commitments, their schedule projections, and their verification requests.
+
+``OUTBOUND_MESSAGE#`` is **not a widening** either. The locator is a participant of the
+projection transaction, which is the application worker's and never the sender's -- the sender
+is denied that prefix explicitly (ADR-026 § 3). It is a partition of its own rather than a sort
+key inside ``NS#n#EXECUTION#a`` because correlation starts from a reply's ``In-Reply-To`` and
+has no action identifier yet, so the printed key could only be resolved by the scan or the GSI
+that ADR rejects by name.
 
 ``EXECUTION#`` is **not a widening** (ADR-024 SS 4). The application already created the
 ``DRAFT`` execution as participant 2 of the proposal apply and moves it on both human
@@ -111,6 +120,18 @@ DENIED_SEND_ACTIONS = (
 )
 """The application drafts and approves. Only the sender sends."""
 
+SCHEDULER_ACTIONS = ("scheduler:CreateSchedule", "scheduler:GetSchedule")
+"""The application's complete scheduler capability, narrowed by ADR-028 § 6.
+
+**No ``DeleteSchedule`` and no ``UpdateSchedule``.** ``DeadlineSchedulerPort`` has no method for
+either, V1 has no reschedule verb, and ``ActionAfterCompletion=DELETE`` handles cleanup -- so a
+wider grant would be a permission with no caller and one obvious illegitimate one. A grant wider
+than its caller is a grant waiting for a second caller.
+"""
+
+DENIED_SCHEDULER_ACTIONS = ("scheduler:DeleteSchedule", "scheduler:UpdateSchedule")
+"""Denied rather than merely ungranted, so a later widening still fails closed."""
+
 DENIED_MODEL_ACTIONS = (
     "bedrock:InvokeModel",
     "bedrock:InvokeModelWithResponseStream",
@@ -155,6 +176,8 @@ class ChorusApplicationStack(Stack):
         tables: ApplicationTables,
         buckets: ApplicationBuckets,
         agent_runtime_arns: tuple[str, ...] = (),
+        scheduler_group_name: str | None = None,
+        scheduler_role_arn: str | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
         Tags.of(self).add("Project", config.project)
@@ -177,6 +200,8 @@ class ChorusApplicationStack(Stack):
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             description="FastAPI application and operation worker: private zone and actions.",
         )
+        self.scheduler_group_name = scheduler_group_name or f"chorus-{config.environment}"
+        self.scheduler_role_arn = scheduler_role_arn
         self._grant_boundary(
             tables=tables, buckets=buckets, agent_runtime_arns=agent_runtime_arns, config=config
         )
@@ -293,6 +318,42 @@ class ChorusApplicationStack(Stack):
                     resources=list(agent_runtime_arns),
                 )
             )
+        # ADR-028 § 6. Create and read, on the one schedule group, and nothing else.
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="CreateAndGetCommitmentSchedulesOnly",
+                effect=iam.Effect.ALLOW,
+                actions=list(SCHEDULER_ACTIONS),
+                resources=[
+                    self.format_arn(
+                        service="scheduler",
+                        resource="schedule",
+                        resource_name=f"{self.scheduler_group_name}/*",
+                    )
+                ],
+            )
+        )
+        if self.scheduler_role_arn:
+            # Passing the scheduler execution role is what lets a created schedule invoke the
+            # watcher. It is scoped to that one role: a broader ``iam:PassRole`` would let the
+            # application hand any role to any target.
+            self.role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="PassSchedulerExecutionRoleOnly",
+                    effect=iam.Effect.ALLOW,
+                    actions=["iam:PassRole"],
+                    resources=[self.scheduler_role_arn],
+                    conditions={"StringEquals": {"iam:PassedToService": "scheduler.amazonaws.com"}},
+                )
+            )
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyScheduleDeletionAndUpdate",
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_SCHEDULER_ACTIONS),
+                resources=["*"],
+            )
+        )
         self.role.add_to_policy(
             iam.PolicyStatement(
                 sid="WriteOwnApplicationLogs",

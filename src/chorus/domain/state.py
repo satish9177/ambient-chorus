@@ -15,7 +15,7 @@ from chorus.domain.entities import (
     CommunityCase,
 )
 from chorus.domain.errors import StateTransitionError
-from chorus.domain.ids import ApprovalId, Sha256Digest
+from chorus.domain.ids import ApprovalId, ContributorId, EvidenceItemId, Sha256Digest
 from chorus.domain.time import require_utc
 
 CASE_EDGES: frozenset[tuple[CaseState, CaseState]] = frozenset(
@@ -170,7 +170,11 @@ def _case_guard(source: CaseState, target: CaseState, context: CaseTransitionCon
     if (source, target) == (CaseState.VERIFYING, CaseState.RESOLVED):
         return context.actor_is_human and context.affected_contributor_verified
     if (source, target) == (CaseState.VERIFYING, CaseState.READY_FOR_ACTION):
-        return context.commitment_missed
+        # ``actor_is_human`` was missing here, and 04-domain-state-and-events.md's transition
+        # contract has always said this outcome is the affected contributor's. Nothing
+        # constructed the call before Phase 9, so the defect was latent -- and Phase 9 is the
+        # phase that would otherwise have written the first system-actor caller (ADR-027 § 5).
+        return context.actor_is_human and context.commitment_missed
     if source in {CaseState.RESOLVED, CaseState.CLOSED_UNRESOLVED}:
         return context.actor_is_human and context.new_evidence and context.explicit_reopen
     return False
@@ -364,6 +368,22 @@ def require_monotonic_presence(before: ActionExecution, after: ActionExecution) 
             raise StateTransitionError(str(before.execution_id))
 
 
+HUMAN_ONLY_COMMITMENT_STATUSES: frozenset[CommitmentStatus] = frozenset(
+    {CommitmentStatus.FULFILLED, CommitmentStatus.MISSED, CommitmentStatus.CANCELLED}
+)
+"""Every commitment outcome a person alone may take (ADR-027 § 5).
+
+``FULFILLED`` and ``MISSED`` joined ``CANCELLED`` here because the documents always said both
+outcomes were the affected contributor's and the guard only ever enforced the third. That left
+``DUE -> FULFILLED`` reachable by a system actor -- which is T39, a model reporting a fixed
+elevator that was never fixed -- and it was latent only because no caller existed yet.
+
+``PENDING -> DUE`` is therefore the state machine's **one** system-actor edge, and it is taken
+by the deadline watcher and by nothing else. Time passage produces a verification request; it
+never produces an outcome.
+"""
+
+
 def transition_commitment(
     commitment: Commitment,
     target: CommitmentStatus,
@@ -371,15 +391,35 @@ def transition_commitment(
     expected_version: int,
     now: datetime,
     actor_is_human: bool = False,
+    verified_by_contributor_id: ContributorId | None = None,
+    verification_evidence_id: EvidenceItemId | None = None,
+    outcome_note: str | None = None,
 ) -> Commitment:
-    """Advance commitment status; cancellation is a human-only decision."""
+    """Advance commitment status; every outcome but ``DUE`` is a human-only decision.
+
+    The three optional values are what a human verification records alongside the edge: who
+    decided, the optional safe evidence they cited, and their short note. They are applied in
+    the same construction as the status change, so the entity validates the *result*, and
+    ``None`` means "leave as it was" rather than "clear it".
+    """
 
     require_utc(now)
     edge = (commitment.status, target)
     if (
         commitment.version != expected_version
         or edge not in COMMITMENT_EDGES
-        or (target is CommitmentStatus.CANCELLED and not actor_is_human)
+        or (target in HUMAN_ONLY_COMMITMENT_STATUSES and not actor_is_human)
     ):
         raise StateTransitionError(str(commitment.commitment_id))
-    return replace(commitment, status=target, version=commitment.version + 1, updated_at=now)
+    supplied = {
+        "verified_by_contributor_id": verified_by_contributor_id,
+        "verification_evidence_id": verification_evidence_id,
+        "outcome_note": outcome_note,
+    }
+    return replace(
+        commitment,
+        status=target,
+        version=commitment.version + 1,
+        updated_at=now,
+        **{name: value for name, value in supplied.items() if value is not None},  # type: ignore[arg-type]
+    )

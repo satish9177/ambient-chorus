@@ -72,11 +72,11 @@ Expected proof: Action has no private/tool/data access, sender alone calls SES, 
 
 ### 3:45–4:30 — Manager promise and real schedule
 
-- Ingest the staged management reply: “Technician scheduled Wednesday 10–12.”
-- Let Investigator propose terms; deterministic validation creates the commitment and a real EventBridge one-time schedule.
+- Deliver the staged management reply through the inbound boundary. Its plain-text body states an explicit ISO date — “We will restore elevator B to service by 2030-01-14.” — because [ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) § 6 rejects weekday and relative date constructs outright and [ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 4 will not let a model turn “Wednesday” into an instant. The presenter selects a **fixture identifier**; the route reads no case, destination, sender, or body from the caller, and the fixture goes through the same attester a deployed delivery would ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md)).
+- Let the `EXTRACT_COMMITMENT` operation propose span-cited terms; the nine deterministic checks create the commitment, and the scheduler adapter creates a real one-time schedule under the deterministic name and client token.
 - Show logical due time, real mapped schedule time, generation, and case `VERIFYING`.
 
-Expected proof: raw reply is untrusted/private, commitment is cited/safe, scheduler—not agent memory—owns the deadline.
+Expected proof: the reply is authenticated by its transport and correlated to one `SENT` execution before it is anything at all; the raw MIME stays private; the obligor comes from the correlation and the deadline from a cited ISO date, neither from the model; and the scheduler — not agent memory — owns the deadline.
 
 ### 4:30–5:00 — Background watcher and missed deadline
 

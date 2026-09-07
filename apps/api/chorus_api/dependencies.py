@@ -27,16 +27,36 @@ from fastapi import Header, HTTPException, Request
 from chorus.application.commands.approve_action import ApproveAction
 from chorus.application.commands.compile_view import CompileView
 from chorus.application.commands.decide_mandate import DecideMandate
+from chorus.application.commands.ingest_external_reply import (
+    IngestExternalReply,
+    RecordReplyRejection,
+)
 from chorus.application.commands.ingest_messages import IngestMessages
 from chorus.application.commands.invalidate_action import InvalidateAction
 from chorus.application.commands.propose_mandates import ProposeMandates
+from chorus.application.commands.record_commitment_due import RecordCommitmentDue
+from chorus.application.commands.verify_commitment import VerifyCommitment
 from chorus.application.operations import ApplicationOperations
 from chorus.application.queries.current_action import ReadCurrentAction
 from chorus.application.queries.feed import ReadAmbientFeed
 from chorus.application.queries.mandates import ReadMandateThread
-from chorus.domain.ids import CommunityId, ContributorId, DestinationId, Namespace, Sha256Digest
+from chorus.application.services.inbound_mail import InboundMailAttester
+from chorus.domain.entities import Commitment
+from chorus.domain.ids import (
+    CaseId,
+    CommitmentId,
+    CommunityId,
+    ContributorId,
+    DestinationId,
+    Namespace,
+    Sha256Digest,
+)
+from chorus.infrastructure.fixtures.inbound_delivery import DemoReplyDeliverySource
+from chorus.infrastructure.local.demo_clock import LogicalDemoClock
 from chorus.ports.operations import OperationDispatchPort
 from chorus.ports.records import StoredSafeDestination
+from chorus.ports.repositories import ShareableRepositoryPort
+from chorus.ports.scopes import CaseScope
 
 ACTOR_HEADER = "X-Chorus-Demo-Actor"
 
@@ -67,6 +87,22 @@ RESIDENT_ACTORS: frozenset[DemoActor] = frozenset(
     }
 )
 """The personas that own facts, and therefore the only ones that can decide a mandate."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InboundReplySurface:
+    """Everything the demo reply route reaches, and deliberately nothing more.
+
+    No SES port, no agent client, no compiler client, and no scheduler client. The route turns a
+    reviewed fixture into a delivery, hands it to the attester, and persists what comes back --
+    and the absence of the other four is what makes "the inbound path can do nothing else" a
+    property of this type (ADR-026 § Consequences).
+    """
+
+    attester: InboundMailAttester
+    ingest: IngestExternalReply
+    record_rejection: RecordReplyRejection
+    demo_replies: DemoReplyDeliverySource
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -105,7 +141,53 @@ class ApiContainer:
     """Withdrawal and clearing. Without it the failure matrix's own remedy for a definite send
     failure -- create and approve a fresh proposal -- has no reachable path."""
 
+    verify_commitment: VerifyCommitment | None = None
+    """The one path by which a commitment is satisfied or missed, and a case resolved.
+
+    Optional because a composition may wire the read surfaces without it; a route that finds it
+    absent answers ``503`` rather than pretending a decision was recorded (ADR-027 § 8).
+    """
+
+    inbound_replies: InboundReplySurface | None = None
+    """The four objects the demo reply route needs, or ``None`` for a deployment with no boundary.
+
+    Grouped rather than four fields, because they are only ever wired together: an attester with
+    no verifier mints artifacts nothing accepts, and a verifier with no attester accepts nothing.
+    """
+
+    record_commitment_due: RecordCommitmentDue | None = None
+    demo_clock: LogicalDemoClock | None = None
+    """The demo's one logical clock, or ``None`` outside the demo.
+
+    The route that advances it holds no repository write path to ``COMMITMENT#``: it holds this
+    clock and the watcher use case, and the watcher re-verifies every field of the event it is
+    handed against the strongly loaded row.
+    """
+
+    commitments: ShareableRepositoryPort | None = None
+    """The read handle the demo clock route uses to name which commitment it is waking.
+
+    A read-only use of the Shareable repository, and the only one this container holds: the
+    route needs the commitment's generation and due time to build the event the watcher will
+    then re-verify against that same row.
+    """
+
     dispatcher: OperationDispatchPort
+
+    async def read_commitment(self, *, case_id: CaseId, commitment_id: CommitmentId) -> Commitment:
+        """Strongly read one commitment for the demo clock route, or refuse.
+
+        On the container rather than in the route because a route that assembled a scope would
+        be a route deciding which namespace and community it is acting in -- and those are
+        exactly the two values a caller must never be able to choose.
+        """
+
+        if self.commitments is None:
+            raise RuntimeError("no commitment read handle is wired")
+        return await self.commitments.load_commitment(
+            CaseScope(namespace=self.namespace, community_id=self.community_id, case_id=case_id),
+            commitment_id,
+        )
 
 
 def container_of(request: Request) -> ApiContainer:

@@ -27,9 +27,12 @@ from chorus.ports.errors import (
     PersistenceConflictError,
 )
 from chorus.ports.objects import (
+    INBOUND_REPLY_MEDIA_TYPE,
     MAX_EVIDENCE_SOURCE_BYTES,
+    MAX_INBOUND_REPLY_BYTES,
     ExportObjectDescriptor,
     export_evidence_key,
+    inbound_reply_key,
     private_evidence_key,
 )
 
@@ -126,6 +129,81 @@ class S3ObjectStore:
         if len(content) > MAX_EVIDENCE_SOURCE_BYTES:
             raise ExternalDependencyError("PRIVATE_EVIDENCE_OBJECT", retryable=False)
         return bytes(content)
+
+    async def head_inbound_reply(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        raw_sha256: Sha256Digest,
+    ) -> ExportObjectDescriptor | None:
+        """Describe the stored raw MIME at this content address without fetching it."""
+
+        key = inbound_reply_key(
+            namespace=namespace,
+            community_id=community_id,
+            case_id=case_id,
+            raw_sha256=raw_sha256,
+        )
+        try:
+            response = self.client.head_object(Bucket=self.private_bucket, Key=key)
+        except ClientError as error:
+            if _error_code(error) in _ABSENT_CODES:
+                return None
+            raise _translate(error, "INBOUND_REPLY_OBJECT") from error
+        except BotoCoreError as error:
+            raise _translate(error, "INBOUND_REPLY_OBJECT") from error
+        stored = response.get("Metadata", {}).get(DIGEST_METADATA_KEY)
+        return ExportObjectDescriptor(
+            media_type=response.get("ContentType", ""),
+            byte_length=int(response.get("ContentLength", 0)),
+            sha256=Sha256Digest(stored) if stored else Sha256Digest("sha256:" + "0" * 64),
+        )
+
+    async def put_inbound_reply(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        raw_sha256: Sha256Digest,
+        content: bytes,
+    ) -> None:
+        """Create one raw inbound message at its content address, or report one is there.
+
+        The digest is recomputed here rather than trusted, because the address *is* the digest:
+        a mismatch would file a stranger's message under a name that describes different bytes,
+        and every later integrity check would compare the wrong two things.
+        """
+
+        if len(content) > MAX_INBOUND_REPLY_BYTES:
+            raise ExternalDependencyError("INBOUND_REPLY_OBJECT", retryable=False)
+        if f"sha256:{sha256(content).hexdigest()}" != raw_sha256.value:
+            raise ExternalDependencyError("INBOUND_REPLY_OBJECT", retryable=False)
+        key = inbound_reply_key(
+            namespace=namespace,
+            community_id=community_id,
+            case_id=case_id,
+            raw_sha256=raw_sha256,
+        )
+        try:
+            self.client.put_object(
+                Bucket=self.private_bucket,
+                Key=key,
+                Body=content,
+                ContentType=INBOUND_REPLY_MEDIA_TYPE,
+                ServerSideEncryption="aws:kms",
+                ChecksumAlgorithm="SHA256",
+                Metadata={DIGEST_METADATA_KEY: raw_sha256.value},
+                IfNoneMatch="*",
+            )
+        except ClientError as error:
+            if _error_code(error) in _ALREADY_EXISTS_CODES:
+                raise PersistenceConflictError("INBOUND_REPLY_OBJECT") from error
+            raise _translate(error, "INBOUND_REPLY_OBJECT") from error
+        except BotoCoreError as error:
+            raise _translate(error, "INBOUND_REPLY_OBJECT") from error
 
     async def head_export_evidence(
         self,

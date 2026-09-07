@@ -19,6 +19,10 @@ from enum import StrEnum
 from typing import Protocol
 
 from chorus.contracts.action import ActionInput, ActionProposalDraft
+from chorus.contracts.commitment import (
+    CommitmentExtractionInput,
+    CommitmentExtractionOutput,
+)
 from chorus.contracts.common import AgentInputEnvelope, AgentResultEnvelope
 from chorus.contracts.investigation import (
     InvestigationAssessmentDraft,
@@ -34,6 +38,9 @@ type InvestigationResult = AgentResultEnvelope[InvestigationAssessmentDraft]
 
 type ActionInvocation = AgentInputEnvelope[ActionInput]
 type ActionResult = AgentResultEnvelope[ActionProposalDraft]
+
+type CommitmentExtractionInvocation = AgentInputEnvelope[CommitmentExtractionInput]
+type CommitmentExtractionResult = AgentResultEnvelope[CommitmentExtractionOutput]
 
 
 class AgentErrorCode(StrEnum):
@@ -109,6 +116,27 @@ class InvestigationRejection(StrEnum):
     TRANSACTION_BOUND_EXCEEDED = "TRANSACTION_BOUND_EXCEEDED"
 
 
+class CommitmentExtractionRejection(StrEnum):
+    """Every deterministic reason an extraction answer can be refused *as an answer*.
+
+    A fourth closed set, and it is deliberately short. The nine grounding checks of ADR-027 § 3
+    reject individual *proposals* and are recorded as
+    :class:`chorus.application.services.commitment_validation.CommitmentRejection`; these five
+    refuse the whole envelope, because a run that answered about a different reply or under a
+    different prompt has not made a proposal this system can evaluate at all.
+
+    ``PROMPT_VERSION_MISMATCH`` is the sharpest of them here: the extraction runs on the
+    Investigator runtime under its **own** prompt version, so a runtime answering
+    ``investigator/v1`` is running the wrong reviewed artifact for this call.
+    """
+
+    SCHEMA_INVALID = "SCHEMA_INVALID"
+    ENVELOPE_MISMATCH = "ENVELOPE_MISMATCH"
+    PROMPT_VERSION_MISMATCH = "PROMPT_VERSION_MISMATCH"
+    CASE_MISMATCH = "CASE_MISMATCH"
+    EVIDENCE_MISMATCH = "EVIDENCE_MISMATCH"
+
+
 class ActionRejection(StrEnum):
     """Every deterministic reason an Action proposal can be refused.
 
@@ -159,7 +187,9 @@ class ActionRejection(StrEnum):
     SENSITIVE_TERM = "SENSITIVE_TERM"
 
 
-type AgentRejectionCode = AgentRejection | InvestigationRejection | ActionRejection
+type AgentRejectionCode = (
+    AgentRejection | InvestigationRejection | ActionRejection | CommitmentExtractionRejection
+)
 
 
 class AgentError(Exception):
@@ -263,6 +293,25 @@ class ActionAgentPort(Protocol):
         The same contract as the other two ports, and for a sharper reason: this is the one
         agent whose output becomes text an external recipient reads, so an adapter that
         repaired a malformed answer would be editing a message nobody reviewed.
+        """
+
+
+class CommitmentExtractionPort(Protocol):
+    """Invoke the extraction exactly once with one reply's text and nothing else.
+
+    A separate port from :class:`InvestigatorAgentPort` even though both run on the Investigator
+    runtime, because they are different reviewed artifacts answering different questions under
+    different prompt versions. One port with two methods would let a composition wire the
+    extraction and get the investigation, which is the mistake a type can prevent.
+    """
+
+    async def invoke_commitment_extraction(
+        self, invocation: CommitmentExtractionInvocation
+    ) -> CommitmentExtractionResult:
+        """Return the strict result envelope, or raise a closed :class:`AgentError`.
+
+        Implementations must not retry internally, for the reason every other agent port gives
+        and one more: a second pass here is a second reading of a stranger's private email.
         """
 
 

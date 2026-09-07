@@ -263,6 +263,7 @@ class ApplicationOperationKind(StrEnum):
     MONITOR = "MONITOR"
     INVESTIGATE = "INVESTIGATE"
     PROPOSE_ACTION = "PROPOSE_ACTION"
+    EXTRACT_COMMITMENT = "EXTRACT_COMMITMENT"
     SEND_ACTION = "SEND_ACTION"
     DEMO_DUE = "DEMO_DUE"
 
@@ -272,6 +273,7 @@ AGENT_INVOKING_OPERATION_KINDS: frozenset[ApplicationOperationKind] = frozenset(
         ApplicationOperationKind.MONITOR,
         ApplicationOperationKind.INVESTIGATE,
         ApplicationOperationKind.PROPOSE_ACTION,
+        ApplicationOperationKind.EXTRACT_COMMITMENT,
     }
 )
 """The operation kinds that invoke an agent, and therefore carry a handover identity.
@@ -409,14 +411,87 @@ class EvidenceRoot:
             raise ValueError("derived evidence requires a parent root")
 
 
+EVIDENCE_ITEM_SCHEMA_VERSION_V1 = "evidence-item/v1"
+EVIDENCE_ITEM_SCHEMA_VERSION_V2 = "evidence-item/v2"
+"""The two accepted stored shapes. Readers take both; writers emit ``/v2``.
+
+``/v1`` rows carry a required resident owner and no external binding, which is exactly the
+combination ``/v2`` still admits. No stored row is rewritten (ADR-026 § 5).
+"""
+
+EXTERNAL_SOURCE_BINDING_SCHEMA_VERSION = "external-source-binding/v1"
+
+INBOUND_RECEIPT_PASS = "PASS"  # noqa: S105 - a receipt verdict word, not a credential
+INBOUND_RECEIPT_FAIL = "FAIL"
+"""The two SES receipt verdict words this system reads. Everything else is neither."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ExternalSourceBinding:
+    """Who wrote an inbound artifact, what it answers, and the wire it arrived on.
+
+    Immutable and create-only. It records the approved destination **exactly as the registry
+    stood at ingestion**, the correlated action and execution, the two address comparisons as
+    *digests*, the transport, the receipt verdicts, and the attestation the boundary minted --
+    and it holds no address, no subject, and no body. The digests are what keep the inbound
+    principal from becoming a second holder of the destination-address secret the sender exists
+    to be the sole holder of (ADR-026 § 3).
+
+    **It authenticates and it does not verify.** It answers who wrote a reply, never what the
+    reply may establish: the allowed verification source set of ADR-015 stays empty and
+    ``EvidenceStatus.VERIFIED`` remains unreachable in policy/v1 (ADR-026 § 7).
+    """
+
+    destination_id: str
+    registry_version: int
+    routing_token: UUID
+    correlated_action_id: ActionId
+    correlated_execution_id: ExecutionId
+    inbound_message_id_hash: Sha256Digest
+    sender_address_digest: Sha256Digest
+    recipient_address_digest: Sha256Digest
+    transport: str
+    transport_source_arn: str
+    spf: str
+    dkim: str
+    dmarc: str
+    spam: str
+    virus: str
+    received_at: datetime
+    correlation_proof: str
+    schema_version: str = EXTERNAL_SOURCE_BINDING_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _bounded(self.destination_id, 1, 120, "destination_id")
+        if self.registry_version < 1:
+            raise ValueError("destination registry version must be positive")
+        _bounded(self.transport, 1, 64, "transport")
+        _bounded(self.transport_source_arn, 1, 256, "transport_source_arn")
+        for name in ("spf", "dkim", "dmarc", "spam", "virus"):
+            _bounded(getattr(self, name), 1, 32, name)
+        _bounded(self.correlation_proof, 1, 128, "correlation_proof")
+        if self.schema_version != EXTERNAL_SOURCE_BINDING_SCHEMA_VERSION:
+            raise ValueError("unsupported external source binding schema")
+        require_utc(self.received_at)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EvidenceItem:
+    """One stored evidence object, owned either by a resident or by an authenticated stranger.
+
+    **Exactly one of ``submitted_by_contributor_id`` and ``external_source_binding`` is set.**
+    A resident upload has an owner and no binding; an authenticated inbound reply has a binding
+    and no owner. ADR-015's revisit condition asked for exactly this and said which of the field
+    and the truth was to change: the field became nullable rather than management being written
+    into private storage as a resident contributor.
+    """
+
     evidence_id: EvidenceItemId
     root_id: EvidenceRootId
     community_id: CommunityId
     case_id: CaseId
     namespace: Namespace
-    submitted_by_contributor_id: ContributorId
+    submitted_by_contributor_id: ContributorId | None
     source_message_id: MessageId | None
     private_object_key: SensitiveStr = field(repr=False)
     media_type: str
@@ -431,7 +506,8 @@ class EvidenceItem:
     version: int
     created_at: datetime
     updated_at: datetime
-    schema_version: str = "evidence-item/v1"
+    external_source_binding: ExternalSourceBinding | None = None
+    schema_version: str = EVIDENCE_ITEM_SCHEMA_VERSION_V2
 
     def __post_init__(self) -> None:
         _bounded(self.media_type, 1, 120, "media_type")
@@ -442,6 +518,15 @@ class EvidenceItem:
         require_utc(self.uploaded_at)
         _positive_version(self.version)
         _timestamps(self.created_at, self.updated_at)
+        owned = self.submitted_by_contributor_id is not None
+        bound = self.external_source_binding is not None
+        if owned == bound:
+            # Neither is a record with no author at all; both is a record that claims two
+            # different ones. Refusing at construction is what keeps "an inbound reply is never
+            # a resident upload" a property of the type rather than of every call site.
+            raise ValueError("evidence has exactly one of a resident owner and an external binding")
+        if bound and self.schema_version != EVIDENCE_ITEM_SCHEMA_VERSION_V2:
+            raise ValueError("an external source binding requires evidence-item/v2")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

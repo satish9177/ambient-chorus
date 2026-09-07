@@ -102,8 +102,9 @@ Every path that writes a `CommunityCase` row in V1 appears here. A path not in t
 | 10 | Contributor verification | `VERIFYING → RESOLVED` or `VERIFYING → READY_FOR_ACTION` | +1 | unchanged | records a human verification outcome |
 | 11 | Human close | any allowed `→ CLOSED_UNRESOLVED` | +1 | unchanged | terminal lifecycle; disclosure is stopped by the **state** check, not by a counter |
 | 12 | Terminal reopen | `RESOLVED`/`CLOSED_UNRESOLVED → INVESTIGATING` | +1 | unchanged | the new evidence that justifies a reopen bumped the authorization epoch when it landed |
+| 13 | **External reply ingestion** ([ADR-026](ADR-026-inbound-reply-trust-and-correlation.md) § 6) | none — the case stays `ACTIONED` or `VERIFYING` | +1 | **+1** | an `EvidenceItem` lands in the case partition; row 12 already reasons that evidence bumps the epoch when it arrives, and staling an in-flight compile is the conservative direction |
 
-**Read the table as one rule rather than twelve.** Rows 2–5 are the complete set of case-owned inputs the compiler evaluates: active facts and their values, statuses and evidence statuses; report linkage; evidence roots and safety; current mandate decisions, versions, revocations, and expiry corrections; and the investigation results that feed gate 17. Rows 6–12 are lifecycle.
+**Read the table as one rule rather than thirteen.** Rows 2–5 and row 13 are the complete set of case-owned inputs the compiler evaluates: active facts and their values, statuses and evidence statuses; report linkage; evidence roots and safety; current mandate decisions, versions, revocations, and expiry corrections; and the investigation results that feed gate 17. Rows 6–12 are lifecycle.
 
 An authorization-sensitive command increments **both**, exactly once, in the one transaction that makes the change. A lifecycle-only transition increments `version` and copies `authorization_version` forward unchanged.
 

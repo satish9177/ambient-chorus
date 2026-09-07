@@ -252,6 +252,24 @@ def _cases() -> tuple[Case, ...]:
             world.commitment(),
         ),
         (
+            "OUTBOUND_MESSAGE_LOCATOR",
+            lambda w: codec_share.encode_outbound_message(w.outbound_message()),
+            codec_share.decode_outbound_message,
+            world.outbound_message(),
+        ),
+        (
+            "COMMITMENT_SCHEDULE",
+            lambda w: codec_share.encode_commitment_schedule(case_scope, w.commitment_schedule()),
+            codec_share.decode_commitment_schedule,
+            world.commitment_schedule(),
+        ),
+        (
+            "VERIFICATION_REQUEST",
+            lambda w: codec_share.encode_verification_request(case_scope, w.verification_request()),
+            codec_share.decode_verification_request,
+            world.verification_request(),
+        ),
+        (
             "COMPILER_AUDIT_PROJECTION",
             lambda w: codec_audit.encode_compile_projection(
                 case_scope, w.compile_projection(), retention=DEMO_RETENTION

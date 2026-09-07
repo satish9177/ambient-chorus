@@ -85,7 +85,11 @@ Fields: `root_id`, `community_id`, `root_sha256`, `media_type`, `first_observed_
 
 Purpose: stored evidence object and its provenance.
 
-Fields: `evidence_id`, `root_id`, `community_id`, `case_id`, `submitted_by_contributor_id`, `source_message_id?`, `private_object_key: SensitiveStr`, `media_type`, `byte_length`, `sha256`, `captured_at?`, `uploaded_at`, `derived_from_evidence_id?`, `malware_scan_status: PENDING|CLEAN|REJECTED`, `extraction_status: NOT_NEEDED|PENDING|COMPLETE|FAILED`, `extracted_text: SensitiveStr?`, `version`, timestamps. Object key/content lineage are immutable; scan/extraction results update conditionally. An item cannot cross case/community. Private-zone only.
+Fields: `evidence_id`, `root_id`, `community_id`, `case_id`, `submitted_by_contributor_id?`, `external_source_binding?`, `source_message_id?`, `private_object_key: SensitiveStr`, `media_type`, `byte_length`, `sha256`, `captured_at?`, `uploaded_at`, `derived_from_evidence_id?`, `malware_scan_status: PENDING|CLEAN|REJECTED`, `extraction_status: NOT_NEEDED|PENDING|COMPLETE|FAILED`, `extracted_text: SensitiveStr?`, `version`, timestamps. Object key/content lineage are immutable; scan/extraction results update conditionally. An item cannot cross case/community. Private-zone only. The schema version is `evidence-item/v2`; readers accept `/v1` rows unchanged.
+
+**Exactly one of `submitted_by_contributor_id` and `external_source_binding` is set**, enforced at construction ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md) § 5). A resident upload has an owner and no binding; an authenticated inbound reply has a binding and no owner. The field became nullable rather than management being written into private storage as a resident contributor — [ADR-015](../adr/ADR-015-evidence-status-and-verification.md) § Revisit condition asked for exactly that, and said which of the field and the truth was to change.
+
+`ExternalSourceBinding` is an immutable create-only value recording the destination ID, registry version, and routing token as the registry stood at ingestion, the correlated action and execution, the inbound message-ID hash, the sender and recipient address **digests**, the transport and its source ARN, the SES receipt verdicts, `received_at`, and the correlation proof. It holds no address, subject, or body. **It authenticates and it does not verify**: the allowed verification source set of [ADR-015](../adr/ADR-015-evidence-status-and-verification.md) stays empty and `EvidenceStatus.VERIFIED` remains unreachable in policy/v1.
 
 ### DisclosureMandate
 
@@ -226,7 +230,7 @@ Fields: `execution_id`, `action_id`, `case_id`, `approval_id?`, `proposal_hash`,
 
 Purpose: track an external promise independently of send/resolution.
 
-Fields: `commitment_id`, `case_id`, `action_id?`, `source_evidence_id`, `obligor`, `action_text`, `due_at`, `verification_method`, `status`, `scheduler_name`, `schedule_generation: int`, `due_event_id`, `verified_by_contributor_id?`, `verification_evidence_id?`, `outcome_note?`, `version`, timestamps. Same-case cited external reply is required. Updates are guarded. `PENDING→DUE→FULFILLED|MISSED`; cancellation is human-only before fulfillment. Stored in shareable table only after action text is validated safe; the raw reply remains private.
+Fields: `commitment_id`, `case_id`, `action_id?`, `source_evidence_id`, `obligor`, `action_text`, `due_at`, `verification_method`, `status`, `scheduler_name`, `schedule_generation: int`, `due_event_id`, `verified_by_contributor_id?`, `verification_evidence_id?`, `outcome_note?`, `version`, timestamps. Same-case cited external reply is required, and the reply must be an authenticated correlated artifact ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md)). `commitment_id` is derived rather than minted, so a redelivered apply re-stages one identical create-only row. `scheduler_name`, `schedule_generation`, and `due_event_id` are likewise **derived at creation** from `commitment_id` and `generation = 1`; whether the schedule exists is carried by the separate `COMMITMENT_SCHEDULE#c` projection and never by a status ([ADR-028](../adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) § 4). Updates are guarded. `PENDING→DUE→FULFILLED|MISSED`; **`FULFILLED`, `MISSED`, and `CANCELLED` are all human-only, and `PENDING→DUE` is the machine's one edge** ([ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 5). V1 implements no cancellation route. There is no `DISPUTED` status: a dispute has no deterministic consequence the state machine can take. Stored in shareable table only after action text is validated safe; the raw reply remains private.
 
 ### AuditEvent
 
@@ -368,9 +372,9 @@ Every transition increments `version`. Whether it also increments `authorization
 | `INVESTIGATING→READY_FOR_ACTION` | validated assessment bound to the current case version; recomputed `independent_source_count>=2`; no material unresolved different-issue finding; a compile preflight finds eligible facts | application | remains investigating |
 | `READY_FOR_ACTION→ACTION_PROPOSED` | current allowed view and valid proposal hashes; committed in the proposal apply transaction, conditioned on the exact `version`, `authorization_version`, and `state` the validator read, and moving `version` only | application | remains ready; stale view triggers recompile |
 | `ACTION_PROPOSED→ACTIONED` | execution reaches `SENT`; matching approval consumed | sender/application projection | `FAILED`/`SEND_UNKNOWN` leaves case `ACTION_PROPOSED` with execution banner |
-| `ACTIONED→VERIFYING` | valid commitment or explicit verification request | application | remains actioned if schedule creation fails; retry scheduling |
-| `VERIFYING→RESOLVED` | affected contributor supplies explicit fulfilled decision; optional safe evidence | human verification | remains verifying |
-| `VERIFYING→READY_FOR_ACTION` | affected contributor records `MISSED`/not fulfilled | human/application | same verification replay is no-op |
+| `ACTIONED→VERIFYING` | the `Commitment` created in the *same transaction* stands `PENDING`; the guard is satisfied by that participant and never by a caller-set flag | application | remains actioned if the apply fails whole; schedule creation happens after the transaction and its failure leaves the case `VERIFYING` with a visibly unscheduled commitment |
+| `VERIFYING→RESOLVED` | a human affected contributor supplies an explicit `FULFILLED` decision in the same transaction that moves the commitment `DUE→FULFILLED`; optional safe evidence. The **only** source that may resolve a case | human verification | remains verifying |
+| `VERIFYING→READY_FOR_ACTION` | **a human** affected contributor records `MISSED` in the same transaction that moves the commitment `DUE→MISSED`; the current action pointer is invalidated with it | human | same verification replay is no-op |
 | any allowed → `CLOSED_UNRESOLVED` | human reason from fixed enum; no active `SENDING` execution | human | source state retained on conflict |
 | terminal reopen | new report/evidence and explicit human/demo command | human/application | terminal state retained on failure |
 
@@ -413,7 +417,8 @@ Events are transactional outbox-style records/projections used for local dispatc
 | `ActionProposed` | proposal validator | approval UI |
 | `ActionApproved` | approval service | execution eligibility |
 | `ActionExecutionStarted|ActionSent|ActionFailed|ActionSendUnknown` | sender | case/UI/reconciliation |
-| `ExternalReplyReceived` | ingestion | investigator commitment proposal |
+| `ExternalReplyReceived` | authenticated inbound adapter | `EXTRACT_COMMITMENT` operation |
+| `ExternalReplyRejected` | authenticated inbound adapter | audit/operations only; closed reason code, no content |
 | `CommitmentCreated` | application | scheduler adapter |
 | `CommitmentDue` | EventBridge Scheduler | watcher |
 | `VerificationRequested` | watcher | case UI |

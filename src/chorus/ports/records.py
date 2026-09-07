@@ -31,6 +31,7 @@ from chorus.domain.ids import (
     ActionId,
     ApprovalId,
     CaseId,
+    CommitmentId,
     CommunityId,
     ContributorId,
     DestinationId,
@@ -239,6 +240,16 @@ class AgentInvocationResult:
     model_profile_hash: Sha256Digest | None = None
     failure_code: str | None = None
     operation_id: OperationId | None = None
+    reason_codes: tuple[str, ...] = ()
+    """Closed application-level codes about the *result*, never about the invocation itself.
+
+    ``failure_code`` says the invocation failed; this says the invocation succeeded and
+    deterministic code then had something to say about what it returned -- a commitment
+    extraction's per-proposal grounding rejections, for instance. Carried here, alongside the
+    input hash and prompt version this record already proves, so a recovery path that finds this
+    record can answer exactly what a first attempt answered without invoking the model again and
+    without a second durable store to keep in agreement with this one.
+    """
     schema_version: str = "agent-invocation-result/v2"
 
     def __post_init__(self) -> None:
@@ -983,3 +994,153 @@ class CompilerAuditProjection:
             record.outcome is CompileItemOutcome.INCLUDED for record in self.facts
         ):
             raise ValueError("a denied compile included nothing")
+
+
+# ---------------------------------------------------------------------------------------
+# Phase 9: the inbound correlation channel, the schedule projection, and the request item
+# ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OutboundMessageLocator:
+    """The only index from an SES message identifier back to one execution (ADR-026 § 3).
+
+    ``chorus_execution`` is an SES *message tag*: it exists for configuration-set event
+    publishing and is never a header on the delivered MIME, so no recipient ever sees it.
+    ``reply_to_address`` is one fixed address per sending identity and carries no per-execution
+    component. Nothing in the repository therefore carried the outward binding a reply needs,
+    and ``06-persistence-and-evidence.md`` forbids both scans in request handlers and a new
+    GSI -- so correlation had to be **designed**, and this immutable create-only item is the
+    design.
+
+    It is written as the fifth participant of the action case projection, which is run by the
+    application worker at ``SENT`` and nowhere else. Not in the send-outcome transaction,
+    because that one belongs to the sender; and never lazily on first reply, because a locator
+    a reply creates is a locator a reply controls.
+
+    The consequence is deliberate and stated out loud: **a ``SEND_UNKNOWN`` execution gets no
+    locator, so no reply can attach to it.** An execution the system cannot prove it sent is
+    not an execution a promise can answer.
+
+    It holds no address, no subject, and no body.
+    """
+
+    namespace: Namespace
+    community_id: CommunityId
+    case_id: CaseId
+    action_id: ActionId
+    execution_id: ExecutionId
+    ses_message_id: str
+    destination_id: DestinationId
+    registry_version: int
+    routing_token: UUID
+    sent_at: datetime
+    schema_version: str = "outbound-message-locator/v1"
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.ses_message_id) <= 256:
+            raise ValueError("an SES message identifier is required")
+        if self.registry_version < 1:
+            raise ValueError("destination registry version must be positive")
+        require_utc(self.sent_at)
+
+
+class CommitmentScheduleStatus(StrEnum):
+    """Whether the alarm clock exists, which is **not** a ``CommitmentStatus``.
+
+    ``PENDING_SCHEDULE`` is an operational projection value and the enum of domain statuses is
+    unchanged (ADR-028 § 4). A commitment whose schedule creation failed is genuinely
+    ``PENDING``: what failed is the alarm clock, not the promise, and encoding an
+    infrastructure outcome as a domain status is how the two come to be confused -- and how a
+    domain decision comes to be made on the strength of "AWS did not answer".
+    """
+
+    PENDING_SCHEDULE = "PENDING_SCHEDULE"
+    CREATED = "CREATED"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CommitmentScheduleProjection:
+    """Whether one commitment's one-time schedule exists, and what happened if it does not.
+
+    Mutable and versioned, unlike the commitment it describes. It is created ``PENDING_SCHEDULE``
+    inside the commitment transaction and moved to ``CREATED`` by a separate two-participant
+    transaction after the scheduler answers, so a case is never shown as scheduled on the
+    strength of a call that had not yet been made.
+    """
+
+    namespace: Namespace
+    community_id: CommunityId
+    case_id: CaseId
+    commitment_id: CommitmentId
+    status: CommitmentScheduleStatus
+    schedule_name: str
+    generation: int
+    attempts: int
+    version: int
+    created_at: datetime
+    updated_at: datetime
+    last_error_code: str | None = None
+    schema_version: str = "commitment-schedule/v1"
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.schedule_name) <= 64:
+            raise ValueError("schedule name length is invalid")
+        if self.generation < 1:
+            raise ValueError("schedule generation must be positive")
+        if self.attempts < 0:
+            raise ValueError("attempts cannot be negative")
+        if self.version < 1:
+            raise ValueError("version must be positive")
+        if self.last_error_code is not None and not _SAFE_CODE.fullmatch(self.last_error_code):
+            raise ValueError("schedule error code is not a safe closed code")
+        if self.status is CommitmentScheduleStatus.CREATED and self.last_error_code is not None:
+            raise ValueError("a created schedule carries no failure code")
+        require_utc(self.created_at)
+        require_utc(self.updated_at)
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at precedes created_at")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class VerificationRequest:
+    """The durable form of ``VerificationRequested``, create-only and keyed by generation.
+
+    Being create-only is what makes "exactly one verification request per commitment
+    generation" a property rather than a hope: a duplicate scheduler delivery stages the same
+    key, and the second transaction fails whole rather than asking a person twice.
+    """
+
+    namespace: Namespace
+    community_id: CommunityId
+    case_id: CaseId
+    commitment_id: CommitmentId
+    generation: int
+    due_event_id: UUID
+    requested_at: datetime
+    schema_version: str = "verification-request/v1"
+
+    def __post_init__(self) -> None:
+        if self.generation < 1:
+            raise ValueError("verification request generation must be positive")
+        require_utc(self.requested_at)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SafeInboundMailConfiguration:
+    """The non-secret safe configuration the inbound path is allowed to hold (ADR-026 § 3).
+
+    Composed beside :class:`StoredSafeDestination` rather than added to it, because that record
+    is a field of every stored shareable view and adding a member would change every view hash
+    a compiler already produced.
+
+    The two digests are the whole reason this record exists. The destination-address secret
+    belongs to the sender alone, and the inbound path must not become a second holder, so the
+    sender and recipient comparisons of ADR-026 § 3 are digest comparisons against values that
+    name no mailbox. The residual -- an attacker who already knows an address can confirm it --
+    is accepted in the ADR: the digest is a comparison token, never a credential.
+    """
+
+    destination: StoredSafeDestination
+    destination_address_digest: Sha256Digest
+    inbound_address_digest: Sha256Digest

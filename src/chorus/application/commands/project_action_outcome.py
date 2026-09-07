@@ -8,18 +8,34 @@ fact that settles it: the execution row. That split is what makes "the sender ne
 access" true rather than aspirational, and it is why a worker crash cannot lose a sent result --
 the send is already recorded where the worker can read it.
 
-Four participants, and the second is the one that matters
------------------------------------------------------------
+Five participants, and two of them are the ones that matter
+------------------------------------------------------------
 1. the case ``ACTION_PROPOSED@{v,a} -> ACTIONED@{v+1,a}``, conditional on exact ``version``,
    ``authorization_version``, and ``state``;
 2. a Shareable **ConditionCheck** that the execution is ``SENT`` at its exact version;
-3. the ``action.actioned`` audit event;
-4. the projection commit proof, in the ``EXECUTION`` partition.
+3. the immutable **outbound message locator**, create-only;
+4. the ``action.actioned`` audit event;
+5. the projection commit proof, in the ``EXECUTION`` partition.
 
 Participant 2 is a condition rather than a read because an execution that moved between the
 worker's read and its write would otherwise let a case be marked ``ACTIONED`` on the strength of
 a state it no longer holds. It writes nothing: the execution is the sender's row, and the worker
 has no business changing it.
+
+Participant 3 is Phase 9's one amendment to this transaction
+([ADR-026](../../../../docs/adr/ADR-026-inbound-reply-trust-and-correlation.md) § 3, amending
+[ADR-025](../../../../docs/adr/ADR-025-one-deliberate-ses-attempt.md) § 11). Nothing in the
+repository carried a channel from an outbound send back to a reply: ``chorus_execution`` is an
+SES *message tag* that no recipient ever sees, and ``reply_to_address`` is one fixed address per
+identity with no per-execution component. The locator is that channel, and it is written **here**
+rather than in the send-outcome transaction because that one is run by the sender and this one by
+the application worker -- and never lazily on first reply, because a locator a reply creates is a
+locator a reply controls.
+
+It is additive: no existing participant, field, or condition changes, and ``SENT`` is the only
+state that reaches it. The consequence is deliberate and stated out loud: **a ``SEND_UNKNOWN``
+execution gets no locator, so no reply can attach to it.** An execution the system cannot prove
+it sent is not an execution a promise can answer.
 
 ``authorization_version`` is carried forward unchanged. Recording a send outcome changes no
 fact, status, mandate, or count (ADR-020 SS 2 row 7), and bumping the epoch here would stale
@@ -68,6 +84,7 @@ from chorus.domain.ids import (
 from chorus.domain.state import CaseTransitionContext, transition_case
 from chorus.ports.clock import Clock
 from chorus.ports.idempotency import EntityRef, IdempotencyKey
+from chorus.ports.records import OutboundMessageLocator, StoredSafeDestination
 from chorus.ports.repositories import (
     AuditRepositoryPort,
     CoreRepositoryPort,
@@ -79,8 +96,8 @@ from chorus.ports.unit_of_work import TransactionPlan, UnitOfWork
 
 PROJECTION_TRANSACTION = "project-action-outcome"
 
-PROJECTION_PARTICIPANTS = 4
-"""Case Put, execution ConditionCheck, audit event, and the projection commit proof."""
+PROJECTION_PARTICIPANTS = 5
+"""Case Put, execution ConditionCheck, outbound message locator, audit event, and commit proof."""
 
 ACTIONED_REASON_CODE = "ACTION_SENT"
 
@@ -158,6 +175,13 @@ class ProjectActionOutcome:
     unit_of_work: UnitOfWork
     clock: Clock
     ids: IdGenerator
+    destination: StoredSafeDestination
+    """The deployment's safe registry entry, recorded on the locator as it stood at the send.
+
+    Address-free, like every other copy of it in this system. The locator carries the triple so
+    an inbound reply's sender comparison can be made against the registry state the message
+    actually went out under, rather than against whatever is configured when the reply arrives.
+    """
 
     async def execute(self, command: ProjectActionOutcomeCommand) -> ProjectActionOutcomeResult:
         execution = await self.shareable.load_execution(command.action_scope, command.execution_id)
@@ -224,6 +248,9 @@ class ProjectActionOutcome:
             self.shareable.stage_require_execution(
                 command.action_scope, execution, expected_version=execution.version
             ),
+            self.shareable.stage_create_outbound_message_locator(
+                self._locator(command, execution, now=now)
+            ),
             self.audit.stage_append_case_event(
                 command.scope,
                 self._audit_event(command, case=actioned, execution=execution, now=now),
@@ -263,6 +290,36 @@ class ProjectActionOutcome:
             authorization_version=actioned.authorization_version,
             execution_state=execution.state,
             projected=True,
+        )
+
+    def _locator(
+        self,
+        command: ProjectActionOutcomeCommand,
+        execution: ActionExecution,
+        *,
+        now: datetime,
+    ) -> OutboundMessageLocator:
+        """Build the one index from this send's SES message identifier back to this execution.
+
+        ``sent_at`` is the execution's own ``finished_at`` rather than the projection's clock:
+        the locator records when the message left, not when a worker got round to projecting it.
+        """
+
+        message_id = execution.ses_message_id
+        finished_at = execution.finished_at
+        if message_id is None or finished_at is None:  # pragma: no cover - SENT requires both
+            raise IntegrityError("ACTION_EXECUTION")
+        return OutboundMessageLocator(
+            namespace=command.namespace,
+            community_id=command.community_id,
+            case_id=command.case_id,
+            action_id=command.action_id,
+            execution_id=command.execution_id,
+            ses_message_id=message_id,
+            destination_id=self.destination.destination_id,
+            registry_version=self.destination.registry_version,
+            routing_token=self.destination.routing_token,
+            sent_at=finished_at,
         )
 
     def _key(

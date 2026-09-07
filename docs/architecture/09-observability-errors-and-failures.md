@@ -56,7 +56,8 @@ Strands/OpenTelemetry content capture is disabled. An exporter processor drops `
 | compiler | `compile.started/allowed/denied`, `compile.fact.included/excluded`, `view.persisted`; opaque IDs, rule/reason, scope, hashes |
 | action | `proposal.requested`, `proposal.validated/denied`, `proposal.stale_rejected`, `proposal.persisted`, `proposal.replayed`, `approval.recorded/conflict`, `send.fence.acquired/denied/released`; IDs, hashes, bounded `ActionRejection` codes, and counts only — never claim, request, caveat, subject, or rendered body text |
 | SES | `execution.sending/sent/failed/unknown/reconciled`, `execution.claim.not_owned`; execution ID, safe error, SES ID when known. **Never** the subject, either body, a claim, a caveat, a recipient address, or a reply-to address |
-| commitment | `commitment.created`, `schedule.created/failed`, `commitment.due/replayed/fulfilled/missed`; IDs/generation |
+| inbound reply | `reply.received`, `reply.rejected`; the closed refusal code, the inbound message-ID **hash**, and the correlated execution when correlation got that far. **Never** the sender, recipient, subject, body, or any part of the raw MIME |
+| commitment | `commitment.extracted`, `commitment.created`, `commitment.rejected`, `schedule.created/failed`, `commitment.due/replayed/fulfilled/missed`; IDs, generation, counts, and rejection codes. **Never** the cited span text, the action text, or the obligor label |
 | security | `cross_case.denied`, `private_uri.denied`, `prompt_injection.observed`, `iam.probe.denied`; no malicious content |
 | replay | `idempotency.replay/conflict`, `scheduler.replay`, `lambda.replay`; command/event key hash |
 | worker | `worker.job.mismatch`, `operation.resume.scheduled`, `operation.resumed`, `monitor.batch.noop`; operation/invocation IDs, safe reason codes |
@@ -111,7 +112,7 @@ Domain/application code returns/raises closed typed errors; adapters translate S
 | `AgentTimeoutError` | 504 | one worker retry | no result persisted |
 | `ExternalDependencyError` | 503 | classified | Bedrock/AgentCore/Dynamo/S3/SES definite dependency failure |
 | `PersistenceConflictError` | 409 | safe command restart | optimistic condition failed |
-| `SchedulerFailureError` | 503 | yes by same schedule identity | commitment visible as unscheduled |
+| `SchedulerFailureError` | 503 | yes by the same name and client token; a lost response is reconciled by `GetSchedule` on the exact name, never by a second differently named schedule | the commitment is `PENDING` and its `COMMITMENT_SCHEDULE#c` projection is visibly `PENDING_SCHEDULE` |
 | `SendAmbiguousError` | 409 status projection | **never resend** | execution is `SEND_UNKNOWN`; reconcile only |
 | `IntegrityError` | 500 | no; page operator | stored hash/ownership/schema invariant broken |
 
@@ -189,7 +190,18 @@ Policy denial is not logged as an application error. Unknown exceptions become `
 | private S3 URI accidentally supplied | strict DTO/denylist rejects at boundary; never log or forward | not retryable as-is | no view/proposal | `private_uri.denied`; safe validation message |
 | prompt injection in community message | treat as delimited data; Monitor output still validated | ordinary agent retry only on timeout | text remains private; no authority | injection-observed marker, no content in log |
 | prompt injection in evidence | Investigator may see; no tools/policy authority; compiler lacks export rule | no policy retry | evidence private, excluded | audit says `UNSAFE_EVIDENCE`/`INTERNAL_ONLY` |
-| malicious external reply | bounded untrusted evidence; commitment citations/range/safe-text validation fails | no automatic correction | reply private; no commitment/schedule/action | contract/validation failure visible |
+| a delivery arrives with no transport authenticator wired | `TRANSPORT_UNAVAILABLE`; nothing is decoded | not retryable; Phase 11 owes the authenticator | no evidence, no case write | `reply.rejected`; the delivery is not evidence about anything |
+| forged, foreign-transport, wrong-sender, or wrong-recipient delivery | refused at the attester before any decode or persist | never retried | nothing written anywhere | `reply.rejected` with one of the ten closed codes and no content |
+| a reply that correlates to nothing, to two executions, to a `SEND_UNKNOWN` execution, or to a terminal case | refused whole | never retried | nothing written in the case | `reply.rejected`; `REPLY_UNCORRELATED`, `REPLY_CORRELATION_AMBIGUOUS`, `REPLY_EXECUTION_NOT_SENT`, `REPLY_CASE_TERMINAL` |
+| oversized, attachment-bearing, header-truncated, or HTML-only reply | refused whole; raw bytes not retained and no metadata recorded | not retryable | nothing written | `reply.rejected` |
+| duplicate inbound delivery | the `INGEST_REPLY` record replays the recorded outcome | safe replay | one artifact, one root, one audit event, **zero** extra model calls | `idempotency.replay` |
+| malicious external reply | bounded untrusted evidence; the nine grounding checks fail | no automatic correction | the artifact is stored and private; no commitment, schedule, or action | `commitment.rejected` with per-proposal codes; the idempotency record carries the answer so a redelivery spends no second model pass |
+| extraction crashes or times out | the operation goes `RUNNING→PENDING` and the durable agent-invocation record decides on redelivery | retryable; a committed apply means **zero** model calls | the artifact stands; no partial commitment | `operation.resume.scheduled` |
+| extraction succeeds and the apply commit outcome is unknown | resolved against the plan's own commit proof, never by a blind retry | never a second model call | either the whole commitment transaction or none of it | integrity error if the proof disagrees |
+| watcher fires early, on a stale generation, or for an unknown commitment | success no-op; nothing changes and nothing is rescheduled | the one-time schedule fires again at its own time | commitment unchanged | `commitment.replayed` with `WATCHER_EARLY`/`WATCHER_STALE_GENERATION`/`WATCHER_UNKNOWN_COMMITMENT` |
+| watcher fires for a commitment already `DUE`, `FULFILLED`, `MISSED`, or `CANCELLED` | success no-op | safe replay | one `DUE` transition and one verification request, ever | `commitment.replayed` with `WATCHER_REPLAY` |
+| a non-human actor attempts `FULFILLED`, `MISSED`, or `VERIFYING→READY_FOR_ACTION` | refused by the transition guard | never coerced | commitment and case unchanged | `StateTransitionError`; security audit |
+| a verifier who owns no `ACTIVE` fact in the case | refused before any write | not retryable by that actor | commitment and case unchanged | authorization failure; no enumeration in the response |
 | aggregate below 3 contributors | optional aggregate excluded; required aggregate denies | only after distinct approved contributor added | no under-threshold safe fact | `AGGREGATE_PRIVACY_MIN_NOT_MET` |
 | anonymous fact paired with identity request | identity gate strips neither silently nor combines; requested identity excluded/required deny | new mandate if desired | anonymous view only or deny | separate content/identity reasons |
 | DynamoDB conditional conflict | abort whole transaction; reload current version | command may retry with fresh expected version; same key safe | no partial transaction | 409 conflict and retry/reload hint |

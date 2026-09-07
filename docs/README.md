@@ -83,6 +83,9 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-023](adr/ADR-023-approval-binding-and-immutability.md) | What a human approval binds, why it is immutable, and where consumption lives |
 | [ADR-024](adr/ADR-024-execution-partition-and-sender-boundary.md) | Executions get their own Shareable partition so `W(execution only)` is enforceable by IAM |
 | [ADR-025](adr/ADR-025-one-deliberate-ses-attempt.md) | One deliberate SES attempt: the send order, the fence's real job, and the honest unknown |
+| [ADR-026](adr/ADR-026-inbound-reply-trust-and-correlation.md) | The trusted inbound reply boundary, reply-to-execution correlation, and the immutable inbound artifact |
+| [ADR-027](adr/ADR-027-commitment-extraction-grounding-and-authority.md) | What a model may propose about a reply, what grounds a commitment, and who alone may verify one |
+| [ADR-028](adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) | The deadline watcher: an unsigned event, a re-checked commitment, and the schedule the demo does not fake |
 
 ## Implementation control
 

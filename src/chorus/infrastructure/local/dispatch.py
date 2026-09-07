@@ -59,6 +59,7 @@ class RecordingOperationDispatcher:
     investigations: list[InvestigationOperationJob] = field(default_factory=list)
     proposals: list[ProposeActionOperationJob] = field(default_factory=list)
     sends: list[SendActionOperationJob] = field(default_factory=list)
+    extractions: list[object] = field(default_factory=list)
     failures: int = 0
 
     async def dispatch_monitor(self, job: MonitorOperationJob) -> None:
@@ -85,6 +86,12 @@ class RecordingOperationDispatcher:
             raise DispatchFailedError("the job was not handed over")
         self.sends.append(job)
 
+    async def dispatch_extract_commitment(self, job: object) -> None:
+        if self.failures > 0:
+            self.failures -= 1
+            raise DispatchFailedError("the job was not handed over")
+        self.extractions.append(job)
+
 
 @dataclass(slots=True)
 class InProcessOperationDispatcher:
@@ -94,6 +101,7 @@ class InProcessOperationDispatcher:
     investigator: InvestigationJobRunner | None = None
     proposer: ProposeActionJobRunner | None = None
     sender: SendActionJobRunner | None = None
+    extractor: object | None = None
     _tasks: set[asyncio.Task[object]] = field(default_factory=set, init=False)
     _pending: set[threading.Event] = field(default_factory=set, init=False)
 
@@ -116,6 +124,11 @@ class InProcessOperationDispatcher:
         if self.sender is None:
             raise DispatchFailedError("no send runner is wired to this dispatcher")
         self._run(self.sender.execute(job))
+
+    async def dispatch_extract_commitment(self, job: object) -> None:
+        if self.extractor is None:
+            raise DispatchFailedError("no extraction runner is wired to this dispatcher")
+        self._run(self.extractor.execute(job))  # type: ignore[attr-defined]
 
     def _run(self, coroutine: object) -> None:
         finished = threading.Event()

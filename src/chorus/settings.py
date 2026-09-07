@@ -81,7 +81,34 @@ class Settings(BaseSettings):
     watcher_function_arn: str | None = None
     worker_function_arn: str | None = None
     scheduler_group: str = "chorus-development"
+    scheduler_environment: str = Field(default="dev", pattern=r"^[a-z0-9][a-z0-9-]{0,7}$")
+    """The ``{env}`` segment of the frozen schedule name, bounded at eight characters.
+
+    The frozen format ``chorus-{env}-{namespace_hash8}-{commitment_id}-{generation}`` spends 56
+    of EventBridge Scheduler's 64 name characters on its fixed parts, so the environment word
+    has exactly eight to work with -- and ``development`` is eleven. It is a short deployment
+    token rather than the environment name for that reason and no other; it changes no format,
+    and :func:`chorus.application.services.commitment_schedule.schedule_name` asserts the bound
+    rather than letting a live ``CreateSchedule`` be where it is discovered.
+    """
     scheduler_role_arn: str | None = None
+    inbound_transport: str = "aws:ses-receipt"
+    inbound_source_arn: str | None = None
+    """The receipt rule set the inbound attester requires a delivery to have arrived through.
+
+    ``None`` in every environment Phase 9 ships, because Phase 11 builds the resource. A
+    composition with no ARN builds no attester, so there is nothing for a delivery to reach --
+    which is the same static-now split the SES event boundary already uses.
+    """
+    destination_address_digest: str | None = None
+    inbound_address_digest: str | None = None
+    """The two non-secret comparison tokens of ADR-026 § 3.
+
+    Digests and never addresses: the destination-address secret belongs to the sender alone,
+    and the inbound principal must not become a second holder. They are ordinary deployment
+    configuration in the same class as the safe destination label, the registry version, and
+    the routing token -- non-secret, naming no mailbox, and never accepted as a credential.
+    """
     ses_configuration_set: str = "chorus-development"
     ses_from_identity_id: str = Field(
         default="chorus-demo-sender", min_length=1, max_length=120, pattern=r"^[A-Za-z0-9._:-]+$"

@@ -79,6 +79,9 @@ class EntityType(StrEnum):
     CURRENT_ACTION_POINTER = "CURRENT_ACTION_POINTER"
     ACTION_HISTORY_LOCATOR = "ACTION_HISTORY_LOCATOR"
     COMMITMENT = "COMMITMENT"
+    COMMITMENT_SCHEDULE = "COMMITMENT_SCHEDULE"
+    VERIFICATION_REQUEST = "VERIFICATION_REQUEST"
+    OUTBOUND_MESSAGE_LOCATOR = "OUTBOUND_MESSAGE_LOCATOR"
     AUDIT_EVENT = "AUDIT_EVENT"
     COMPILER_AUDIT_PROJECTION = "COMPILER_AUDIT_PROJECTION"
 
@@ -270,6 +273,23 @@ class ItemReader:
 
     def mapping(self, name: str) -> StoredItem:
         value = self._raw(name)
+        if isinstance(value, tuple) or not isinstance(value, Mapping):
+            raise _fail(self._ref, f"type:{name}")
+        return value
+
+    def optional_mapping(self, name: str) -> StoredItem | None:
+        """Read a nested map that a policy decides whether to write at all.
+
+        Distinct from :meth:`mapping` because ``None`` is a legitimate stored value for an
+        attribute whose presence is decided by the record's own shape -- an evidence item's
+        external source binding is set on exactly the rows that have no resident owner. The
+        attribute is still *consumed* either way, so ``finish`` keeps refusing anything the
+        decoder never looked at.
+        """
+
+        value = self._raw(name)
+        if value is None:
+            return None
         if isinstance(value, tuple) or not isinstance(value, Mapping):
             raise _fail(self._ref, f"type:{name}")
         return value

@@ -9,14 +9,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from uuid import UUID
 
 from chorus.domain.entities import (
     ActionExecution,
     ActionProposal,
     Approval,
     Commitment,
+    CommitmentStatus,
 )
-from chorus.domain.ids import ApprovalId, CommitmentId, ExecutionId, ViewId
+from chorus.domain.ids import ActionId, ApprovalId, CommitmentId, ExecutionId, ViewId
 from chorus.infrastructure.dynamodb import codec_share, keys
 from chorus.infrastructure.dynamodb.codec import ATTR_VERSION, DecodedScope
 from chorus.infrastructure.dynamodb.cursor import SignedCursorCodec
@@ -25,14 +27,17 @@ from chorus.infrastructure.dynamodb.guards import (
     create_operation,
     replace_operation,
     require_same,
+    validate_identity,
     validate_page_scope,
     validate_scope,
 )
 from chorus.ports.errors import (
+    CrossCaseViolationError,
     ModelLimitExceededError,
     NotFoundError,
 )
 from chorus.ports.limits import (
+    BATCH_GET_MAX_KEYS,
     MAX_ACTIONS_PER_CASE,
     MAX_COMMITMENTS_PER_CASE,
     MAX_VIEWS_PER_CASE,
@@ -41,18 +46,22 @@ from chorus.ports.pagination import Page, PageCursor, PageRequest, QueryBinding
 from chorus.ports.records import (
     ActionHistoryLocator,
     ActionPointerExpectation,
+    CommitmentScheduleProjection,
     CurrentActionPointer,
     CurrentViewPointer,
+    OutboundMessageLocator,
     StoredShareableView,
+    VerificationRequest,
     ViewHistoryLocator,
     ViewPointerExpectation,
 )
-from chorus.ports.scopes import ActionScope, CaseScope
+from chorus.ports.scopes import ActionScope, CaseScope, NamespaceScope
 from chorus.ports.storage import (
     AllOf,
     AttributeEqualsNumber,
     AttributeEqualsString,
     CheckItem,
+    ItemCondition,
     ItemKey,
     KeyAbsent,
     PutItem,
@@ -68,6 +77,8 @@ ATTR_VIEW_HASH = "view_hash"
 ATTR_PROPOSAL_HASH = "proposal_hash"
 ATTR_APPROVAL_HASH = "approval_hash"
 ATTR_STATE = "state"
+ATTR_STATUS = "status"
+ATTR_DUE_EVENT_ID = "due_event_id"
 
 
 @dataclass(slots=True)
@@ -216,6 +227,122 @@ class ShareableRepository:
         require_same(commitment.commitment_id, commitment_id, "COMMITMENT")
         require_same(commitment.case_id, scope.case_id, "COMMITMENT")
         return commitment
+
+    async def load_outbound_message_locators(
+        self, scope: NamespaceScope, ses_message_ids: tuple[str, ...]
+    ) -> tuple[OutboundMessageLocator, ...]:
+        """One direct-key batch get over addresses derived from the reply's own identifiers.
+
+        Every returned row is revalidated against the namespace it was asked for *and* against
+        the address its own contents derive, so a row stored under one message identifier that
+        claims a different one is a cross-case violation rather than a correlation.
+
+        Identifiers that resolve nothing are absent from the result rather than an error: a
+        reply's ``References`` names the whole thread, most of which this system never sent.
+        """
+
+        unique = tuple(dict.fromkeys(identifier for identifier in ses_message_ids if identifier))
+        if not unique:
+            return ()
+        if len(unique) > BATCH_GET_MAX_KEYS:
+            raise ModelLimitExceededError("OUTBOUND_MESSAGE_LOCATOR")
+        requested = {
+            codec_share.outbound_message_key(scope.namespace, identifier): identifier
+            for identifier in unique
+        }
+        items = await self.driver.batch_get_items(tuple(requested), consistent=True)
+        locators: list[OutboundMessageLocator] = []
+        for item in items:
+            _, locator = codec_share.decode_outbound_message(item)
+            expected = codec_share.outbound_message_key(locator.namespace, locator.ses_message_id)
+            if expected not in requested:
+                # The row's own contents derive an address nobody asked for. Returning it would
+                # let a locator planted under one identifier answer for another.
+                raise CrossCaseViolationError("OUTBOUND_MESSAGE_LOCATOR")
+            validate_identity(
+                EntityIdentity(
+                    namespace=locator.namespace,
+                    community_id=locator.community_id,
+                    case_id=locator.case_id,
+                ),
+                entity_ref="OUTBOUND_MESSAGE_LOCATOR",
+                namespace=scope.namespace,
+            )
+            locators.append(locator)
+        return tuple(locators)
+
+    async def load_commitment_schedule(
+        self, scope: CaseScope, commitment_id: CommitmentId
+    ) -> CommitmentScheduleProjection | None:
+        key = codec_share.commitment_schedule_key(scope, commitment_id)
+        loaded = await self._get(key, codec_share.decode_commitment_schedule, consistent=True)
+        if loaded is None:
+            return None
+        decoded, projection = loaded
+        validate_scope(
+            decoded,
+            key=key,
+            entity_ref="COMMITMENT_SCHEDULE",
+            namespace=scope.namespace,
+            community_id=scope.community_id,
+            case_id=scope.case_id,
+        )
+        require_same(projection.commitment_id, commitment_id, "COMMITMENT_SCHEDULE")
+        return projection
+
+    async def load_verification_request(
+        self, scope: CaseScope, commitment_id: CommitmentId, *, generation: int
+    ) -> VerificationRequest | None:
+        key = codec_share.verification_request_key(scope, commitment_id, generation)
+        loaded = await self._get(key, codec_share.decode_verification_request, consistent=True)
+        if loaded is None:
+            return None
+        decoded, request = loaded
+        validate_scope(
+            decoded,
+            key=key,
+            entity_ref="VERIFICATION_REQUEST",
+            namespace=scope.namespace,
+            community_id=scope.community_id,
+            case_id=scope.case_id,
+        )
+        require_same(request.commitment_id, commitment_id, "VERIFICATION_REQUEST")
+        return request
+
+    async def load_live_commitment(
+        self, scope: CaseScope, action_id: ActionId
+    ) -> Commitment | None:
+        """The one ``PENDING`` or ``DUE`` commitment for this action, strongly read.
+
+        One bounded strongly consistent query over the case partition's ``COMMITMENT#`` prefix.
+        The frozen per-case cap is twenty, so the whole collection fits one page, and filtering
+        in code avoids a second address for a value whose whole nature is to move.
+        """
+
+        result = await self.driver.query(
+            QueryRequest(
+                table=TableName.SHAREABLE,
+                partition_key=keys.case_partition(scope.namespace, scope.case_id),
+                sort_key=SortKeyBeginsWith(keys.COMMITMENT_SORT_KEY_PREFIX),
+                consistent=True,
+                limit=MAX_COMMITMENTS_PER_CASE,
+            )
+        )
+        live = [CommitmentStatus.PENDING, CommitmentStatus.DUE]
+        for item in result.items:
+            decoded, commitment = codec_share.decode_commitment(item)
+            validate_page_scope(
+                decoded,
+                EntityIdentity(case_id=commitment.case_id),
+                expected_key=codec_share.commitment_key(scope, commitment.commitment_id),
+                entity_ref="COMMITMENT",
+                namespace=scope.namespace,
+                community_id=scope.community_id,
+                case_id=scope.case_id,
+            )
+            if commitment.action_id == action_id and commitment.status in live:
+                return commitment
+        return None
 
     # -- paged reads -------------------------------------------------------------------
 
@@ -525,18 +652,100 @@ class ShareableRepository:
             codec_share.encode_action_history(scope, locator),
         )
 
+    def stage_create_outbound_message_locator(self, locator: OutboundMessageLocator) -> PutItem:
+        return create_operation(
+            codec_share.outbound_message_key(locator.namespace, locator.ses_message_id),
+            codec_share.encode_outbound_message(locator),
+        )
+
     def stage_create_commitment(self, scope: CaseScope, commitment: Commitment) -> PutItem:
         return create_operation(
             codec_share.commitment_key(scope, commitment.commitment_id),
             codec_share.encode_commitment(scope, commitment),
         )
 
-    def stage_update_commitment(
-        self, scope: CaseScope, commitment: Commitment, *, expected_version: int
+    def stage_create_commitment_schedule(
+        self, scope: CaseScope, projection: CommitmentScheduleProjection
+    ) -> PutItem:
+        return create_operation(
+            codec_share.commitment_schedule_key(scope, projection.commitment_id),
+            codec_share.encode_commitment_schedule(scope, projection),
+        )
+
+    def stage_update_commitment_schedule(
+        self, scope: CaseScope, projection: CommitmentScheduleProjection, *, expected_version: int
     ) -> PutItem:
         return replace_operation(
+            codec_share.commitment_schedule_key(scope, projection.commitment_id),
+            codec_share.encode_commitment_schedule(scope, projection),
+            expected_version=expected_version,
+            new_version=projection.version,
+        )
+
+    def stage_create_verification_request(
+        self, scope: CaseScope, request: VerificationRequest
+    ) -> PutItem:
+        return create_operation(
+            codec_share.verification_request_key(scope, request.commitment_id, request.generation),
+            codec_share.encode_verification_request(scope, request),
+        )
+
+    def stage_require_current_action_pointer(
+        self, scope: CaseScope, *, expected: ActionPointerExpectation
+    ) -> CheckItem:
+        """Assert the pointer still stands at this row version and proposal digest.
+
+        A ``CheckItem`` and never a ``PutItem``, for the reason ADR-025 already established for
+        the withdrawal path: the ``FULFILLED`` branch changes nothing about the pointer, and a
+        put that rewrote the row with its own content would be a second, later record of
+        something that did not happen. It also keeps the verification transaction at five
+        participants on both branches, so the count says nothing about which outcome a case
+        took.
+        """
+
+        return CheckItem(
+            key=codec_share.action_pointer_key(scope),
+            condition=AllOf(
+                (
+                    AttributeEqualsNumber(name=ATTR_VERSION, value=expected.row_version),
+                    AttributeEqualsString(
+                        name=ATTR_PROPOSAL_HASH, value=expected.proposal_hash.value
+                    ),
+                )
+            ),
+        )
+
+    def stage_update_commitment(
+        self,
+        scope: CaseScope,
+        commitment: Commitment,
+        *,
+        expected_version: int,
+        expected_status: CommitmentStatus | None = None,
+        expected_due_event_id: UUID | None = None,
+    ) -> PutItem:
+        """Replace the commitment row, guarded on the exact prior state the caller read.
+
+        The OCC version alone is what a human verification needs, because it holds the
+        commitment it strongly read. The watcher needs all three: its event is untrusted, so
+        "this row is still ``PENDING`` and this is still the due event it names" has to be a
+        condition DynamoDB refuses rather than a fact the watcher checked a moment ago
+        (ADR-028 § 3).
+        """
+
+        put = replace_operation(
             codec_share.commitment_key(scope, commitment.commitment_id),
             codec_share.encode_commitment(scope, commitment),
             expected_version=expected_version,
             new_version=commitment.version,
         )
+        extra: list[ItemCondition] = []
+        if expected_status is not None:
+            extra.append(AttributeEqualsString(name=ATTR_STATUS, value=expected_status.value))
+        if expected_due_event_id is not None:
+            extra.append(
+                AttributeEqualsString(name=ATTR_DUE_EVENT_ID, value=str(expected_due_event_id))
+            )
+        if not extra:
+            return put
+        return PutItem(key=put.key, item=put.item, condition=AllOf((put.condition, *extra)))

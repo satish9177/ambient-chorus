@@ -123,6 +123,8 @@ from chorus.ports.records import (
     AgentInvocationResult,
     AgentName,
     ChannelUniquenessLock,
+    CommitmentScheduleProjection,
+    CommitmentScheduleStatus,
     CompileDecisionOutcome,
     CompiledEvidenceRecord,
     CompiledFactRecord,
@@ -138,6 +140,7 @@ from chorus.ports.records import (
     MonitorSnapshotChunk,
     MonitorSnapshotKind,
     MonitorSnapshotManifest,
+    OutboundMessageLocator,
     SendFence,
     StoredCurrentMandatePointer,
     StoredMandateVersionRef,
@@ -146,6 +149,7 @@ from chorus.ports.records import (
     StoredShareableFact,
     StoredShareableView,
     TransformationKind,
+    VerificationRequest,
     ViewHistoryLocator,
 )
 from chorus.ports.retention import AuditRetention
@@ -1104,6 +1108,59 @@ class World:
             version=version,
             created_at=NOW - timedelta(hours=1),
             updated_at=NOW - timedelta(hours=1) + timedelta(minutes=version),
+        )
+
+    def outbound_message(self, *, index: int = 0) -> OutboundMessageLocator:
+        """The immutable correlation locator the action case projection writes at ``SENT``.
+
+        Addressed by the message identifier alone, which is the whole point: a reply knows an
+        ``In-Reply-To`` and nothing else (ADR-026 § 3).
+        """
+
+        return OutboundMessageLocator(
+            namespace=self.namespace,
+            community_id=self.community_id,
+            case_id=self.case_id,
+            action_id=self.action_id,
+            execution_id=self.execution_id,
+            ses_message_id=f"0100019a-fixture-{index}",
+            destination_id=DestinationId("property_manager:demo"),
+            registry_version=1,
+            routing_token=self.uuid(f"routing-token:{index}"),
+            sent_at=NOW - timedelta(hours=2),
+        )
+
+    def commitment_schedule(
+        self, *, version: int = 1, index: int = 0
+    ) -> CommitmentScheduleProjection:
+        """Whether the alarm clock exists. Never a ``CommitmentStatus`` (ADR-028 § 4)."""
+
+        return CommitmentScheduleProjection(
+            namespace=self.namespace,
+            community_id=self.community_id,
+            case_id=self.case_id,
+            commitment_id=self.commitment_id,
+            status=CommitmentScheduleStatus.PENDING_SCHEDULE,
+            schedule_name=f"chorus-test-commitment-{index}",
+            generation=1,
+            attempts=0,
+            version=version,
+            created_at=NOW - timedelta(hours=1),
+            updated_at=NOW - timedelta(hours=1) + timedelta(minutes=version),
+            last_error_code=None,
+        )
+
+    def verification_request(self, *, index: int = 0) -> VerificationRequest:
+        """The durable form of ``VerificationRequested``, create-only per generation."""
+
+        return VerificationRequest(
+            namespace=self.namespace,
+            community_id=self.community_id,
+            case_id=self.case_id,
+            commitment_id=self.commitment_id,
+            generation=1,
+            due_event_id=self.uuid(f"due-event:{index}"),
+            requested_at=NOW,
         )
 
     # -- audit -----------------------------------------------------------------------

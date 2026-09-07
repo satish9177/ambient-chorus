@@ -237,6 +237,9 @@ This is accepted rather than mitigated. Case corroboration is the quantity with 
 
 ## Revisit condition
 
+> **Partially satisfied by [ADR-026](ADR-026-inbound-reply-trust-and-correlation.md).** The immutable authenticated external-source binding this section asks for now exists: it records the destination ID, registry version, and routing token as the registry stood at ingestion, on the stored `EvidenceItem`, and `submitted_by_contributor_id` became nullable rather than management being written into private storage as a resident contributor — the field, not the truth, is what changed. **The allowed verification source set is still empty and `VERIFIED` is still unreachable in policy/v1.** Everything below about what adding a member would require stands unchanged.
+
+
 The allowed verification source set stays empty until an ADR adds a member to it, and **adding one is never automatic**.
 
 A later phase will need an immutable authenticated external-source binding for its own reasons — commitment validation requires knowing which approved destination authored a reply, and [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md) already demands it. That binding must record the approved destination identity (destination ID, registry version, and routing token as they stood at ingestion) durably on the stored evidence, so "which authenticated party authored this" is answerable from the record rather than asserted by a flag. It must **not** model management as a resident contributor; if the existing required-owner field cannot express a non-resident author, the field, not the truth, is what changes.

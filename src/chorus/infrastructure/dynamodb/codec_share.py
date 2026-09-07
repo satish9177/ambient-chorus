@@ -36,6 +36,7 @@ from chorus.domain.ids import (
     EvidenceItemId,
     ExecutionId,
     ExportFactId,
+    Namespace,
     SafeEvidenceRefId,
     Sha256Digest,
     ViewId,
@@ -57,14 +58,18 @@ from chorus.infrastructure.dynamodb.codec import (
 from chorus.infrastructure.dynamodb.codec_core import build_entity_error
 from chorus.ports.records import (
     ActionHistoryLocator,
+    CommitmentScheduleProjection,
+    CommitmentScheduleStatus,
     CurrentActionPointer,
     CurrentViewPointer,
+    OutboundMessageLocator,
     StoredMandateVersionRef,
     StoredSafeDestination,
     StoredSafeEvidenceRef,
     StoredShareableFact,
     StoredShareableView,
     TransformationKind,
+    VerificationRequest,
     ViewHistoryLocator,
 )
 from chorus.ports.scopes import ActionScope, CaseScope
@@ -88,6 +93,9 @@ accepts an item with no authorization epoch, which is the one thing ADR-020 forb
 """
 ACTION_HISTORY_SCHEMA_VERSIONS: Final = frozenset({"action-history-locator/v1"})
 COMMITMENT_SCHEMA_VERSIONS: Final = frozenset({"commitment/v1"})
+COMMITMENT_SCHEDULE_SCHEMA_VERSIONS: Final = frozenset({"commitment-schedule/v1"})
+VERIFICATION_REQUEST_SCHEMA_VERSIONS: Final = frozenset({"verification-request/v1"})
+OUTBOUND_MESSAGE_LOCATOR_SCHEMA_VERSIONS: Final = frozenset({"outbound-message-locator/v1"})
 
 
 def _optional_digest(digest: Sha256Digest | None) -> StoredValue:
@@ -902,3 +910,200 @@ def decode_commitment(item: StoredItem) -> tuple[DecodedScope, Commitment]:
     )
     reader.finish()
     return scope, commitment
+
+
+# ---------------------------------------------------------------------------------------
+# Phase 9: the correlation locator, the schedule projection, and the verification request
+# ---------------------------------------------------------------------------------------
+
+
+def outbound_message_key(namespace: Namespace, ses_message_id: str) -> ItemKey:
+    """The locator address, derived from the message identifier and nothing else.
+
+    Addressable from a reply alone, which is the whole point: the correlation this row exists
+    for starts from an ``In-Reply-To`` and has no action identifier yet. See
+    :func:`chorus.infrastructure.dynamodb.keys.outbound_message_partition` for why this is a
+    partition of its own rather than the sort key ADR-026 § 3 prints.
+    """
+
+    return ItemKey(
+        table=_SHARE,
+        partition_key=keys.outbound_message_partition(namespace, ses_message_id),
+        sort_key=keys.outbound_message_sort_key(),
+    )
+
+
+def encode_outbound_message(locator: OutboundMessageLocator) -> StoredItem:
+    key = outbound_message_key(locator.namespace, locator.ses_message_id)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.OUTBOUND_MESSAGE_LOCATOR,
+        schema_version=locator.schema_version,
+        key=key,
+        namespace=locator.namespace,
+        community_id=locator.community_id,
+        case_id=locator.case_id,
+    )
+    item.update(
+        {
+            "action_id": identifier(locator.action_id),
+            "execution_id": identifier(locator.execution_id),
+            "ses_message_id": locator.ses_message_id,
+            "destination_id": str(locator.destination_id),
+            "registry_version": locator.registry_version,
+            "routing_token": str(locator.routing_token),
+            "sent_at": instant(locator.sent_at),
+        }
+    )
+    return item
+
+
+def decode_outbound_message(item: StoredItem) -> tuple[DecodedScope, OutboundMessageLocator]:
+    reader = ItemReader(item, entity_ref="OUTBOUND_MESSAGE_LOCATOR")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.OUTBOUND_MESSAGE_LOCATOR,
+        accepted_schema_versions=OUTBOUND_MESSAGE_LOCATOR_SCHEMA_VERSIONS,
+    )
+    if scope.community_id is None or scope.case_id is None:
+        raise build_entity_error(reader, "scope")
+    locator = build_entity(
+        reader.entity_ref,
+        OutboundMessageLocator,
+        namespace=scope.namespace,
+        community_id=scope.community_id,
+        case_id=scope.case_id,
+        action_id=reader.identifier("action_id", ActionId),
+        execution_id=reader.identifier("execution_id", ExecutionId),
+        ses_message_id=reader.text("ses_message_id"),
+        destination_id=DestinationId(reader.text("destination_id")),
+        registry_version=reader.number("registry_version"),
+        routing_token=reader.uuid("routing_token"),
+        sent_at=reader.instant("sent_at"),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return scope, locator
+
+
+def commitment_schedule_key(scope: CaseScope, commitment_id: CommitmentId) -> ItemKey:
+    return ItemKey(
+        table=_SHARE,
+        partition_key=keys.case_partition(scope.namespace, scope.case_id),
+        sort_key=keys.commitment_schedule_sort_key(commitment_id),
+    )
+
+
+def encode_commitment_schedule(
+    scope: CaseScope, projection: CommitmentScheduleProjection
+) -> StoredItem:
+    key = commitment_schedule_key(scope, projection.commitment_id)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.COMMITMENT_SCHEDULE,
+        schema_version=projection.schema_version,
+        key=key,
+        namespace=projection.namespace,
+        community_id=projection.community_id,
+        case_id=projection.case_id,
+    )
+    item.update(
+        {
+            "commitment_id": identifier(projection.commitment_id),
+            "status": projection.status.value,
+            "schedule_name": projection.schedule_name,
+            "generation": projection.generation,
+            "attempts": projection.attempts,
+            "last_error_code": projection.last_error_code,
+            "version": projection.version,
+            "created_at": instant(projection.created_at),
+            "updated_at": instant(projection.updated_at),
+        }
+    )
+    return item
+
+
+def decode_commitment_schedule(
+    item: StoredItem,
+) -> tuple[DecodedScope, CommitmentScheduleProjection]:
+    reader = ItemReader(item, entity_ref="COMMITMENT_SCHEDULE")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.COMMITMENT_SCHEDULE,
+        accepted_schema_versions=COMMITMENT_SCHEDULE_SCHEMA_VERSIONS,
+    )
+    if scope.community_id is None or scope.case_id is None:
+        raise build_entity_error(reader, "scope")
+    projection = build_entity(
+        reader.entity_ref,
+        CommitmentScheduleProjection,
+        namespace=scope.namespace,
+        community_id=scope.community_id,
+        case_id=scope.case_id,
+        commitment_id=reader.identifier("commitment_id", CommitmentId),
+        status=reader.enum("status", CommitmentScheduleStatus),
+        schedule_name=reader.text("schedule_name"),
+        generation=reader.number("generation"),
+        attempts=reader.number("attempts"),
+        last_error_code=reader.optional_text("last_error_code"),
+        version=reader.number("version"),
+        created_at=reader.instant("created_at"),
+        updated_at=reader.instant("updated_at"),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return scope, projection
+
+
+def verification_request_key(
+    scope: CaseScope, commitment_id: CommitmentId, generation: int
+) -> ItemKey:
+    return ItemKey(
+        table=_SHARE,
+        partition_key=keys.case_partition(scope.namespace, scope.case_id),
+        sort_key=keys.verification_request_sort_key(commitment_id, generation),
+    )
+
+
+def encode_verification_request(scope: CaseScope, request: VerificationRequest) -> StoredItem:
+    key = verification_request_key(scope, request.commitment_id, request.generation)
+    item: dict[str, StoredValue] = envelope(
+        entity_type=EntityType.VERIFICATION_REQUEST,
+        schema_version=request.schema_version,
+        key=key,
+        namespace=request.namespace,
+        community_id=request.community_id,
+        case_id=request.case_id,
+    )
+    item.update(
+        {
+            "commitment_id": identifier(request.commitment_id),
+            "generation": request.generation,
+            "due_event_id": str(request.due_event_id),
+            "requested_at": instant(request.requested_at),
+        }
+    )
+    return item
+
+
+def decode_verification_request(item: StoredItem) -> tuple[DecodedScope, VerificationRequest]:
+    reader = ItemReader(item, entity_ref="VERIFICATION_REQUEST")
+    scope, schema_version = read_envelope(
+        reader,
+        expected_type=EntityType.VERIFICATION_REQUEST,
+        accepted_schema_versions=VERIFICATION_REQUEST_SCHEMA_VERSIONS,
+    )
+    if scope.community_id is None or scope.case_id is None:
+        raise build_entity_error(reader, "scope")
+    request = build_entity(
+        reader.entity_ref,
+        VerificationRequest,
+        namespace=scope.namespace,
+        community_id=scope.community_id,
+        case_id=scope.case_id,
+        commitment_id=reader.identifier("commitment_id", CommitmentId),
+        generation=reader.number("generation"),
+        due_event_id=reader.uuid("due_event_id"),
+        requested_at=reader.instant("requested_at"),
+        schema_version=schema_version,
+    )
+    reader.finish()
+    return scope, request
