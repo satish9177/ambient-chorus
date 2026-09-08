@@ -20,6 +20,8 @@ from chorus.contracts.monitor import MessageClassification, MonitorOutput
 from chorus.domain.entities import CaseState, CommunityMessage, EvidenceStatus
 from chorus.domain.facts import FactStatus, ReportStatus
 from chorus.domain.ids import MessageId
+from chorus.infrastructure.fixtures.synthetic_feed import SyntheticAmbientAdapter
+from chorus.infrastructure.local.demo_classification import is_reportable_message
 from chorus.infrastructure.local.monitor_agent import (
     LexicalFakeMonitorAgent,
     ScriptedMonitorAgent,
@@ -41,11 +43,28 @@ pytestmark = pytest.mark.anyio
 SIGNAL_CHANNEL_IDS = frozenset(
     {"feed-002", "feed-005", "feed-008", "feed-011", "feed-012", "feed-014", "feed-016"}
 )
-"""The messages a keyword stand-in recognises in the frozen corpus.
+"""The ordinary equipment-failure signals a keyword stand-in recognises in the frozen corpus.
 
 Named here rather than in production code, and used only to assert what the *fake* did. The
 live evaluation makes no such assumption -- it asserts the shape of the discovery, not which
 strings produced it.
+"""
+
+REPORTABLE_CHANNEL_IDS = frozenset(
+    message.channel_message_id
+    for message in SyntheticAmbientAdapter().messages()
+    if is_reportable_message(message.text)
+)
+"""Every frozen-corpus message the stand-in turns into its own report and fact.
+
+Phase 10 extended the fake Monitor so the private incident details already in the corpus
+(feed-004/006/007 -- a family member, a health reaction, a unit number) each become a
+report/fact/feed-signal alongside the seven ordinary equipment signals, so flow-level counts
+-- ``case.report_ids``, persisted report citations, feed signal links, replay stability,
+noise -- are now over this union of signals and sensitive details. Derived here through the
+shared :func:`is_reportable_message` rather than restated; the exact membership of the
+sensitive-detail half is pinned independently in
+``tests/unit/infra/test_demo_classification.py``.
 """
 
 
@@ -64,28 +83,32 @@ async def test_a_repeated_pattern_becomes_one_candidate_case(harness: MonitorHar
     case = await harness.core.load_case(_case_scope(harness, result))
     assert case.state is CaseState.CANDIDATE
     assert case.issue_type == "ELEVATOR_FAILURE"
-    assert len(case.report_ids) == len(SIGNAL_CHANNEL_IDS)
+    assert len(case.report_ids) == len(REPORTABLE_CHANNEL_IDS)
     assert case.corroboration_source_count == 0
 
 
-async def test_every_persisted_report_cites_only_a_signal_message(
+async def test_every_persisted_report_cites_only_a_reportable_message(
     harness: MonitorHarness,
 ) -> None:
-    """Noise stays noise: an unrelated message never becomes part of the case."""
+    """Noise stays noise: an unrelated message never becomes part of the case.
+
+    The stand-in's reports cite exactly the reportable fixture messages -- the seven
+    equipment signals plus the three private incident details -- and nothing else.
+    """
 
     result = await _discover(harness)
     case_scope = _case_scope(harness, result)
     reports = await harness.core.read_case_reports(case_scope, PageRequest(limit=100))
 
     corpus = {message.channel_message_id: message for message in harness.adapter.messages()}
-    signal_sent_at = {corpus[channel_id].sent_at for channel_id in SIGNAL_CHANNEL_IDS}
+    reportable_sent_at = {corpus[channel_id].sent_at for channel_id in REPORTABLE_CHANNEL_IDS}
     cited_sent_at = set()
     for report in reports.items:
         assert report.status is ReportStatus.ACTIVE
         for message_id in report.source_message_ids:
             message = await _message_by_id(harness, message_id)
             cited_sent_at.add(message.sent_at)
-    assert cited_sent_at == signal_sent_at
+    assert cited_sent_at == reportable_sent_at
 
 
 async def test_the_injection_message_produces_no_durable_state(
@@ -140,7 +163,7 @@ async def test_replaying_the_same_invocation_creates_no_duplicates(
     assert again.report_count == 0
     assert again.fact_count == 0
     case = await harness.core.load_case(_case_scope(harness, first))
-    assert len(case.report_ids) == len(SIGNAL_CHANNEL_IDS)
+    assert len(case.report_ids) == len(REPORTABLE_CHANNEL_IDS)
     assert case.version == 1
 
 
@@ -160,8 +183,8 @@ async def test_a_fresh_invocation_over_the_same_feed_is_still_duplicate_free(
     assert second.report_count == 0
     assert second.fact_count == 0
     case = await harness.core.load_case(_case_scope(harness, first))
-    assert len(case.report_ids) == len(SIGNAL_CHANNEL_IDS)
-    assert len(case.fact_ids) == len(SIGNAL_CHANNEL_IDS)
+    assert len(case.report_ids) == len(REPORTABLE_CHANNEL_IDS)
+    assert len(case.fact_ids) == len(REPORTABLE_CHANNEL_IDS)
 
 
 async def test_candidate_identity_is_stable_across_a_reset(harness: MonitorHarness) -> None:
@@ -204,7 +227,7 @@ async def test_a_feed_signal_is_retrievable_for_every_linked_message(
 
     signalled = {item for item in page.items if item.chorus_signal is not None}
     assert len(page.items) == 24
-    assert len(signalled) == len(SIGNAL_CHANNEL_IDS)
+    assert len(signalled) == len(REPORTABLE_CHANNEL_IDS)
     assert {item.chorus_signal.candidate_case_id for item in signalled if item.chorus_signal} == {
         result.created_case_ids[0]
     }
@@ -225,7 +248,7 @@ async def test_the_feed_still_shows_every_unrelated_message(harness: MonitorHarn
     )
 
     unsignalled = [item for item in page.items if item.chorus_signal is None]
-    assert len(unsignalled) == 24 - len(SIGNAL_CHANNEL_IDS)
+    assert len(unsignalled) == 24 - len(REPORTABLE_CHANNEL_IDS)
 
 
 async def test_an_invalid_answer_leaves_no_partial_durable_state(
@@ -338,7 +361,7 @@ async def test_message_classification_covers_every_projected_message(
 
     output = build_lexical_output(agent.invocations[0])
     assert len(output.message_results) == 24
-    assert result.noise_message_count == 24 - len(SIGNAL_CHANNEL_IDS) - 1
+    assert result.noise_message_count == 24 - len(REPORTABLE_CHANNEL_IDS) - 1
     assert {item.classification for item in output.message_results} == {
         MessageClassification.NOISE,
         MessageClassification.POSSIBLE_ISSUE_SIGNAL,
