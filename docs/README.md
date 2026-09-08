@@ -86,9 +86,11 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-026](adr/ADR-026-inbound-reply-trust-and-correlation.md) | The trusted inbound reply boundary, reply-to-execution correlation, and the immutable inbound artifact |
 | [ADR-027](adr/ADR-027-commitment-extraction-grounding-and-authority.md) | What a model may propose about a reply, what grounds a commitment, and who alone may verify one |
 | [ADR-028](adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) | The deadline watcher: an unsigned event, a re-checked commitment, and the schedule the demo does not fake |
+| [ADR-029](adr/ADR-029-deployed-demo-clock-authority.md) | The deployed demo clock: one authoritative logical time the watcher can actually read |
+| [ADR-030](adr/ADR-030-live-ses-receipt-decoding.md) | Decoding a real SES receipt: thread references, correspondent identity, and recipient authority |
 
 ## Implementation control
 
-The detailed plan is [implementation-plan.md](plans/implementation-plan.md). [build-order.md](plans/build-order.md) is the dependency gate, [demo-plan.md](plans/demo-plan.md) is the five-minute live path, [risk-register.md](plans/risk-register.md) records residual risk, and [cut-list.md](plans/cut-list.md) prevents scope drift.
+The detailed plan is [implementation-plan.md](plans/implementation-plan.md). [build-order.md](plans/build-order.md) is the dependency gate, [demo-plan.md](plans/demo-plan.md) is the five-minute live path, [risk-register.md](plans/risk-register.md) records residual risk, and [cut-list.md](plans/cut-list.md) prevents scope drift. [phase-11-deployment-contract.md](plans/phase-11-deployment-contract.md) freezes how the already-decided system is deployed — identity, region, stack DAG, AgentCore contract, live IAM canaries, rollback, cost, and the prerequisites that currently block deployment.
 
 Architecture is ready only when the documents, ADRs, diagrams, failure matrix, and validation report are internally consistent. Application implementation must wait for explicit user approval.

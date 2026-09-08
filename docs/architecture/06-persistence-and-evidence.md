@@ -43,7 +43,7 @@ All application gets/queries include a namespace prefix. Repositories construct 
 | Application operation | `NS#n#OPERATION#o` | `OPERATION` | status/result refs only; direct poll get; demo TTL |
 | Evidence root | `NS#n#COMM#c` | `EVIDENCE_ROOT#{root_sha256}` | dedupe/forward lineage |
 | Evidence root ID locator | `NS#n#COMM#c` | `EVIDENCE_ROOT_ID#{root_id}` | immutable create-only pointer to `root_sha256`; written in the root's own transaction ([ADR-017](../adr/ADR-017-evidence-root-id-locator.md)) |
-| Demo manifest/reset lock | `NS#DEMO` | `DEMO_MANIFEST#{seed_version}` / `DEMO_RESET_LOCK` | exact partition roots, object prefixes, schedules |
+| Demo manifest/reset lock | `NS#DEMO` | `DEMO_MANIFEST#{seed_version}` / `DEMO_RESET_LOCK` | exact partition roots, object prefixes, schedules. The logical clock is **not** here: [ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md) moves it to the Shareable table so the watcher, whose Core deny is total, can read it |
 | Case root | `NS#n#CASE#k` | `CASE` | aggregate/version/state |
 | Report | `NS#n#CASE#k` | `REPORT#r` | private |
 | Fact | `NS#n#CASE#k` | `FACT#f` | private |
@@ -66,6 +66,7 @@ Entity-type partition prefixes deliberately support IAM `dynamodb:LeadingKeys`; 
 
 | Item | PK | SK | Mutability |
 |---|---|---|---|
+| Demo logical clock | `NS#DEMO#CLOCK` | `DEMO_CLOCK` | monotonic; replaced only by a version-guarded compare-and-swap from the application. Read-only to the watcher, which holds no write action on this prefix ([ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md)). Exists in `demo` only |
 | View | `NS#n#VIEW#v` | `VIEW` | immutable; compiler write only |
 | Current view pointer | `NS#n#VIEW_CURRENT#k` | `CURRENT` | compiler conditional replace; `{view_id,hash,case_version,authorization_version,expires_at}`. The application may `ConditionCheckItem` this row and may never write it ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 7) |
 | View history index | `NS#n#VIEW_CURRENT#k` | `HISTORY#{generated_at}#{view_id}` | immutable compiler-written safe locator |
