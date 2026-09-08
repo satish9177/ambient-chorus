@@ -23,7 +23,15 @@ dependencies = [
   "pydantic>=2.12,<3",
   "pydantic-settings>=2.10,<3",
   "rfc8785>=0.1.4,<0.2",
+  # Only the Phase 10 local composition's `chorus-api serve` command imports this -- the
+  # deployed API runs behind API Gateway/Lambda, not uvicorn.
+  "uvicorn>=0.34,<1",
 ]
+
+[project.scripts]
+chorus-api = "chorus.composition.cli_api:main"
+chorus-demo = "chorus.composition.cli_demo:main"
+chorus-openapi = "chorus.composition.cli_openapi:main"
 
 [dependency-groups]
 dev = [

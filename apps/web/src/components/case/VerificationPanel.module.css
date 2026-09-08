@@ -1,0 +1,31 @@
+.panel {
+  border: 1px solid var(--color-private-border);
+  background: var(--color-private-bg);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.actions {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.button {
+  border: 1px solid var(--color-neutral-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-4);
+  font-weight: 600;
+  background: var(--color-surface);
+}
+
+.button[data-variant="fulfilled"] {
+  border-color: var(--color-success-border);
+  color: var(--color-success-text);
+}
+
+.button[data-variant="missed"] {
+  border-color: var(--color-danger-border);
+  color: var(--color-danger-text);
+}

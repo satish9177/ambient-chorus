@@ -1,0 +1,16 @@
+.panel {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-4);
+}
+
+.button {
+  border: 1px solid var(--color-shareable-border);
+  color: var(--color-shareable-strong);
+  background: var(--color-surface);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-4);
+  font-weight: 600;
+}

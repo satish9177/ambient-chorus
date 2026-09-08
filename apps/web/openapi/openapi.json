@@ -1,0 +1,5184 @@
+{
+  "components": {
+    "schemas": {
+      "AdvanceDemoClockRequest": {
+        "additionalProperties": false,
+        "description": "Which commitment to wake the watcher for, and how far to move the clock.",
+        "properties": {
+          "advance_seconds": {
+            "maximum": 5184000.0,
+            "minimum": 1.0,
+            "title": "Advance Seconds",
+            "type": "integer"
+          },
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "commitment_id": {
+            "format": "uuid",
+            "title": "Commitment Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "commitment_id",
+          "advance_seconds"
+        ],
+        "title": "AdvanceDemoClockRequest",
+        "type": "object"
+      },
+      "AlternativeExplanationResponse": {
+        "properties": {
+          "cited_evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Cited Evidence Ids",
+            "type": "array"
+          },
+          "cited_fact_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Cited Fact Ids",
+            "type": "array"
+          },
+          "cited_report_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Cited Report Ids",
+            "type": "array"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          }
+        },
+        "required": [
+          "description",
+          "cited_report_ids",
+          "cited_fact_ids",
+          "cited_evidence_ids"
+        ],
+        "title": "AlternativeExplanationResponse",
+        "type": "object"
+      },
+      "ApprovalDecision": {
+        "enum": [
+          "APPROVED",
+          "REJECTED"
+        ],
+        "title": "ApprovalDecision",
+        "type": "string"
+      },
+      "ApprovalRequest": {
+        "additionalProperties": false,
+        "description": "The frozen approval body, and every field in it is something the human saw.\n\n``expected_action_status`` is deliberately absent: it named a status where the transaction\nconditions on a row version, and two ways to say \"the thing I saw\" is one too many.",
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecision"
+          },
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "expected_execution_version": {
+            "minimum": 1.0,
+            "title": "Expected Execution Version",
+            "type": "integer"
+          },
+          "preview_hash": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Preview Hash",
+            "type": "string"
+          },
+          "proposal_hash": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Proposal Hash",
+            "type": "string"
+          },
+          "view_hash": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "View Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision",
+          "expected_execution_version",
+          "execution_id",
+          "view_hash",
+          "proposal_hash",
+          "preview_hash"
+        ],
+        "title": "ApprovalRequest",
+        "type": "object"
+      },
+      "ApprovalResponse": {
+        "properties": {
+          "approval_hash": {
+            "title": "Approval Hash",
+            "type": "string"
+          },
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "case_state": {
+            "title": "Case State",
+            "type": "string"
+          },
+          "case_version": {
+            "title": "Case Version",
+            "type": "integer"
+          },
+          "decision": {
+            "title": "Decision",
+            "type": "string"
+          },
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "execution_state": {
+            "title": "Execution State",
+            "type": "string"
+          },
+          "execution_version": {
+            "title": "Execution Version",
+            "type": "integer"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "string"
+          },
+          "pointer_status": {
+            "title": "Pointer Status",
+            "type": "string"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "approval_id",
+          "decision",
+          "approval_hash",
+          "expires_at",
+          "execution_id",
+          "execution_state",
+          "execution_version",
+          "pointer_status",
+          "case_state",
+          "case_version",
+          "authorization_version",
+          "replayed"
+        ],
+        "title": "ApprovalResponse",
+        "type": "object"
+      },
+      "AssessmentResponse": {
+        "properties": {
+          "alternative_explanations": {
+            "items": {
+              "$ref": "#/components/schemas/AlternativeExplanationResponse"
+            },
+            "title": "Alternative Explanations",
+            "type": "array"
+          },
+          "assessment_hash": {
+            "title": "Assessment Hash",
+            "type": "string"
+          },
+          "assessment_id": {
+            "format": "uuid",
+            "title": "Assessment Id",
+            "type": "string"
+          },
+          "based_on_case_version": {
+            "title": "Based On Case Version",
+            "type": "integer"
+          },
+          "contradictions": {
+            "items": {
+              "$ref": "#/components/schemas/ContradictionResponse"
+            },
+            "title": "Contradictions",
+            "type": "array"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/FindingResponse"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "independent_source_count": {
+            "title": "Independent Source Count",
+            "type": "integer"
+          },
+          "is_corroborated": {
+            "title": "Is Corroborated",
+            "type": "boolean"
+          },
+          "linkage_decision": {
+            "title": "Linkage Decision",
+            "type": "string"
+          },
+          "recommended_disposition": {
+            "title": "Recommended Disposition",
+            "type": "string"
+          }
+        },
+        "required": [
+          "assessment_id",
+          "based_on_case_version",
+          "linkage_decision",
+          "independent_source_count",
+          "is_corroborated",
+          "recommended_disposition",
+          "assessment_hash",
+          "created_at",
+          "findings",
+          "contradictions",
+          "alternative_explanations"
+        ],
+        "title": "AssessmentResponse",
+        "type": "object"
+      },
+      "AttachmentThumbnailResponse": {
+        "properties": {
+          "caption": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Caption"
+          },
+          "evidence_id": {
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "evidence_id",
+          "media_type",
+          "caption"
+        ],
+        "title": "AttachmentThumbnailResponse",
+        "type": "object"
+      },
+      "AuditDetailsResponse": {
+        "properties": {
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
+          "rule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Id"
+          }
+        },
+        "required": [
+          "count",
+          "rule_id"
+        ],
+        "title": "AuditDetailsResponse",
+        "type": "object"
+      },
+      "AuditEntityRefResponse": {
+        "properties": {
+          "entity_id": {
+            "format": "uuid",
+            "title": "Entity Id",
+            "type": "string"
+          },
+          "entity_type": {
+            "title": "Entity Type",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "entity_type",
+          "entity_id",
+          "version"
+        ],
+        "title": "AuditEntityRefResponse",
+        "type": "object"
+      },
+      "AuditEventResponse": {
+        "properties": {
+          "actor_type": {
+            "title": "Actor Type",
+            "type": "string"
+          },
+          "audit_event_id": {
+            "format": "uuid",
+            "title": "Audit Event Id",
+            "type": "string"
+          },
+          "causation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Causation Id"
+          },
+          "correlation_id": {
+            "format": "uuid",
+            "title": "Correlation Id",
+            "type": "string"
+          },
+          "decision": {
+            "title": "Decision",
+            "type": "string"
+          },
+          "entity_refs": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEntityRefResponse"
+            },
+            "title": "Entity Refs",
+            "type": "array"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "input_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Hash"
+          },
+          "occurred_at": {
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "output_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Hash"
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reason Codes",
+            "type": "array"
+          },
+          "safe_details": {
+            "$ref": "#/components/schemas/AuditDetailsResponse"
+          }
+        },
+        "required": [
+          "audit_event_id",
+          "event_type",
+          "occurred_at",
+          "actor_type",
+          "decision",
+          "reason_codes",
+          "entity_refs",
+          "safe_details",
+          "correlation_id",
+          "causation_id",
+          "input_hash",
+          "output_hash"
+        ],
+        "title": "AuditEventResponse",
+        "type": "object"
+      },
+      "AuditPageResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEventResponse"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "title": "AuditPageResponse",
+        "type": "object"
+      },
+      "CaseHeaderResponse": {
+        "properties": {
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "corroboration_source_count": {
+            "title": "Corroboration Source Count",
+            "type": "integer"
+          },
+          "issue_type": {
+            "title": "Issue Type",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "state_reason_code": {
+            "title": "State Reason Code",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "case_id",
+          "title",
+          "state",
+          "version",
+          "authorization_version",
+          "issue_type",
+          "corroboration_source_count",
+          "state_reason_code"
+        ],
+        "title": "CaseHeaderResponse",
+        "type": "object"
+      },
+      "CaseSurfaceResponse": {
+        "description": "The frozen case surface: the Phase 7 section plus the five Phase 10 completes.\n\n``current_action`` is ``null`` when the case has never held a proposal. That is a state, not\nan error: a case in ``READY_FOR_ACTION`` legitimately has no action yet.\n\nFor ``case_approver``, ``case.title``, ``evidence_summary``, and ``privacy_counts`` are\nomitted -- the private title/fact labels and privacy exclusion reasons stay presenter-only,\nand only view/action-safe fields remain.",
+        "properties": {
+          "case": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CaseHeaderResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "commitments": {
+            "items": {
+              "$ref": "#/components/schemas/CommitmentSafeResponse"
+            },
+            "title": "Commitments",
+            "type": "array"
+          },
+          "current_action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CurrentActionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "current_shareable_view": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShareableCaseViewBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence_summary": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/EvidenceSummaryRowResponse"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Summary"
+          },
+          "privacy_counts": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrivacyCountsResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "case_id",
+          "case",
+          "evidence_summary",
+          "current_shareable_view",
+          "current_action",
+          "commitments",
+          "privacy_counts"
+        ],
+        "title": "CaseSurfaceResponse",
+        "type": "object"
+      },
+      "CaveatProjection": {
+        "properties": {
+          "export_fact_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Export Fact Ids",
+            "type": "array"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "export_fact_ids"
+        ],
+        "title": "CaveatProjection",
+        "type": "object"
+      },
+      "ChorusSignalResponse": {
+        "properties": {
+          "candidate_case_id": {
+            "format": "uuid",
+            "title": "Candidate Case Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "related_count": {
+            "title": "Related Count",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_case_id",
+          "label",
+          "related_count",
+          "status"
+        ],
+        "title": "ChorusSignalResponse",
+        "type": "object"
+      },
+      "ClaimProjection": {
+        "description": "One claim's own text and the short export-fact identifiers it cites.",
+        "properties": {
+          "export_fact_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Export Fact Ids",
+            "type": "array"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "export_fact_ids"
+        ],
+        "title": "ClaimProjection",
+        "type": "object"
+      },
+      "CommitmentSafeResponse": {
+        "description": "Every field of ``Commitment`` except the four deliberately omitted ones.\n\n``source_evidence_id`` and ``due_event_id`` are the correlation/replay identities the\nwatcher authenticates against, ``scheduler_name`` is transport addressing, and\n``verification_evidence_id`` names a private artifact. ``case_id`` and ``schema_version``\nare already carried by the path and the response version.\n\n``schedule_status``/``schedule_last_error_code`` (P2-9) are the safe half of\n``CommitmentScheduleProjection`` -- whether the one-time schedule exists yet, and the one\nclosed code naming why not, never ``schedule_name`` or the due-event/replay identities the\nwatcher itself authenticates against.",
+        "properties": {
+          "action_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action Id"
+          },
+          "action_text": {
+            "title": "Action Text",
+            "type": "string"
+          },
+          "commitment_id": {
+            "format": "uuid",
+            "title": "Commitment Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "due_at": {
+            "title": "Due At",
+            "type": "string"
+          },
+          "obligor": {
+            "title": "Obligor",
+            "type": "string"
+          },
+          "outcome_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome Note"
+          },
+          "schedule_generation": {
+            "title": "Schedule Generation",
+            "type": "integer"
+          },
+          "schedule_last_error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Last Error Code"
+          },
+          "schedule_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Status"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "verification_method": {
+            "title": "Verification Method",
+            "type": "string"
+          },
+          "verified_by_contributor_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified By Contributor Id"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "commitment_id",
+          "action_id",
+          "obligor",
+          "action_text",
+          "due_at",
+          "verification_method",
+          "status",
+          "schedule_generation",
+          "version",
+          "verified_by_contributor_id",
+          "outcome_note",
+          "created_at",
+          "updated_at",
+          "schedule_status",
+          "schedule_last_error_code"
+        ],
+        "title": "CommitmentSafeResponse",
+        "type": "object"
+      },
+      "CompileEvidenceResponse": {
+        "properties": {
+          "derivative_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Derivative Sha256"
+          },
+          "export_handle_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Export Handle Id"
+          },
+          "included": {
+            "title": "Included",
+            "type": "boolean"
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reason Codes",
+            "type": "array"
+          },
+          "source_evidence_id": {
+            "format": "uuid",
+            "title": "Source Evidence Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_evidence_id",
+          "included",
+          "reason_codes",
+          "export_handle_id",
+          "derivative_sha256"
+        ],
+        "title": "CompileEvidenceResponse",
+        "type": "object"
+      },
+      "CompileExplanationResponse": {
+        "properties": {
+          "based_on_case_version": {
+            "title": "Based On Case Version",
+            "type": "integer"
+          },
+          "compile_id": {
+            "format": "uuid",
+            "title": "Compile Id",
+            "type": "string"
+          },
+          "compiler_version": {
+            "title": "Compiler Version",
+            "type": "string"
+          },
+          "decision": {
+            "title": "Decision",
+            "type": "string"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/CompileEvidenceResponse"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/CompileFactResponse"
+            },
+            "title": "Facts",
+            "type": "array"
+          },
+          "policy_version": {
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reason Codes",
+            "type": "array"
+          },
+          "view_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "View Hash"
+          },
+          "view_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "View Id"
+          }
+        },
+        "required": [
+          "compile_id",
+          "decision",
+          "based_on_case_version",
+          "policy_version",
+          "compiler_version",
+          "view_id",
+          "view_hash",
+          "reason_codes",
+          "facts",
+          "evidence"
+        ],
+        "title": "CompileExplanationResponse",
+        "type": "object"
+      },
+      "CompileFactResponse": {
+        "properties": {
+          "export_fact_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Export Fact Ids",
+            "type": "array"
+          },
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          },
+          "granted_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Scope"
+          },
+          "included": {
+            "title": "Included",
+            "type": "boolean"
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reason Codes",
+            "type": "array"
+          },
+          "transformation_rule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transformation Rule Id"
+          }
+        },
+        "required": [
+          "fact_id",
+          "included",
+          "granted_scope",
+          "reason_codes",
+          "export_fact_ids",
+          "transformation_rule_id"
+        ],
+        "title": "CompileFactResponse",
+        "type": "object"
+      },
+      "CompileViewRequest": {
+        "additionalProperties": false,
+        "description": "The frozen ``CompileCommand``, minus everything the server decides for itself.\n\nNamespace, community, and case come from the path and the deployment. The destination, the\npolicy version, and the compiler contract version are configuration. What remains is what\nthe caller genuinely chooses: which compile this is, which case version they believe they\nare compiling, and which of that case's facts and evidence they are asking about.",
+        "properties": {
+          "compile_id": {
+            "format": "uuid",
+            "title": "Compile Id",
+            "type": "string"
+          },
+          "expected_case_version": {
+            "minimum": 1.0,
+            "title": "Expected Case Version",
+            "type": "integer"
+          },
+          "purpose": {
+            "const": "REQUEST_ELEVATOR_REPAIR_AND_RESPONSE",
+            "title": "Purpose",
+            "type": "string"
+          },
+          "requested_evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Requested Evidence Ids",
+            "type": "array"
+          },
+          "requested_facts": {
+            "items": {
+              "$ref": "#/components/schemas/RequestedFactBody"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Requested Facts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "compile_id",
+          "expected_case_version",
+          "requested_facts",
+          "purpose"
+        ],
+        "title": "CompileViewRequest",
+        "type": "object"
+      },
+      "CompileViewResponse": {
+        "properties": {
+          "audit_event_id": {
+            "format": "uuid",
+            "title": "Audit Event Id",
+            "type": "string"
+          },
+          "compile_id": {
+            "format": "uuid",
+            "title": "Compile Id",
+            "type": "string"
+          },
+          "decision": {
+            "const": "ALLOW",
+            "title": "Decision",
+            "type": "string"
+          },
+          "excluded": {
+            "items": {
+              "$ref": "#/components/schemas/ExcludedFactBody"
+            },
+            "title": "Excluded",
+            "type": "array"
+          },
+          "included": {
+            "items": {
+              "$ref": "#/components/schemas/IncludedFactBody"
+            },
+            "title": "Included",
+            "type": "array"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          },
+          "view": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ShareableCaseViewBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "decision",
+          "compile_id",
+          "audit_event_id",
+          "view",
+          "included",
+          "excluded",
+          "replayed"
+        ],
+        "title": "CompileViewResponse",
+        "type": "object"
+      },
+      "ContradictionResponse": {
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "materiality": {
+            "title": "Materiality",
+            "type": "string"
+          },
+          "statement_fact_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Statement Fact Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "statement_fact_ids",
+          "description",
+          "materiality"
+        ],
+        "title": "ContradictionResponse",
+        "type": "object"
+      },
+      "CurrentActionResponse": {
+        "properties": {
+          "action_id": {
+            "format": "uuid",
+            "title": "Action Id",
+            "type": "string"
+          },
+          "approval_authorization_current": {
+            "title": "Approval Authorization Current",
+            "type": "boolean"
+          },
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "case_version": {
+            "title": "Case Version",
+            "type": "integer"
+          },
+          "caveats": {
+            "items": {
+              "$ref": "#/components/schemas/CaveatProjection"
+            },
+            "title": "Caveats",
+            "type": "array"
+          },
+          "claims": {
+            "items": {
+              "$ref": "#/components/schemas/ClaimProjection"
+            },
+            "title": "Claims",
+            "type": "array"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/ExecutionProjection"
+          },
+          "preview": {
+            "$ref": "#/components/schemas/RenderedPreviewProjection"
+          },
+          "proposal_hash": {
+            "title": "Proposal Hash",
+            "type": "string"
+          },
+          "requested_action": {
+            "title": "Requested Action",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          },
+          "tone": {
+            "title": "Tone",
+            "type": "string"
+          },
+          "view_hash": {
+            "title": "View Hash",
+            "type": "string"
+          },
+          "view_id": {
+            "format": "uuid",
+            "title": "View Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id",
+          "status",
+          "view_id",
+          "view_hash",
+          "case_version",
+          "authorization_version",
+          "subject",
+          "claims",
+          "requested_action",
+          "caveats",
+          "tone",
+          "proposal_hash",
+          "preview",
+          "execution",
+          "approval_authorization_current"
+        ],
+        "title": "CurrentActionResponse",
+        "type": "object"
+      },
+      "DeliverFixtureReplyRequest": {
+        "additionalProperties": false,
+        "description": "A closed body with exactly one field. There is nowhere to put a reply.",
+        "properties": {
+          "fixture_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-z0-9-]+$",
+            "title": "Fixture Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fixture_id"
+        ],
+        "title": "DeliverFixtureReplyRequest",
+        "type": "object"
+      },
+      "DemoClockView": {
+        "properties": {
+          "commitment_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commitment Status"
+          },
+          "logical_now": {
+            "title": "Logical Now",
+            "type": "string"
+          },
+          "watcher_outcome": {
+            "title": "Watcher Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "logical_now",
+          "watcher_outcome",
+          "commitment_status"
+        ],
+        "title": "DemoClockView",
+        "type": "object"
+      },
+      "DemoCorpusAttachmentResponse": {
+        "properties": {
+          "byte_length": {
+            "title": "Byte Length",
+            "type": "integer"
+          },
+          "evidence_id": {
+            "format": "uuid",
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "evidence_id",
+          "media_type",
+          "byte_length",
+          "sha256"
+        ],
+        "title": "DemoCorpusAttachmentResponse",
+        "type": "object"
+      },
+      "DemoCorpusMessageResponse": {
+        "description": "One message in exactly the shape `POST /ingest/messages` accepts for a single item.\n\nSo the frontend never needs to reshape this response before replaying it \u2014 see\n`DemoCorpusResponse` (P2-7).",
+        "properties": {
+          "adapter": {
+            "const": "SYNTHETIC",
+            "title": "Adapter",
+            "type": "string"
+          },
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/DemoCorpusAttachmentResponse"
+            },
+            "title": "Attachments",
+            "type": "array"
+          },
+          "channel_message_id": {
+            "title": "Channel Message Id",
+            "type": "string"
+          },
+          "contributor_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contributor Id"
+          },
+          "sent_at": {
+            "title": "Sent At",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapter",
+          "channel_message_id",
+          "contributor_id",
+          "sent_at",
+          "text",
+          "attachments"
+        ],
+        "title": "DemoCorpusMessageResponse",
+        "type": "object"
+      },
+      "DemoCorpusResponse": {
+        "description": "The immutable public ingestion input for the demo corpus, server-owned (P2-7).\n\nBefore this route, the only way a browser could replay the seeded corpus to trigger the\nMonitor was to mirror the checked-in fixture file as a frontend constant -- a second copy\nof `demo/fixtures/elevator-v1/{manifest,feed}.json` that could silently drift from the one\nthe server actually seeds with. This route serves the same\n:class:`~chorus.infrastructure.fixtures.synthetic_feed.SyntheticAmbientAdapter` reset\nitself reads, so a fixture change on the server is picked up by the browser with no\nfrontend change at all.\n\nIt carries no secret: every field here is exactly what `GET /feed` already shows a\npresenter after reset, resolved into the shape `POST /ingest/messages` accepts. It is\npresenter-only and wired only where `reset_demo` is (local/demo compositions), because it\nexists to serve the demo's own replay step and nothing else.",
+        "properties": {
+          "community_id": {
+            "format": "uuid",
+            "title": "Community Id",
+            "type": "string"
+          },
+          "corpus_sha256": {
+            "title": "Corpus Sha256",
+            "type": "string"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/DemoCorpusMessageResponse"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "seed_version": {
+            "title": "Seed Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "seed_version",
+          "corpus_sha256",
+          "community_id",
+          "messages"
+        ],
+        "title": "DemoCorpusResponse",
+        "type": "object"
+      },
+      "EvidenceSummaryRowResponse": {
+        "properties": {
+          "contributor_id": {
+            "format": "uuid",
+            "title": "Contributor Id",
+            "type": "string"
+          },
+          "evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "evidence_status": {
+            "title": "Evidence Status",
+            "type": "string"
+          },
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          },
+          "fact_type": {
+            "title": "Fact Type",
+            "type": "string"
+          },
+          "sensitivity": {
+            "title": "Sensitivity",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fact_id",
+          "fact_type",
+          "sensitivity",
+          "evidence_status",
+          "status",
+          "contributor_id",
+          "evidence_ids",
+          "version"
+        ],
+        "title": "EvidenceSummaryRowResponse",
+        "type": "object"
+      },
+      "ExcludedFactBody": {
+        "description": "Why one requested fact did not travel. Private, and never part of the Action input.",
+        "properties": {
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reason Codes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "fact_id",
+          "reason_codes"
+        ],
+        "title": "ExcludedFactBody",
+        "type": "object"
+      },
+      "ExecutionProjection": {
+        "description": "The safe execution projection. Its absent fields are absent on purpose (ADR-022 \u00a7 1).\n\n``approval_id`` is ``None`` at ``DRAFT`` and the row's own durable value from ``APPROVED``\nonward -- surfaced (P2-4) so a browser that approved a proposal and then reloaded before\nexecuting can read back the exact binding it needs for ``POST .../executions`` instead of\ndepending on the one-time approval response it may no longer hold.",
+        "properties": {
+          "approval_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Id"
+          },
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "execution_id",
+          "state",
+          "version",
+          "approval_id"
+        ],
+        "title": "ExecutionProjection",
+        "type": "object"
+      },
+      "ExecutionRequest": {
+        "additionalProperties": false,
+        "description": "The frozen execute body. Three identifiers and a version; nothing steerable.",
+        "properties": {
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "expected_execution_version": {
+            "minimum": 1.0,
+            "title": "Expected Execution Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "execution_id",
+          "expected_execution_version",
+          "approval_id"
+        ],
+        "title": "ExecutionRequest",
+        "type": "object"
+      },
+      "ExtractionOperationReference": {
+        "properties": {
+          "evidence_id": {
+            "format": "uuid",
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "poll_url": {
+            "title": "Poll Url",
+            "type": "string"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "status",
+          "poll_url",
+          "evidence_id",
+          "replayed"
+        ],
+        "title": "ExtractionOperationReference",
+        "type": "object"
+      },
+      "FactGrantRequest": {
+        "additionalProperties": false,
+        "description": "One fact's content permission. Never identity permission, whatever the scope says.",
+        "properties": {
+          "allow_safe_transformation": {
+            "title": "Allow Safe Transformation",
+            "type": "boolean"
+          },
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          },
+          "max_scope": {
+            "enum": [
+              "INTERNAL_ONLY",
+              "AGGREGATE_ONLY",
+              "ANONYMOUS_CASE",
+              "NAMED_CASE",
+              "EXTERNAL_ACTION"
+            ],
+            "title": "Max Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fact_id",
+          "max_scope",
+          "allow_safe_transformation"
+        ],
+        "title": "FactGrantRequest",
+        "type": "object"
+      },
+      "FactPermissionResponse": {
+        "description": "One fact row. ``wording`` is contributor-facing text, never the fact's own value.",
+        "properties": {
+          "allow_safe_transformation": {
+            "title": "Allow Safe Transformation",
+            "type": "boolean"
+          },
+          "current_scope": {
+            "title": "Current Scope",
+            "type": "string"
+          },
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          },
+          "fact_type": {
+            "title": "Fact Type",
+            "type": "string"
+          },
+          "locked_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Locked Reason"
+          },
+          "policy_maximum_scope": {
+            "title": "Policy Maximum Scope",
+            "type": "string"
+          },
+          "proposed_scope": {
+            "title": "Proposed Scope",
+            "type": "string"
+          },
+          "requires_identity_grant": {
+            "title": "Requires Identity Grant",
+            "type": "boolean"
+          },
+          "wording": {
+            "title": "Wording",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fact_id",
+          "fact_type",
+          "wording",
+          "policy_maximum_scope",
+          "proposed_scope",
+          "current_scope",
+          "allow_safe_transformation",
+          "requires_identity_grant",
+          "locked_reason"
+        ],
+        "title": "FactPermissionResponse",
+        "type": "object"
+      },
+      "FactResponse": {
+        "properties": {
+          "contributor_id": {
+            "format": "uuid",
+            "title": "Contributor Id",
+            "type": "string"
+          },
+          "evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "evidence_status": {
+            "title": "Evidence Status",
+            "type": "string"
+          },
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          },
+          "fact_type": {
+            "title": "Fact Type",
+            "type": "string"
+          },
+          "sensitivity": {
+            "title": "Sensitivity",
+            "type": "string"
+          },
+          "source_message_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Source Message Ids",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "value_preview": {
+            "title": "Value Preview",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fact_id",
+          "fact_type",
+          "sensitivity",
+          "value_preview",
+          "evidence_status",
+          "status",
+          "contributor_id",
+          "evidence_ids",
+          "source_message_ids",
+          "version"
+        ],
+        "title": "FactResponse",
+        "type": "object"
+      },
+      "FeedItemResponse": {
+        "properties": {
+          "attachment_thumbnails": {
+            "items": {
+              "$ref": "#/components/schemas/AttachmentThumbnailResponse"
+            },
+            "title": "Attachment Thumbnails",
+            "type": "array"
+          },
+          "chorus_signal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChorusSignalResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message_id": {
+            "format": "uuid",
+            "title": "Message Id",
+            "type": "string"
+          },
+          "pseudonym": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pseudonym"
+          },
+          "sent_at": {
+            "format": "date-time",
+            "title": "Sent At",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message_id",
+          "sent_at",
+          "pseudonym",
+          "text",
+          "attachment_thumbnails",
+          "chorus_signal"
+        ],
+        "title": "FeedItemResponse",
+        "type": "object"
+      },
+      "FeedResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FeedItemResponse"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "title": "FeedResponse",
+        "type": "object"
+      },
+      "FindingResponse": {
+        "properties": {
+          "evidence_status": {
+            "title": "Evidence Status",
+            "type": "string"
+          },
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          },
+          "reason_code": {
+            "title": "Reason Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fact_id",
+          "evidence_status",
+          "reason_code"
+        ],
+        "title": "FindingResponse",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "IdentityGrantRequest": {
+        "additionalProperties": false,
+        "description": "Identity permission, submitted as its own object and evaluated on its own.",
+        "properties": {
+          "externally_shareable": {
+            "title": "Externally Shareable",
+            "type": "boolean"
+          },
+          "max_scope": {
+            "enum": [
+              "INTERNAL_ONLY",
+              "AGGREGATE_ONLY",
+              "ANONYMOUS_CASE",
+              "NAMED_CASE",
+              "EXTERNAL_ACTION"
+            ],
+            "title": "Max Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "externally_shareable",
+          "max_scope"
+        ],
+        "title": "IdentityGrantRequest",
+        "type": "object"
+      },
+      "IdentityPermissionResponse": {
+        "properties": {
+          "externally_shareable": {
+            "title": "Externally Shareable",
+            "type": "boolean"
+          },
+          "max_scope": {
+            "title": "Max Scope",
+            "type": "string"
+          },
+          "policy_maximum_scope": {
+            "title": "Policy Maximum Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "externally_shareable",
+          "max_scope",
+          "policy_maximum_scope"
+        ],
+        "title": "IdentityPermissionResponse",
+        "type": "object"
+      },
+      "IncludedFactBody": {
+        "properties": {
+          "export_fact_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Export Fact Ids",
+            "type": "array"
+          },
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fact_id",
+          "export_fact_ids"
+        ],
+        "title": "IncludedFactBody",
+        "type": "object"
+      },
+      "IngestAttachmentRequest": {
+        "additionalProperties": false,
+        "description": "Attachment provenance declared by the adapter; bytes are never posted here.",
+        "properties": {
+          "byte_length": {
+            "maximum": 10485760.0,
+            "minimum": 1.0,
+            "title": "Byte Length",
+            "type": "integer"
+          },
+          "evidence_id": {
+            "format": "uuid",
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "media_type": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Media Type",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "evidence_id",
+          "media_type",
+          "byte_length",
+          "sha256"
+        ],
+        "title": "IngestAttachmentRequest",
+        "type": "object"
+      },
+      "IngestMessageRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "adapter": {
+            "const": "SYNTHETIC",
+            "default": "SYNTHETIC",
+            "title": "Adapter",
+            "type": "string"
+          },
+          "attachments": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/IngestAttachmentRequest"
+            },
+            "maxItems": 8,
+            "title": "Attachments",
+            "type": "array"
+          },
+          "channel_message_id": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Channel Message Id",
+            "type": "string"
+          },
+          "contributor_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contributor Id"
+          },
+          "sent_at": {
+            "format": "date-time",
+            "title": "Sent At",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 10000,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel_message_id",
+          "sent_at",
+          "text"
+        ],
+        "title": "IngestMessageRequest",
+        "type": "object"
+      },
+      "IngestMessagesRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "community_id": {
+            "format": "uuid",
+            "title": "Community Id",
+            "type": "string"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/IngestMessageRequest"
+            },
+            "maxItems": 25,
+            "minItems": 1,
+            "title": "Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "community_id",
+          "messages"
+        ],
+        "title": "IngestMessagesRequest",
+        "type": "object"
+      },
+      "IngestMessagesResponse": {
+        "properties": {
+          "accepted_count": {
+            "title": "Accepted Count",
+            "type": "integer"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/IngestedMessageResponse"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/OperationReference"
+          },
+          "replayed_count": {
+            "title": "Replayed Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "messages",
+          "accepted_count",
+          "replayed_count",
+          "operation"
+        ],
+        "title": "IngestMessagesResponse",
+        "type": "object"
+      },
+      "IngestedMessageResponse": {
+        "properties": {
+          "channel_message_id": {
+            "title": "Channel Message Id",
+            "type": "string"
+          },
+          "message_id": {
+            "format": "uuid",
+            "title": "Message Id",
+            "type": "string"
+          },
+          "replay": {
+            "title": "Replay",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "channel_message_id",
+          "message_id",
+          "replay"
+        ],
+        "title": "IngestedMessageResponse",
+        "type": "object"
+      },
+      "InvalidationRequest": {
+        "additionalProperties": false,
+        "description": "Withdraw an approval, or clear a terminal failure. The same body serves both.",
+        "properties": {
+          "expected_execution_version": {
+            "minimum": 1.0,
+            "title": "Expected Execution Version",
+            "type": "integer"
+          },
+          "proposal_hash": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Proposal Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_execution_version",
+          "proposal_hash"
+        ],
+        "title": "InvalidationRequest",
+        "type": "object"
+      },
+      "InvalidationResponse": {
+        "properties": {
+          "action_id": {
+            "format": "uuid",
+            "title": "Action Id",
+            "type": "string"
+          },
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "case_state": {
+            "title": "Case State",
+            "type": "string"
+          },
+          "case_version": {
+            "title": "Case Version",
+            "type": "integer"
+          },
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "execution_state": {
+            "title": "Execution State",
+            "type": "string"
+          },
+          "execution_version": {
+            "title": "Execution Version",
+            "type": "integer"
+          },
+          "pointer_status": {
+            "title": "Pointer Status",
+            "type": "string"
+          },
+          "reason_code": {
+            "title": "Reason Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id",
+          "execution_id",
+          "execution_state",
+          "execution_version",
+          "pointer_status",
+          "case_state",
+          "case_version",
+          "authorization_version",
+          "reason_code"
+        ],
+        "title": "InvalidationResponse",
+        "type": "object"
+      },
+      "InvestigationCaseResponse": {
+        "properties": {
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "corroboration_source_count": {
+            "title": "Corroboration Source Count",
+            "type": "integer"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "case_id",
+          "title",
+          "state",
+          "version",
+          "authorization_version",
+          "corroboration_source_count"
+        ],
+        "title": "InvestigationCaseResponse",
+        "type": "object"
+      },
+      "InvestigationResponse": {
+        "properties": {
+          "assessment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AssessmentResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "case": {
+            "$ref": "#/components/schemas/InvestigationCaseResponse"
+          },
+          "compile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompileExplanationResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/FactResponse"
+            },
+            "title": "Facts",
+            "type": "array"
+          },
+          "reports": {
+            "items": {
+              "$ref": "#/components/schemas/ReportResponse"
+            },
+            "title": "Reports",
+            "type": "array"
+          }
+        },
+        "required": [
+          "case",
+          "reports",
+          "facts",
+          "assessment",
+          "compile"
+        ],
+        "title": "InvestigationResponse",
+        "type": "object"
+      },
+      "MandateDecisionRequest": {
+        "additionalProperties": false,
+        "description": "One contributor's complete answer to one exact mandate version.\n\n``fact_grants`` is the **whole** replacement set for ``ADJUST``, never a patch. A body that\nlisted one fact would otherwise mean \"change this one\" to a reader and \"revoke all the\nothers\" to the server, and the two readings differ by everything.",
+        "properties": {
+          "decision": {
+            "enum": [
+              "APPROVE",
+              "ADJUST",
+              "REFUSE",
+              "REVOKE"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "fact_grants": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/FactGrantRequest"
+            },
+            "maxItems": 100,
+            "title": "Fact Grants",
+            "type": "array"
+          },
+          "identity_grant": {
+            "$ref": "#/components/schemas/IdentityGrantRequest"
+          }
+        },
+        "required": [
+          "expected_version",
+          "decision",
+          "identity_grant"
+        ],
+        "title": "MandateDecisionRequest",
+        "type": "object"
+      },
+      "MandateDecisionResponse": {
+        "properties": {
+          "case_state": {
+            "title": "Case State",
+            "type": "string"
+          },
+          "case_version": {
+            "title": "Case Version",
+            "type": "integer"
+          },
+          "decided_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          },
+          "mandate_id": {
+            "format": "uuid",
+            "title": "Mandate Id",
+            "type": "string"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "supersedes_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Version"
+          },
+          "terms_hash": {
+            "title": "Terms Hash",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mandate_id",
+          "version",
+          "status",
+          "terms_hash",
+          "supersedes_version",
+          "decided_at",
+          "revoked_at",
+          "case_version",
+          "case_state"
+        ],
+        "title": "MandateDecisionResponse",
+        "type": "object"
+      },
+      "MandateThreadResponse": {
+        "properties": {
+          "allowed_destination_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Destination Ids",
+            "type": "array"
+          },
+          "allowed_purposes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Purposes",
+            "type": "array"
+          },
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_state": {
+            "title": "Case State",
+            "type": "string"
+          },
+          "contributor_id": {
+            "format": "uuid",
+            "title": "Contributor Id",
+            "type": "string"
+          },
+          "current_version": {
+            "title": "Current Version",
+            "type": "integer"
+          },
+          "decided_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "fact_permissions": {
+            "items": {
+              "$ref": "#/components/schemas/FactPermissionResponse"
+            },
+            "title": "Fact Permissions",
+            "type": "array"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/MandateVersionResponse"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "identity_permission": {
+            "$ref": "#/components/schemas/IdentityPermissionResponse"
+          },
+          "mandate_id": {
+            "format": "uuid",
+            "title": "Mandate Id",
+            "type": "string"
+          },
+          "proposed_at": {
+            "format": "date-time",
+            "title": "Proposed At",
+            "type": "string"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "terms_hash": {
+            "title": "Terms Hash",
+            "type": "string"
+          },
+          "valid_from": {
+            "format": "date-time",
+            "title": "Valid From",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mandate_id",
+          "case_id",
+          "case_state",
+          "contributor_id",
+          "current_version",
+          "status",
+          "terms_hash",
+          "fact_permissions",
+          "identity_permission",
+          "allowed_destination_ids",
+          "allowed_purposes",
+          "valid_from",
+          "expires_at",
+          "proposed_at",
+          "decided_at",
+          "revoked_at",
+          "history"
+        ],
+        "title": "MandateThreadResponse",
+        "type": "object"
+      },
+      "MandateVersionRefBody": {
+        "properties": {
+          "mandate_id": {
+            "format": "uuid",
+            "title": "Mandate Id",
+            "type": "string"
+          },
+          "terms_hash": {
+            "title": "Terms Hash",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mandate_id",
+          "version",
+          "terms_hash"
+        ],
+        "title": "MandateVersionRefBody",
+        "type": "object"
+      },
+      "MandateVersionResponse": {
+        "properties": {
+          "decided_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "supersedes_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Version"
+          },
+          "terms_hash": {
+            "title": "Terms Hash",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "status",
+          "terms_hash",
+          "decided_at",
+          "revoked_at",
+          "supersedes_version"
+        ],
+        "title": "MandateVersionResponse",
+        "type": "object"
+      },
+      "OperationReference": {
+        "properties": {
+          "operation_id": {
+            "format": "uuid",
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "poll_url": {
+            "title": "Poll Url",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "status",
+          "poll_url"
+        ],
+        "title": "OperationReference",
+        "type": "object"
+      },
+      "OperationResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "result_refs": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Result Refs",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "kind",
+          "status",
+          "result_refs",
+          "error_code",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "OperationResponse",
+        "type": "object"
+      },
+      "PrivacyCountsResponse": {
+        "properties": {
+          "compile_id": {
+            "format": "uuid",
+            "title": "Compile Id",
+            "type": "string"
+          },
+          "denied_by_reason": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Denied By Reason",
+            "type": "object"
+          },
+          "excluded": {
+            "title": "Excluded",
+            "type": "integer"
+          },
+          "included": {
+            "title": "Included",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "compile_id",
+          "included",
+          "excluded",
+          "denied_by_reason"
+        ],
+        "title": "PrivacyCountsResponse",
+        "type": "object"
+      },
+      "ProposeActionRequest": {
+        "additionalProperties": false,
+        "description": "Exactly the three values a caller genuinely chooses.\n\n``view_id`` and ``view_hash`` together are not redundant with the current pointer: they are\nwhat the caller *believes* is current, so a request made against a view a compile has since\nreplaced is refused as stale rather than silently proposed against the newer one.",
+        "properties": {
+          "expected_case_version": {
+            "minimum": 1.0,
+            "title": "Expected Case Version",
+            "type": "integer"
+          },
+          "view_hash": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "View Hash",
+            "type": "string"
+          },
+          "view_id": {
+            "format": "uuid",
+            "title": "View Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_case_version",
+          "view_id",
+          "view_hash"
+        ],
+        "title": "ProposeActionRequest",
+        "type": "object"
+      },
+      "ProposeMandatesRequest": {
+        "additionalProperties": false,
+        "description": "Accept one candidate case. It says nothing about what may be disclosed.",
+        "properties": {
+          "expected_case_version": {
+            "minimum": 1.0,
+            "title": "Expected Case Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_case_version"
+        ],
+        "title": "ProposeMandatesRequest",
+        "type": "object"
+      },
+      "ProposeMandatesResponse": {
+        "properties": {
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_version": {
+            "title": "Case Version",
+            "type": "integer"
+          },
+          "proposals": {
+            "items": {
+              "$ref": "#/components/schemas/ProposedMandateResponse"
+            },
+            "title": "Proposals",
+            "type": "array"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "case_version",
+          "state",
+          "proposals"
+        ],
+        "title": "ProposeMandatesResponse",
+        "type": "object"
+      },
+      "ProposedMandateResponse": {
+        "properties": {
+          "contributor_id": {
+            "format": "uuid",
+            "title": "Contributor Id",
+            "type": "string"
+          },
+          "fact_grant_count": {
+            "title": "Fact Grant Count",
+            "type": "integer"
+          },
+          "mandate_id": {
+            "format": "uuid",
+            "title": "Mandate Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "terms_hash": {
+            "title": "Terms Hash",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mandate_id",
+          "version",
+          "contributor_id",
+          "status",
+          "terms_hash",
+          "fact_grant_count"
+        ],
+        "title": "ProposedMandateResponse",
+        "type": "object"
+      },
+      "RenderedPreviewProjection": {
+        "description": "The regenerated bodies and the digest the proposal committed.\n\n``preview_hash`` is the *committed* value and ``matches_committed_hash`` says whether the\nbytes above still hash to it. Two fields rather than one, because \"these are the bytes\" and\n\"these are the bytes that were approved\" are different claims.",
+        "properties": {
+          "html_body": {
+            "title": "Html Body",
+            "type": "string"
+          },
+          "matches_committed_hash": {
+            "title": "Matches Committed Hash",
+            "type": "boolean"
+          },
+          "preview_hash": {
+            "title": "Preview Hash",
+            "type": "string"
+          },
+          "template_version": {
+            "title": "Template Version",
+            "type": "string"
+          },
+          "text_body": {
+            "title": "Text Body",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template_version",
+          "text_body",
+          "html_body",
+          "preview_hash",
+          "matches_committed_hash"
+        ],
+        "title": "RenderedPreviewProjection",
+        "type": "object"
+      },
+      "ReportResponse": {
+        "properties": {
+          "contributor_id": {
+            "format": "uuid",
+            "title": "Contributor Id",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "report_id": {
+            "format": "uuid",
+            "title": "Report Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "report_id",
+          "contributor_id",
+          "status",
+          "created_at"
+        ],
+        "title": "ReportResponse",
+        "type": "object"
+      },
+      "RequestedFactBody": {
+        "additionalProperties": false,
+        "properties": {
+          "fact_id": {
+            "format": "uuid",
+            "title": "Fact Id",
+            "type": "string"
+          },
+          "intended_usage": {
+            "enum": [
+              "CLAIM",
+              "AGGREGATION_INPUT",
+              "EVIDENCE"
+            ],
+            "title": "Intended Usage",
+            "type": "string"
+          },
+          "necessity": {
+            "enum": [
+              "REQUIRED",
+              "OPTIONAL"
+            ],
+            "title": "Necessity",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fact_id",
+          "necessity",
+          "intended_usage"
+        ],
+        "title": "RequestedFactBody",
+        "type": "object"
+      },
+      "ResetContributorResponse": {
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "contributor_id": {
+            "format": "uuid",
+            "title": "Contributor Id",
+            "type": "string"
+          },
+          "pseudonym": {
+            "title": "Pseudonym",
+            "type": "string"
+          }
+        },
+        "required": [
+          "actor",
+          "pseudonym",
+          "contributor_id"
+        ],
+        "title": "ResetContributorResponse",
+        "type": "object"
+      },
+      "ResetCountsResponse": {
+        "properties": {
+          "contributors": {
+            "title": "Contributors",
+            "type": "integer"
+          },
+          "deleted": {
+            "title": "Deleted",
+            "type": "integer"
+          },
+          "evidence": {
+            "title": "Evidence",
+            "type": "integer"
+          },
+          "messages": {
+            "title": "Messages",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deleted",
+          "messages",
+          "contributors",
+          "evidence"
+        ],
+        "title": "ResetCountsResponse",
+        "type": "object"
+      },
+      "ResetEvidenceResponse": {
+        "properties": {
+          "evidence_id": {
+            "format": "uuid",
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "evidence_id",
+          "media_type",
+          "sha256"
+        ],
+        "title": "ResetEvidenceResponse",
+        "type": "object"
+      },
+      "ResetRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "confirm": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Confirm",
+            "type": "string"
+          },
+          "namespace": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Namespace",
+            "type": "string"
+          },
+          "seed_version": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Seed Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "confirm",
+          "seed_version"
+        ],
+        "title": "ResetRequest",
+        "type": "object"
+      },
+      "ResetResponse": {
+        "properties": {
+          "audit_event_id": {
+            "format": "uuid",
+            "title": "Audit Event Id",
+            "type": "string"
+          },
+          "community_id": {
+            "format": "uuid",
+            "title": "Community Id",
+            "type": "string"
+          },
+          "contributors": {
+            "items": {
+              "$ref": "#/components/schemas/ResetContributorResponse"
+            },
+            "title": "Contributors",
+            "type": "array"
+          },
+          "corpus_sha256": {
+            "title": "Corpus Sha256",
+            "type": "string"
+          },
+          "counts": {
+            "$ref": "#/components/schemas/ResetCountsResponse"
+          },
+          "destination_id": {
+            "title": "Destination Id",
+            "type": "string"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/ResetEvidenceResponse"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "logical_now": {
+            "title": "Logical Now",
+            "type": "string"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          },
+          "reset_id": {
+            "format": "uuid",
+            "title": "Reset Id",
+            "type": "string"
+          },
+          "seed_version": {
+            "title": "Seed Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reset_id",
+          "namespace",
+          "seed_version",
+          "corpus_sha256",
+          "logical_now",
+          "community_id",
+          "destination_id",
+          "contributors",
+          "evidence",
+          "counts",
+          "replayed",
+          "audit_event_id"
+        ],
+        "title": "ResetResponse",
+        "type": "object"
+      },
+      "SafeDestinationBody": {
+        "properties": {
+          "destination_id": {
+            "title": "Destination Id",
+            "type": "string"
+          },
+          "display_label": {
+            "title": "Display Label",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "registry_version": {
+            "title": "Registry Version",
+            "type": "integer"
+          },
+          "routing_token": {
+            "format": "uuid",
+            "title": "Routing Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "destination_id",
+          "kind",
+          "registry_version",
+          "routing_token",
+          "display_label"
+        ],
+        "title": "SafeDestinationBody",
+        "type": "object"
+      },
+      "SessionResponse": {
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Capabilities",
+            "type": "array"
+          },
+          "community_id": {
+            "format": "uuid",
+            "title": "Community Id",
+            "type": "string"
+          },
+          "contributor_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contributor Id"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          }
+        },
+        "required": [
+          "actor",
+          "contributor_id",
+          "community_id",
+          "namespace",
+          "capabilities"
+        ],
+        "title": "SessionResponse",
+        "type": "object"
+      },
+      "ShareableCaseViewBody": {
+        "description": "The safe artifact, rendered field for field. Nothing is added and nothing is dropped.\n\nBoth counters appear, and they mean different things: ``case_version`` is the Core OCC\nversion the view was built beside and is provenance only, while ``authorization_version``\nis the epoch the view is valid against and is what a caller compares before proposing\nagainst it (ADR-020 \u00a7 4).",
+        "properties": {
+          "audit_refs": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Audit Refs",
+            "type": "array"
+          },
+          "authorization_snapshot_hash": {
+            "title": "Authorization Snapshot Hash",
+            "type": "string"
+          },
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "case_id": {
+            "format": "uuid",
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_version": {
+            "title": "Case Version",
+            "type": "integer"
+          },
+          "community_public_label": {
+            "title": "Community Public Label",
+            "type": "string"
+          },
+          "compiler_version": {
+            "title": "Compiler Version",
+            "type": "string"
+          },
+          "destination": {
+            "$ref": "#/components/schemas/SafeDestinationBody"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "string"
+          },
+          "generated_at": {
+            "title": "Generated At",
+            "type": "string"
+          },
+          "mandate_version_set": {
+            "items": {
+              "$ref": "#/components/schemas/MandateVersionRefBody"
+            },
+            "title": "Mandate Version Set",
+            "type": "array"
+          },
+          "policy_version": {
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "purpose": {
+            "title": "Purpose",
+            "type": "string"
+          },
+          "safe_evidence_refs": {
+            "items": {
+              "$ref": "#/components/schemas/ShareableEvidenceRefBody"
+            },
+            "title": "Safe Evidence Refs",
+            "type": "array"
+          },
+          "schema_version": {
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "shareable_facts": {
+            "items": {
+              "$ref": "#/components/schemas/ShareableFactBody"
+            },
+            "title": "Shareable Facts",
+            "type": "array"
+          },
+          "view_hash": {
+            "title": "View Hash",
+            "type": "string"
+          },
+          "view_id": {
+            "format": "uuid",
+            "title": "View Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "view_id",
+          "case_id",
+          "community_public_label",
+          "case_version",
+          "authorization_version",
+          "policy_version",
+          "compiler_version",
+          "destination",
+          "purpose",
+          "generated_at",
+          "expires_at",
+          "mandate_version_set",
+          "authorization_snapshot_hash",
+          "shareable_facts",
+          "safe_evidence_refs",
+          "audit_refs",
+          "view_hash"
+        ],
+        "title": "ShareableCaseViewBody",
+        "type": "object"
+      },
+      "ShareableEvidenceRefBody": {
+        "properties": {
+          "caption": {
+            "title": "Caption",
+            "type": "string"
+          },
+          "content_hash": {
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "created_by_rule_id": {
+            "title": "Created By Rule Id",
+            "type": "string"
+          },
+          "export_handle_id": {
+            "format": "uuid",
+            "title": "Export Handle Id",
+            "type": "string"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          },
+          "safe_evidence_ref_id": {
+            "format": "uuid",
+            "title": "Safe Evidence Ref Id",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "safe_evidence_ref_id",
+          "media_type",
+          "export_handle_id",
+          "sha256",
+          "caption",
+          "created_by_rule_id",
+          "content_hash"
+        ],
+        "title": "ShareableEvidenceRefBody",
+        "type": "object"
+      },
+      "ShareableFactBody": {
+        "properties": {
+          "content_hash": {
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "contributor_count": {
+            "title": "Contributor Count",
+            "type": "integer"
+          },
+          "effective_scope": {
+            "title": "Effective Scope",
+            "type": "string"
+          },
+          "evidence_status": {
+            "title": "Evidence Status",
+            "type": "string"
+          },
+          "export_fact_id": {
+            "format": "uuid",
+            "title": "Export Fact Id",
+            "type": "string"
+          },
+          "fact_type": {
+            "title": "Fact Type",
+            "type": "string"
+          },
+          "safe_evidence_ref_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Safe Evidence Ref Ids",
+            "type": "array"
+          },
+          "safe_text": {
+            "title": "Safe Text",
+            "type": "string"
+          },
+          "transformation": {
+            "title": "Transformation",
+            "type": "string"
+          },
+          "transformation_rule_id": {
+            "title": "Transformation Rule Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "export_fact_id",
+          "fact_type",
+          "safe_text",
+          "effective_scope",
+          "evidence_status",
+          "contributor_count",
+          "transformation",
+          "transformation_rule_id",
+          "safe_evidence_ref_ids",
+          "content_hash"
+        ],
+        "title": "ShareableFactBody",
+        "type": "object"
+      },
+      "StartInvestigationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_case_version": {
+            "minimum": 1.0,
+            "title": "Expected Case Version",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "INITIAL",
+              "NEW_EVIDENCE",
+              "REOPEN"
+            ],
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_case_version",
+          "reason"
+        ],
+        "title": "StartInvestigationRequest",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "VerificationView": {
+        "properties": {
+          "action_pointer_invalidated": {
+            "title": "Action Pointer Invalidated",
+            "type": "boolean"
+          },
+          "case_state": {
+            "title": "Case State",
+            "type": "string"
+          },
+          "case_version": {
+            "title": "Case Version",
+            "type": "integer"
+          },
+          "commitment_id": {
+            "format": "uuid",
+            "title": "Commitment Id",
+            "type": "string"
+          },
+          "commitment_status": {
+            "title": "Commitment Status",
+            "type": "string"
+          },
+          "commitment_version": {
+            "title": "Commitment Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "commitment_id",
+          "commitment_status",
+          "commitment_version",
+          "case_state",
+          "case_version",
+          "action_pointer_invalidated"
+        ],
+        "title": "VerificationView",
+        "type": "object"
+      },
+      "VerifyCommitmentRequest": {
+        "additionalProperties": false,
+        "description": "The frozen verification body. There is deliberately no contributor field.",
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "fixture_evidence_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fixture Evidence Id"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "outcome": {
+            "enum": [
+              "FULFILLED",
+              "MISSED"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_version",
+          "outcome"
+        ],
+        "title": "VerifyCommitmentRequest",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Ambient CHORUS",
+    "version": "0.9.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/cases/{case_id}": {
+      "get": {
+        "description": "Return the authorized safe surface for one case, preview regenerated on read.",
+        "operationId": "read_case_v1_cases__case_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseSurfaceResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Case",
+        "tags": [
+          "cases"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/actions": {
+      "post": {
+        "description": "Create one ``PROPOSE_ACTION`` operation and hand it over. No model is called here.",
+        "operationId": "propose_action_v1_cases__case_id__actions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposeActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationReference"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Propose Action",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/actions/{action_id}/approvals": {
+      "post": {
+        "description": "Record one immutable human decision about one immutable proposal.",
+        "operationId": "approve_action_v1_cases__case_id__actions__action_id__approvals_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Approve Action",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/actions/{action_id}/executions": {
+      "post": {
+        "description": "Create one ``SEND_ACTION`` operation and hand it over. No SES call happens here.\n\n``202`` and a poll, for the same reason the proposal route returns one: an external call is\nnot something an HTTP request should hold a connection open for. The caller reads the\noutcome through the existing operation poll and the existing case surface.",
+        "operationId": "start_execution_v1_cases__case_id__actions__action_id__executions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationReference"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Execution",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/actions/{action_id}/invalidation": {
+      "post": {
+        "description": "Withdraw an approval, or clear a terminal failure, freeing the case for a new proposal.\n\nRefused for ``SENDING``, ``SENT``, and ``SEND_UNKNOWN``, each for its own reason: a send in\nflight cannot be taken back, a sent message cannot be recalled, and an ambiguous outcome is\na quarantine only reconciliation resolves.",
+        "operationId": "invalidate_action_v1_cases__case_id__actions__action_id__invalidation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvalidationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Invalidate Action",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/audit": {
+      "get": {
+        "description": "Page one case's safe audit trail, presenter-only, in occurrence order.",
+        "operationId": "read_case_audit_v1_cases__case_id__audit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditPageResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Case Audit",
+        "tags": [
+          "audit"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/commitments/{commitment_id}/verification": {
+      "post": {
+        "description": "Record one affected contributor's decision. The only source that may resolve a case.",
+        "operationId": "verify_commitment_v1_cases__case_id__commitments__commitment_id__verification_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "commitment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Commitment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyCommitmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerificationView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Commitment",
+        "tags": [
+          "commitments"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/investigation": {
+      "get": {
+        "description": "Presenter-only. Creates nothing; the private half of ``PrivacyBoundaryCompare``.",
+        "operationId": "read_investigation_v1_cases__case_id__investigation_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvestigationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Investigation",
+        "tags": [
+          "investigations"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/investigations": {
+      "post": {
+        "description": "Create one ``INVESTIGATE`` operation and hand it over. No model is called here.",
+        "operationId": "start_investigation_v1_cases__case_id__investigations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartInvestigationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationReference"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Investigation",
+        "tags": [
+          "investigations"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/mandates": {
+      "post": {
+        "description": "Accept a candidate case and ask every contributor it names for a mandate.",
+        "operationId": "propose_mandates_v1_cases__case_id__mandates_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposeMandatesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposeMandatesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Propose Mandates",
+        "tags": [
+          "mandates"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/mandates/{mandate_id}/decisions": {
+      "post": {
+        "description": "Record one immutable authorization decision by the contributor who owns the mandate.",
+        "operationId": "decide_mandate_v1_cases__case_id__mandates__mandate_id__decisions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "mandate_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Mandate Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MandateDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MandateDecisionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Decide Mandate",
+        "tags": [
+          "mandates"
+        ]
+      }
+    },
+    "/v1/cases/{case_id}/views": {
+      "post": {
+        "description": "Compile one safe view, or refuse deterministically. No model is called here.",
+        "operationId": "compile_view_v1_cases__case_id__views_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompileViewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompileViewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Compile View",
+        "tags": [
+          "views"
+        ]
+      }
+    },
+    "/v1/contributors/{contributor_id}/mandates/current": {
+      "get": {
+        "description": "Return one contributor's mandate thread for one case.\n\nA resident may read only their own. Asking for somebody else's answers ``404`` rather than\n``403``, and identically to an identifier that names nobody: a caller who could tell those\napart could enumerate which contributors exist and which of them have mandates in a case\nthey cannot otherwise see.",
+        "operationId": "read_current_mandate_v1_contributors__contributor_id__mandates_current_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "contributor_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Contributor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MandateThreadResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Current Mandate",
+        "tags": [
+          "mandates"
+        ]
+      }
+    },
+    "/v1/demo/clock/advance": {
+      "post": {
+        "description": "Move the logical clock, then invoke the same watcher with the same event.\n\nThe event this route builds is derived from the commitment's own identity and generation --\nit is the value the schedule would have carried -- and the watcher re-verifies every field of\nit against the strongly loaded row. So a presenter can make a deadline arrive and can change\nnothing else: both commitment outcomes still require a contributor.",
+        "operationId": "advance_demo_clock_v1_demo_clock_advance_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdvanceDemoClockRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoClockView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Advance Demo Clock",
+        "tags": [
+          "commitments"
+        ]
+      }
+    },
+    "/v1/demo/corpus": {
+      "get": {
+        "description": "Serve the exact seeded corpus, resolved into the shape ingest already accepts.",
+        "operationId": "read_demo_corpus_v1_demo_corpus_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoCorpusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Demo Corpus",
+        "tags": [
+          "demo"
+        ]
+      }
+    },
+    "/v1/demo/external-replies": {
+      "post": {
+        "description": "Deliver one reviewed fixture through the trust boundary, then start one extraction.",
+        "operationId": "deliver_external_reply_v1_demo_external_replies_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeliverFixtureReplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractionOperationReference"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Deliver External Reply",
+        "tags": [
+          "replies"
+        ]
+      }
+    },
+    "/v1/demo/reset": {
+      "post": {
+        "description": "Delete-and-seed the demo namespace, idempotently, against local adapters.",
+        "operationId": "reset_demo_v1_demo_reset_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 8,
+                  "pattern": "^[\\x20-\\x7e]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Demo",
+        "tags": [
+          "demo"
+        ]
+      }
+    },
+    "/v1/feed": {
+      "get": {
+        "description": "Return one page of ambient messages with any discovered-pattern signal attached.",
+        "operationId": "read_feed_v1_feed_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "community_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Community Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Feed",
+        "tags": [
+          "feed"
+        ]
+      }
+    },
+    "/v1/ingest/messages": {
+      "post": {
+        "description": "Persist a batch of ambient messages and start one Monitor operation over it.",
+        "operationId": "ingest_messages_v1_ingest_messages_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 8,
+              "pattern": "^[\\x20-\\x7e]+$",
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestMessagesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestMessagesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest Messages",
+        "tags": [
+          "ingest"
+        ]
+      }
+    },
+    "/v1/operations/{operation_id}": {
+      "get": {
+        "description": "Return the status of one durable operation.\n\nAgent output is never returned here. ``result_refs`` names the case the validated result\nwas applied to, and the caller reads it through the endpoint that authorizes that case.\n\nThe presenter may inspect any operation, because operating the demo means watching work\nthat other personas started. Everyone else may inspect only their own: an operation\nidentifier is a random UUID, but guessing difficulty is not an authorization boundary, so\nthe actor hash on the record is compared to the caller's.",
+        "operationId": "read_operation_v1_operations__operation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Operation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Operation",
+        "tags": [
+          "feed"
+        ]
+      }
+    },
+    "/v1/session": {
+      "get": {
+        "description": "Resolve the calling persona. Cannot enumerate or name any other persona.",
+        "operationId": "read_session_v1_session_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Chorus-Demo-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Chorus-Demo-Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Session",
+        "tags": [
+          "demo"
+        ]
+      }
+    }
+  }
+}

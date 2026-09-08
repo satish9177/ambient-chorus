@@ -219,3 +219,13 @@ class Uuid5Generator:
     def new_uuid(self) -> UUID:
         self._counter += 1
         return uuid5(self.namespace, f"{self.prefix}:UUID:{self._counter}")
+
+    def reset(self) -> None:
+        """Rewind the counter so the next call reproduces the first identifier again.
+
+        Used only where the whole world the generator fed has been deleted and is about to be
+        re-seeded identically -- the local demo reset -- so that replaying the same corpus
+        yields the same identifiers rather than a fresh sequence.
+        """
+
+        self._counter = 0

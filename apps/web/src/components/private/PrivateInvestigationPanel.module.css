@@ -1,0 +1,72 @@
+.panel {
+  border: 1px solid var(--color-private-border);
+  background: var(--color-private-bg);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  height: 100%;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.title {
+  margin: 0;
+  color: var(--color-private-strong);
+  font-size: 1rem;
+}
+
+.section {
+  margin-top: var(--space-4);
+}
+
+.section h4 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--color-private-strong);
+  margin-bottom: var(--space-2);
+}
+
+.factRow {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--color-private-border) 60%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  margin-bottom: var(--space-2);
+  font-size: 0.88rem;
+}
+
+.factMeta {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+  font-size: 0.76rem;
+  color: var(--color-text-muted);
+}
+
+.contradiction {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-danger-border);
+  background: var(--color-danger-bg);
+  color: var(--color-danger-text);
+  border-radius: var(--radius-sm);
+  margin-bottom: var(--space-2);
+  font-size: 0.88rem;
+}
+
+.excludedRow {
+  padding: var(--space-1) var(--space-2);
+  font-size: 0.8rem;
+  color: var(--color-private-text);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-private-border) 40%, transparent);
+}
+
+.empty {
+  font-size: 0.85rem;
+  color: var(--color-private-text);
+}

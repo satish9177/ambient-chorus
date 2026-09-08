@@ -24,8 +24,9 @@ from chorus.domain.entities import (
     ActionExecutionState,
     ActionProposal,
     ActionProposalStatus,
+    Approval,
 )
-from chorus.domain.ids import ActionId, ExecutionId, Sha256Digest, ViewId
+from chorus.domain.ids import ActionId, ApprovalId, ExecutionId, Sha256Digest, ViewId
 from chorus.ports.records import CurrentActionPointer, StoredShareableView
 from chorus.ports.repositories import ShareableRepositoryPort
 from chorus.ports.scopes import ActionScope, CaseScope
@@ -38,6 +39,37 @@ class CurrentActionProjection:
     action_id: ActionId
     execution_id: ExecutionId
     execution_state: ActionExecutionState
+    execution_version: int
+    """The row's own OCC version, added in Phase 10 so a browser stops having to guess it.
+
+    ``POST .../approvals``, ``POST .../invalidation``, and ``POST .../executions`` all require
+    ``expected_execution_version``; before this field, no read returned one.
+    """
+
+    approval_id: ApprovalId | None
+    """The durable approval binding, surfaced so a browser can recover from a reload (P2-4).
+
+    ``POST .../executions`` requires ``approval_id`` alongside ``execution_id`` and
+    ``expected_execution_version``, and before this field no read returned it -- a browser that
+    approved a proposal and then reloaded before executing had no way to read back which
+    approval it held, because the id existed only in that one POST's response body. It is the
+    ``ActionExecution`` row's own field (present from ``APPROVED`` onward per ADR-022 § 1's
+    presence table), not a new pointer: ``None`` at ``DRAFT``, and reads back exactly what the
+    approval transaction wrote once the execution has moved past it.
+    """
+
+    approval_authorization_version: int | None
+    """The disclosure-authority epoch recorded on the durable approval, or ``None``.
+
+    Read straight off the ``Approval`` row (its own ``authorization_version`` field, ADR-023
+    SS 1) whenever ``approval_id`` is set, so a reader can be told whether the approval a
+    browser still holds was made against the case's *current* authorization epoch. ``None``
+    before approval, when there is no durable decision to compare. The route turns this into the
+    ``approval_authorization_current`` boolean by comparing it against the case's live
+    ``authorization_version``; nothing here re-derives send-time authority, which the Phase-8
+    fence still owns.
+    """
+
     status: ActionProposalStatus
     view_id: ViewId
     view_hash: Sha256Digest
@@ -84,7 +116,22 @@ class ReadCurrentAction:
         # UUIDv4 and nothing recomputes one from the other.
         execution_id = pointer.execution_id
         execution = await self.shareable.load_execution(action_scope, execution_id)
-        return self._project(pointer, proposal, view, execution_id, execution.state)
+        approval: Approval | None = None
+        if execution.approval_id is not None:
+            # The row carries the binding from APPROVED onward; loading it here is what lets the
+            # read say whether that decision is still current for the case's authorization epoch
+            # (P2), rather than leaving a browser to infer it from unrelated fields.
+            approval = await self.shareable.load_approval(action_scope, execution.approval_id)
+        return self._project(
+            pointer,
+            proposal,
+            view,
+            execution_id,
+            execution.state,
+            execution.version,
+            execution.approval_id,
+            None if approval is None else approval.authorization_version,
+        )
 
     def _project(
         self,
@@ -93,12 +140,18 @@ class ReadCurrentAction:
         view: StoredShareableView,
         execution_id: ExecutionId,
         execution_state: ActionExecutionState,
+        execution_version: int,
+        approval_id: ApprovalId | None,
+        approval_authorization_version: int | None,
     ) -> CurrentActionProjection:
         preview = render_preview(proposal, view, from_identity_id=self.from_identity_id)
         return CurrentActionProjection(
             action_id=proposal.action_id,
             execution_id=execution_id,
             execution_state=execution_state,
+            execution_version=execution_version,
+            approval_id=approval_id,
+            approval_authorization_version=approval_authorization_version,
             status=pointer.status,
             view_id=proposal.view_id,
             view_hash=proposal.view_hash,

@@ -1,0 +1,37 @@
+.card {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  gap: var(--space-4);
+}
+
+.card:last-child {
+  border-bottom: none;
+}
+
+.card[data-linked="true"] {
+  background: color-mix(in srgb, var(--color-shareable-bg) 40%, transparent);
+}
+
+.meta {
+  flex: none;
+  width: 9rem;
+  color: var(--color-text-faint);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.pseudonym {
+  display: block;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.body {
+  flex: 1;
+  min-width: 0;
+}
+
+.text {
+  margin: 0;
+}

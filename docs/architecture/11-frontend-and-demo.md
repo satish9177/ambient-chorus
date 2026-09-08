@@ -8,6 +8,21 @@ CSS Modules plus shared CSS custom properties implement a small accessible desig
 
 The browser never computes authoritative hashes, disclosure permission, evidence status, case transition, or send eligibility. It displays server results and submits exact version/hash fields from them. All responses are `no-store`; the token lives in `sessionStorage`, not local storage, logs, query strings, or analytics.
 
+## Generated API types, never hand-written ones
+
+There is exactly one definition of the wire shapes and it is FastAPI's. Two commands, both deterministic and both run in CI:
+
+```text
+uv run chorus-openapi export --out apps/web/openapi/openapi.json
+npm --prefix apps/web run generate:api      # openapi-typescript -> src/api/schema.d.ts
+```
+
+`chorus-openapi export` builds the app from the same local container the dev server uses and writes `app.openapi()` with sorted keys and a trailing newline. The artifact is **committed** at `apps/web/openapi/openapi.json`, and CI re-runs the export and fails on any diff — a generated file that is not checked is a file that silently drifts. The generated types land at `apps/web/src/api/schema.d.ts`, are likewise committed, and are likewise diff-checked.
+
+`apps/web/src/api/client.ts` is the only hand-written API file: one typed `fetch` wrapper that attaches the actor header, the correlation ID, and the idempotency key, and maps Problem Details onto a typed error. It declares **no request or response shapes of its own** — every one is imported from `schema.d.ts`. An ESLint rule forbids declaring an interface for a wire type anywhere under `src/`, because a hand-maintained duplicate of a generated type is a second source of truth that agrees with the first only until someone changes the server.
+
+The private/shareable boundary of § 6 is enforced on top of the generated types: `src/api/private.ts` and `src/api/shareable.ts` re-export disjoint subsets, and `no-restricted-imports` forbids `api/private` inside `components/shareable/**`. The subsets are disjoint by construction — a type that appears in both is a boundary violation and a test asserts the intersection is empty.
+
 ## Exactly three surfaces
 
 ### 1. Ambient Signal Feed (`/`)
@@ -106,6 +121,58 @@ The synthetic feed has exactly 24 messages; order and times are fixed, but the M
 Evidence fixtures are: one JPEG elevator E42 photo, one UTF-8 malicious text document containing the supplied prompt injection, and one RFC822 management reply template: “Technician scheduled Wednesday 10–12.” The photo and malicious document are seeded as private evidence; the management reply file is staged in the fixture catalog but is not ingested/persisted until the live external-reply step. Fixed checksums are part of the seed manifest.
 
 No reset creates a report, fact, candidate case, assessment, mandate proposal/decision, view, action, approval, execution, commitment, schedule, or verification result. Those outcomes run live. Because a mandate is case-specific, all mandate proposals/decisions are live after discovery; the presenter approves safe scopes as seeded Resident A, C, and D, and demonstrates Resident B adjusting health/unit/name to internal while allowing the anonymous incident and photo action scope.
+
+## The local composition root
+
+Before Phase 10 the only place an `ApiContainer` was constructed was `tests/contract/api/conftest.py`, so there was nothing a browser could be pointed at and nothing a Playwright run could drive. Phase 10 owns a real one.
+
+```text
+src/chorus/composition/local.py        build_local_container(settings) -> ApiContainer
+apps/api/chorus_api/asgi.py            app = build_app(build_local_container(Settings()))
+uv run chorus-api serve --port 8080    uvicorn over that factory
+```
+
+It lives under `src/chorus/composition/` rather than under `tests/`, because the harnesses and storage-driver factory that already exist are test fixtures and a shipped entry point may not import them.
+
+What it wires, and what each of those is:
+
+| Slot | Local implementation | Not |
+|---|---|---|
+| storage | in-memory driver, or DynamoDB Local | deployed DynamoDB |
+| object store | `infrastructure/local/objects` | S3 |
+| Monitor / Investigator / Action | `infrastructure/local/*_agent` fakes | AgentCore |
+| commitment extraction | `infrastructure/local/commitment_agent` | AgentCore |
+| sender | `infrastructure/local/sender` filesystem outbox | SES |
+| scheduler | `infrastructure/local/scheduler` manual scheduler | EventBridge Scheduler |
+| inbound replies | `infrastructure/local/inbound_mail` + `fixtures/inbound_delivery` | SES inbound |
+| clock | `LogicalDemoClock` seeded from the manifest | `SystemClock` |
+| dispatcher | `InProcessOperationDispatcher` | worker Lambda |
+
+It requires **no AWS credentials**, makes **no network call**, and reaches **no** SES, AgentCore, EventBridge, S3, or deployed DynamoDB. It also wires the five Phase-9 slots the previous composition left `None` — `verify_commitment`, `inbound_replies`, `record_commitment_due`, `demo_clock`, and `commitments` — which is what moves `POST /demo/external-replies`, `POST /demo/clock/advance`, and `POST .../verification` off their `503` and makes the last four steps of the hero flow reachable at all. Wiring them changes no Phase-9 semantics: the attester still authenticates the fixture through the trust boundary, the watcher still re-verifies every event field against the strongly loaded row, and verification still requires a resident persona owning an `ACTIVE` fact.
+
+The environment gate is the existing `Settings.environment`. `build_local_container` refuses to construct outside `test`, `development`, or `demo`, so the fakes cannot be assembled in a deployed process by configuration accident. Phase 11 deploys this composition against real adapters; it does not write a second one.
+
+## Local hero smoke
+
+One backend-only HTTP test, `tests/smoke/test_local_hero_flow.py`, drives the whole five-minute path against the local composition through the ASGI client and **no browser**. It is the executable form of gate 10→11's "full local smoke", and it exists before the frontend so that a UI failure is never confused with a backend gap.
+
+The sequence, each step asserting the state the demo script claims:
+
+1. `POST /demo/reset` → 24 messages, `logical_now = 2030-01-14T09:00:00Z`, deterministic contributor IDs;
+2. `POST /ingest/messages` (fixture corpus) → poll the Monitor operation to `SUCCEEDED`;
+3. `GET /feed` → a `chorus_signal` naming a `candidate_case_id`;
+4. `POST /cases/{id}/mandates` → per-contributor proposals; `GET /session` per resident persona; `POST .../decisions` with A/C/D approving and **B adjusting** health, unit, and name to `INTERNAL_ONLY` with `externally_shareable: false`;
+5. `POST /cases/{id}/investigations` → poll; `GET /cases/{id}/investigation` shows the contradiction and the resolved evidence statuses;
+6. `GET /cases/{id}` → `state == READY_FOR_ACTION`;
+7. `POST /cases/{id}/views` → `ALLOW`; assert the injected instruction and every `INTERNAL_ONLY` fact are absent from the returned view, and that `excluded` names them with reason codes;
+8. `POST /cases/{id}/actions` → poll; `GET /cases/{id}` returns a preview with `matches_committed_hash: true` and `execution.version`;
+9. `POST .../approvals` as `case_approver` with the exact three hashes and that version;
+10. `POST .../executions` → poll; execution `SENT`; **exactly one** local sender attempt; case `ACTIONED`;
+11. `POST /demo/external-replies` with the manager-promise fixture → poll `EXTRACT_COMMITMENT`; `result_refs` names one commitment; `GET /cases/{id}` shows it `PENDING` with its ISO due date; case `VERIFYING`;
+12. `POST /demo/clock/advance` → `watcher_outcome: DUE`, commitment `DUE`;
+13. `POST .../verification` as the affected resident with `outcome: MISSED` → commitment `MISSED`, case back to `READY_FOR_ACTION`, action pointer invalidated.
+
+The final assertion is the demo's own thesis: `ACTIONED != RESOLVED`. The smoke asserts the secret sentinel never appears in any response body it received across the whole run, which is the network half of the Playwright assertion the UI will later add for the DOM.
 
 ## One-command reset
 

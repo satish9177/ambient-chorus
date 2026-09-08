@@ -7,8 +7,9 @@ an error code, never a command payload, never agent output, and never message te
 
 It is deliberately not a workflow engine. There is no step list, no scheduler, no compensation,
 and no branching. The transitions are the four the frozen model names, plus one narrow
-``RUNNING -> PENDING`` edge for a Monitor operation whose validated apply plan is already
-frozen and whose remaining work is bounded deterministic writes -- see
+``RUNNING -> PENDING`` edge reached only by two kind-restricted resume methods -- for a Monitor
+operation whose validated apply plan is already frozen, and for an ``EXTRACT_COMMITMENT``
+operation whose commitment is durable but whose idempotent schedule step has not taken. See
 :data:`_ALLOWED_TRANSITIONS` for why that edge is not a general retry.
 
 Exclusivity is a condition, not a token
@@ -272,16 +273,19 @@ _ALLOWED_TRANSITIONS: frozenset[tuple[ApplicationOperationStatus, ApplicationOpe
 )
 """The five edges an operation may take, and the narrow reason there is a fifth.
 
-``RUNNING -> PENDING`` exists because a Monitor operation whose validated plan is already
-snapshotted is *finishable*: the model has answered, the answer is frozen, and the only work
-left is bounded deterministic writes against durable state. Recording such an operation as
-``FAILED`` would abandon valid committed state and make the remainder reachable only by a
-human minting a new invocation -- a second pass over private text for work already paid for.
+``RUNNING -> PENDING`` exists because some operations whose model call is already answered and
+frozen are *finishable*: the only work left is bounded deterministic writes against durable
+state. Recording such an operation as ``FAILED`` would abandon valid committed state and make
+the remainder reachable only by a human minting a new invocation -- a second pass over private
+text for work already paid for.
 
 It is deliberately not a general retry edge, and it is deliberately not a new status. Callers
-reach it through :meth:`ApplicationOperations.release_for_resume`, which refuses anything that
-is not a Monitor operation, and the use case only asks for it when a frozen plan exists with
-steps still outstanding. Everything else that ends an attempt still ends it.
+reach it through exactly two kind-restricted methods:
+:meth:`ApplicationOperations.release_for_resume` for a ``MONITOR`` operation whose frozen plan
+still has deterministic writes outstanding, and
+:meth:`ApplicationOperations.release_for_reschedule` for an ``EXTRACT_COMMITMENT`` operation
+whose commitment is durable but whose idempotent ``CreateDueSchedule`` step has not yet taken.
+Both resume without a model call. Everything else that ends an attempt still ends it.
 """
 
 
@@ -628,6 +632,26 @@ class ApplicationOperations:
         """
 
         if operation.kind is not ApplicationOperationKind.MONITOR:
+            raise StateTransitionError(str(operation.operation_id))
+        return await self._transition(operation, ApplicationOperationStatus.PENDING)
+
+    async def release_for_reschedule(self, operation: ApplicationOperation) -> ApplicationOperation:
+        """Return an ``EXTRACT_COMMITMENT`` operation to ``PENDING`` when its commitment is
+        durable but its deadline schedule has not reached ``CREATED``.
+
+        Restricted to ``EXTRACT_COMMITMENT`` by kind, and safe only there: the redelivery
+        resumes through the durable agent-invocation record
+        (:meth:`ExtractCommitment._recovered`) and never re-invokes the model, so the one piece
+        of repeated work is the idempotent ``CreateDueSchedule`` call ADR-028 § 4 makes safe to
+        repeat under the derived schedule name. Every other operation family either re-runs a
+        model on resume or has no external step left to retry, which is why
+        :meth:`release_for_resume` stays ``MONITOR``-only.
+
+        Guarded by the row's own version like every transition: a recovery worker that already
+        drove this attempt to a terminal state keeps it, and this caller loses the race.
+        """
+
+        if operation.kind is not ApplicationOperationKind.EXTRACT_COMMITMENT:
             raise StateTransitionError(str(operation.operation_id))
         return await self._transition(operation, ApplicationOperationStatus.PENDING)
 

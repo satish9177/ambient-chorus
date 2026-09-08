@@ -1,0 +1,45 @@
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-2) var(--space-4);
+  align-items: center;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-private-border);
+  background: var(--color-private-bg);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-3);
+}
+
+.wording {
+  margin: 0;
+  font-weight: 500;
+}
+
+.meta {
+  font-size: 0.8rem;
+  color: var(--color-private-text);
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+}
+
+.locked {
+  font-size: 0.8rem;
+  color: var(--color-danger-text);
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 14rem;
+}
+
+.control label {
+  font-size: 0.75rem;
+  color: var(--color-private-text);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
