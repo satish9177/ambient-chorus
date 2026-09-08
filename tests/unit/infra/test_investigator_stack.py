@@ -23,12 +23,30 @@ from infra.cdk.stacks.agents import (
     DENIED_EVIDENCE_OBJECT_ACTIONS,
     DENIED_OBJECT_MUTATION_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
+    INFERENCE_PROFILE_ARN_CONDITION_KEY,
     INVESTIGATOR_STATEMENT_IDS,
     MONITOR_STATEMENT_IDS,
+    NOVA_2_LITE_BASE_MODEL_ID,
+    US_INFERENCE_PROFILE_DESTINATION_REGIONS,
 )
 
 POLICY_TYPE = "AWS::IAM::Policy"
 ROLE_TYPE = "AWS::IAM::Role"
+
+MONITOR_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-monitor-a1b2c3d4"
+)
+INVESTIGATOR_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-investigator-e5f6"
+)
+ACTION_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-action-99887766"
+)
+PROFILE_ARNS = {
+    "monitor_model_profile_arn": MONITOR_PROFILE_ARN,
+    "investigator_model_profile_arn": INVESTIGATOR_PROFILE_ARN,
+    "action_model_profile_arn": ACTION_PROFILE_ARN,
+}
 
 
 def template(*, artifact_bucket_arn: str | None = None) -> assertions.Template:
@@ -38,6 +56,7 @@ def template(*, artifact_bucket_arn: str | None = None) -> assertions.Template:
         "TestAgents",
         config=CdkBuildConfig(),
         artifact_bucket_arn=artifact_bucket_arn,
+        **PROFILE_ARNS,
     )
     return assertions.Template.from_stack(stack)
 
@@ -63,6 +82,7 @@ def test_the_two_runtimes_have_separate_statement_identifiers() -> None:
 
     fields = (
         "invoke_profile",
+        "invoke_foundation_models",
         "write_logs",
         "emit_traces",
         "read_artifact",
@@ -91,14 +111,35 @@ def test_the_investigator_role_is_assumable_only_by_the_agentcore_service() -> N
 def test_the_investigator_may_invoke_only_its_own_inference_profile() -> None:
     built = template()
     allowed = statement(built, INVESTIGATOR_STATEMENT_IDS.invoke_profile)
-    assert set(allowed["Action"]) == {
+    # I4 / P1-2: BOTH model actions -- the runtime's structured-output call streams.
+    assert actions_of(built, INVESTIGATOR_STATEMENT_IDS.invoke_profile) == {
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
     }
-    resources = allowed["Resource"]
-    rendered = str(resources)
-    assert "chorus-investigator" in rendered
-    assert "chorus-monitor" not in rendered
+    assert allowed["Resource"] == INVESTIGATOR_PROFILE_ARN
+    assert "chorus-monitor" not in str(allowed["Resource"])
+
+
+def test_the_investigator_fm_grant_is_bound_to_its_own_profile_across_three_regions() -> None:
+    built = template()
+    fm = statement(built, INVESTIGATOR_STATEMENT_IDS.invoke_foundation_models)
+
+    assert fm["Effect"] == "Allow"
+    assert actions_of(built, INVESTIGATOR_STATEMENT_IDS.invoke_foundation_models) == {
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+    }
+    assert set(fm["Resource"]) == {
+        f"arn:aws:bedrock:{region}::foundation-model/{NOVA_2_LITE_BASE_MODEL_ID}"
+        for region in US_INFERENCE_PROFILE_DESTINATION_REGIONS
+    }
+    assert all("111122223333" not in arn for arn in fm["Resource"])
+    assert (
+        fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY]
+        == INVESTIGATOR_PROFILE_ARN
+    )
+    assert MONITOR_PROFILE_ARN not in str(fm)
+    assert ACTION_PROFILE_ARN not in str(fm)
 
 
 def test_the_investigator_is_denied_every_data_store() -> None:

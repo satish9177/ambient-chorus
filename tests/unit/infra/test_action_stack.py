@@ -29,15 +29,38 @@ from infra.cdk.stacks.agents import (
     DENIED_EVIDENCE_OBJECT_ACTIONS,
     DENIED_OBJECT_MUTATION_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
+    INFERENCE_PROFILE_ARN_CONDITION_KEY,
+    NOVA_2_LITE_BASE_MODEL_ID,
+    US_INFERENCE_PROFILE_DESTINATION_REGIONS,
 )
 
 POLICY_TYPE = "AWS::IAM::Policy"
 ROLE_TYPE = "AWS::IAM::Role"
 
+MONITOR_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-monitor-a1b2c3d4"
+)
+INVESTIGATOR_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-investigator-e5f6"
+)
+ACTION_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-action-99887766"
+)
+PROFILE_ARNS = {
+    "monitor_model_profile_arn": MONITOR_PROFILE_ARN,
+    "investigator_model_profile_arn": INVESTIGATOR_PROFILE_ARN,
+    "action_model_profile_arn": ACTION_PROFILE_ARN,
+}
+
 
 def template(**kwargs: object) -> assertions.Template:
     app = App()
-    stack = ChorusAgentStack(app, "TestAgents", config=CdkBuildConfig(), **kwargs)  # type: ignore[arg-type]
+    stack = ChorusAgentStack(
+        app,
+        "TestAgents",
+        config=CdkBuildConfig(),
+        **{**PROFILE_ARNS, **kwargs},  # type: ignore[arg-type]
+    )
     return assertions.Template.from_stack(stack)
 
 
@@ -76,11 +99,12 @@ def test_the_role_may_invoke_only_its_own_inference_profile() -> None:
     allowed = statement("InvokeActionInferenceProfileOnly")
 
     assert allowed["Effect"] == "Allow"
-    assert set(allowed["Action"]) == {
+    # I4 / P1-2: BOTH model actions -- the runtime's structured-output call streams.
+    assert actions_of("InvokeActionInferenceProfileOnly") == {
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
     }
-    assert "application-inference-profile/chorus-action" in str(allowed["Resource"])
+    assert allowed["Resource"] == ACTION_PROFILE_ARN
     assert allowed["Resource"] != "*"
 
 
@@ -91,10 +115,30 @@ def test_the_role_cannot_invoke_another_agents_profile() -> None:
     Investigator ran" in the one place that is still true after a compromise.
     """
 
-    resource = str(statement("InvokeActionInferenceProfileOnly")["Resource"])
+    profile = str(statement("InvokeActionInferenceProfileOnly")["Resource"])
+    assert "chorus-monitor" not in profile
+    assert "chorus-investigator" not in profile
 
-    assert "chorus-monitor" not in resource
-    assert "chorus-investigator" not in resource
+    # The FM grant is condition-bound to the Action profile, never another agent's.
+    fm = statement("InvokeActionFoundationModelsViaProfileOnly")
+    bound = fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY]
+    assert bound == ACTION_PROFILE_ARN
+    assert MONITOR_PROFILE_ARN not in str(fm)
+    assert INVESTIGATOR_PROFILE_ARN not in str(fm)
+
+
+def test_the_action_fm_grant_covers_the_three_frozen_us_regions_without_an_account() -> None:
+    fm = statement("InvokeActionFoundationModelsViaProfileOnly")
+
+    assert actions_of("InvokeActionFoundationModelsViaProfileOnly") == {
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+    }
+    assert set(fm["Resource"]) == {
+        f"arn:aws:bedrock:{region}::foundation-model/{NOVA_2_LITE_BASE_MODEL_ID}"
+        for region in US_INFERENCE_PROFILE_DESTINATION_REGIONS
+    }
+    assert all("111122223333" not in arn for arn in fm["Resource"])
 
 
 def test_the_role_writes_only_to_its_own_log_group() -> None:

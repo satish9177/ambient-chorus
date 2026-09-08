@@ -272,3 +272,236 @@ def test_the_application_stack_is_part_of_the_synthesized_app() -> None:
     assembly = build_app().synth()
 
     assert "AmbientChorusApplication" in [stack.stack_name for stack in assembly.stacks]
+
+
+# =====================================================================================
+# I5 -- the request path and the durable worker are two principals, not one
+# =====================================================================================
+
+ROLE_TYPE = "AWS::IAM::Role"
+
+WORKER_FN = "arn:aws:lambda:us-east-1:111122223333:function:chorus-worker-demo"
+COMPILER_FN = "arn:aws:lambda:us-east-1:111122223333:function:chorus-compiler-demo"
+SENDER_FN = "arn:aws:lambda:us-east-1:111122223333:function:chorus-sender-demo"
+RUNTIME_ARNS = (
+    "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_monitor-abc",
+    "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_investigator-def",
+    "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_action-ghi",
+)
+DEMO_SECRET = "arn:aws:secretsmanager:us-east-1:111122223333:secret:chorus-demo-access-AbCdEf"
+DEST_SECRET = "arn:aws:secretsmanager:us-east-1:111122223333:secret:chorus-demo-destination-XyZ"
+SCHEDULER_ROLE_ARN = "arn:aws:iam::111122223333:role/chorus-scheduler-demo"
+
+
+def _split_template() -> assertions.Template:
+    return _template(
+        agent_runtime_arns=RUNTIME_ARNS,
+        scheduler_group_name="chorus-demo",
+        scheduler_role_arn=SCHEDULER_ROLE_ARN,
+        worker_function_arn=WORKER_FN,
+        compiler_function_arn=COMPILER_FN,
+        sender_function_arn=SENDER_FN,
+        demo_access_secret_arn=DEMO_SECRET,
+        destination_registry_secret_arn=DEST_SECRET,
+    )
+
+
+def _role_statements(built: assertions.Template, logical_prefix: str) -> list[Mapping[str, Any]]:
+    """Every policy statement attached to the role whose default policy logical id starts with
+    ``logical_prefix`` (``ApiRole`` / ``WorkerRole``)."""
+
+    found: list[Mapping[str, Any]] = []
+    for logical_id, policy in built.find_resources(POLICY_TYPE).items():
+        if logical_id.startswith(logical_prefix):
+            found.extend(policy["Properties"]["PolicyDocument"]["Statement"])
+    return found
+
+
+def _api(built: assertions.Template) -> list[Mapping[str, Any]]:
+    return _role_statements(built, "ApiRole")
+
+
+def _worker(built: assertions.Template) -> list[Mapping[str, Any]]:
+    return _role_statements(built, "WorkerRole")
+
+
+def _find(items: list[Mapping[str, Any]], sid: str) -> Mapping[str, Any]:
+    return next(item for item in items if item.get("Sid") == sid)
+
+
+def _allowed_actions(items: list[Mapping[str, Any]]) -> set[str]:
+    out: set[str] = set()
+    for item in items:
+        if item["Effect"] == "Allow":
+            out |= actions_of(item)
+    return out
+
+
+def test_the_stack_synthesizes_exactly_two_roles_named_api_and_worker() -> None:
+    built = _split_template()
+    built.resource_count_is(ROLE_TYPE, 2)
+    names = {
+        str(role["Properties"]["RoleName"]) for role in built.find_resources(ROLE_TYPE).values()
+    }
+    assert names == {"chorus-api-development", "chorus-worker-development"}
+
+
+# -- API: ALLOW the request path's capabilities ----------------------------------------
+
+
+def test_api_holds_the_shared_private_zone_boundary() -> None:
+    api = _api(_split_template())
+    allowed = _allowed_actions(api)
+    assert {"dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:ConditionCheckItem"} <= allowed
+    assert {"s3:GetObject", "s3:PutObject"} <= allowed
+    assert {"kms:Decrypt", "kms:GenerateDataKey"} <= allowed
+
+
+def test_api_writes_the_action_and_case_prefixes_but_not_outbound_message() -> None:
+    grant = _find(_api(_split_template()), "WriteApiActionAndCasePrefixesOnly")
+    keys = set(leading_keys(grant))
+    assert keys == {
+        "NS#*#ACTION#*",
+        "NS#*#ACTION_CURRENT#*",
+        "NS#*#EXECUTION#*",
+        "NS#*#CASE#*",
+    }
+    assert "NS#*#OUTBOUND_MESSAGE#*" not in keys
+
+
+def test_api_invokes_the_worker_and_the_compiler_and_nothing_else() -> None:
+    grant = _find(_api(_split_template()), "InvokeOperationWorkerAndCompilerOnly")
+    assert actions_of(grant) == {"lambda:InvokeFunction"}
+    assert set(grant["Resource"]) == {WORKER_FN, COMPILER_FN}
+    assert SENDER_FN not in grant["Resource"]
+
+
+def test_api_reads_the_demo_access_token_secret_only() -> None:
+    grant = _find(_api(_split_template()), "ReadDemoAccessTokenSecretOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"secretsmanager:GetSecretValue"}
+    assert grant["Resource"] == DEMO_SECRET
+
+
+# -- API: DENY / no grant of the worker-only capabilities ------------------------------
+
+
+def test_api_has_no_agentcore_invocation_grant_and_denies_it() -> None:
+    api = _api(_split_template())
+    assert "bedrock-agentcore:InvokeAgentRuntime" not in _allowed_actions(api)
+    deny = _find(api, "DenyApiAgentRuntimeInvocation")
+    assert deny["Effect"] == "Deny"
+    assert "bedrock-agentcore:InvokeAgentRuntime" in actions_of(deny)
+
+
+def test_api_has_no_scheduler_grant_and_denies_scheduler_creation() -> None:
+    api = _api(_split_template())
+    assert not any(a.startswith("scheduler:") for a in _allowed_actions(api))
+    deny = _find(api, "DenyApiSchedulerAuthority")
+    assert deny["Effect"] == "Deny"
+    assert {"scheduler:CreateSchedule", "scheduler:*"} <= actions_of(deny)
+
+
+def test_api_has_no_pass_role_grant_and_denies_it() -> None:
+    api = _api(_split_template())
+    assert "iam:PassRole" not in _allowed_actions(api)
+    deny = _find(api, "DenyApiPassRole")
+    assert deny["Effect"] == "Deny"
+    assert actions_of(deny) == {"iam:PassRole"}
+
+
+def test_api_cannot_read_the_destination_registry_secret() -> None:
+    deny = _find(_api(_split_template()), "DenyApiDestinationRegistrySecret")
+    assert deny["Effect"] == "Deny"
+    assert actions_of(deny) == {"secretsmanager:GetSecretValue"}
+    assert deny["Resource"] == DEST_SECRET
+
+
+# -- Worker: ALLOW the exact worker capabilities --------------------------------------
+
+
+def test_worker_invokes_the_three_named_runtimes() -> None:
+    grant = _find(_worker(_split_template()), "InvokeNamedAgentRuntimesOnly")
+    assert actions_of(grant) == {"bedrock-agentcore:InvokeAgentRuntime"}
+    assert set(grant["Resource"]) == set(RUNTIME_ARNS)
+
+
+def test_worker_invokes_the_compiler_and_the_sender() -> None:
+    grant = _find(_worker(_split_template()), "InvokeCompilerAndSenderOnly")
+    assert actions_of(grant) == {"lambda:InvokeFunction"}
+    assert set(grant["Resource"]) == {COMPILER_FN, SENDER_FN}
+    assert WORKER_FN not in grant["Resource"]
+
+
+def test_worker_writes_the_outbound_message_locator_prefix() -> None:
+    grant = _find(_worker(_split_template()), "WriteActionAndCasePrefixesOnly")
+    assert "NS#*#OUTBOUND_MESSAGE#*" in set(leading_keys(grant))
+
+
+def test_worker_creates_and_gets_schedules_and_passes_the_scheduler_role_alone() -> None:
+    worker = _worker(_split_template())
+    create = _find(worker, "CreateAndGetCommitmentSchedulesOnly")
+    assert actions_of(create) == {"scheduler:CreateSchedule", "scheduler:GetSchedule"}
+    assert "chorus-demo/*" in str(create["Resource"])
+
+    passrole = _find(worker, "PassSchedulerExecutionRoleOnly")
+    assert actions_of(passrole) == {"iam:PassRole"}
+    assert passrole["Resource"] == SCHEDULER_ROLE_ARN
+    assert passrole["Condition"]["StringEquals"]["iam:PassedToService"] == "scheduler.amazonaws.com"
+
+    deny = _find(worker, "DenyScheduleDeletionAndUpdate")
+    assert actions_of(deny) == {"scheduler:DeleteSchedule", "scheduler:UpdateSchedule"}
+
+
+# -- Worker: DENY / no grant of the demo-token secret --------------------------------
+
+
+def test_worker_reads_no_secret_and_denies_the_demo_token_read() -> None:
+    worker = _worker(_split_template())
+    assert not any(a.startswith("secretsmanager:") for a in _allowed_actions(worker))
+    deny = _find(worker, "DenyWorkerSecretReads")
+    assert deny["Effect"] == "Deny"
+    assert actions_of(deny) == {"secretsmanager:GetSecretValue"}
+    assert deny["Resource"] == "*"
+
+
+# -- Both: the earlier negative boundaries are retained on each role -----------------
+
+
+@pytest.mark.parametrize("collect", [_api, _worker], ids=["api", "worker"])
+def test_each_role_retains_the_view_send_and_model_denies(
+    collect: object,
+) -> None:
+    items = collect(_split_template())  # type: ignore[operator]
+    view = _find(items, "DenyViewPartitionWrites")
+    assert view["Effect"] == "Deny"
+    assert set(leading_keys(view)) == set(VIEW_KEY_PREFIXES)
+
+    send = _find(items, "DenyApplicationSend")
+    assert send["Effect"] == "Deny"
+    assert "ses:SendEmail" in actions_of(send)
+
+    model = _find(items, "DenyDirectModelAccess")
+    assert model["Effect"] == "Deny"
+    assert "bedrock:InvokeModel" in actions_of(model)
+
+
+@pytest.mark.parametrize("collect", [_api, _worker], ids=["api", "worker"])
+def test_neither_role_can_write_a_view_prefix(collect: object) -> None:
+    for item in collect(_split_template()):  # type: ignore[operator]
+        if item["Effect"] != "Allow":
+            continue
+        if not actions_of(item) & set(WRITE_ACTIONS):
+            continue
+        assert not (set(leading_keys(item)) & set(VIEW_KEY_PREFIXES)), item.get("Sid")
+
+
+def test_offline_synth_grants_no_lambda_invoke_or_secret_read() -> None:
+    """With no function or secret ARNs supplied (the state ``app.py`` synthesizes today),
+    neither conditional grant appears -- the split is asserted, deployed by nobody."""
+
+    built = _template()
+    for items in (_api(built), _worker(built)):
+        allowed = _allowed_actions(items)
+        assert "lambda:InvokeFunction" not in allowed
+        assert "secretsmanager:GetSecretValue" not in allowed

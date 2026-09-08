@@ -128,6 +128,51 @@ reads a secret to obtain it.
 """
 
 
+# -- I4: Nova 2 Lite through one application inference profile per agent -----------------
+
+NOVA_2_LITE_BASE_MODEL_ID = "amazon.nova-2-lite-v1:0"
+"""The frozen base model (deployment contract § 4). Not substituted, not a Nova Lite fallback."""
+
+NOVA_2_LITE_US_SYSTEM_PROFILE_ID = "us.amazon.nova-2-lite-v1:0"
+"""The US geographic cross-region *system* inference profile each agent's *application*
+profile is derived from. Recorded here for provenance; nothing in this stack invokes it by id --
+the runtime is handed its own application-profile ARN as a discovered deployment input."""
+
+US_INFERENCE_PROFILE_DESTINATION_REGIONS = ("us-east-1", "us-east-2", "us-west-2")
+"""The regions the US geographic profile currently routes inference to (deployment contract
+§ 4). The deploy CLI re-reads this from the system profile's own ``models`` list and fails if it
+has grown a region this tuple does not name; the tuple is the policy-side copy that list is
+checked against."""
+
+INFERENCE_PROFILE_ARN_CONDITION_KEY = "bedrock:InferenceProfileArn"
+"""The Bedrock condition key that binds a foundation-model grant to one inference profile
+(deployment contract § 4). The foundation-model statement is usable *only* through the profile
+whose ARN this key equals, so the grant is not a direct unrestricted model invocation."""
+
+RUNTIME_MODEL_ACTIONS = ("bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream")
+"""Both actions are required. ``strands`` ``structured_output`` -> ``stream`` ->
+``converse_stream`` (streaming defaults to ``True`` in ``BedrockModel``, and
+``runtimes/*/agent.py`` never sets it ``False``), which the IAM policy simulator authorizes
+through ``bedrock:InvokeModelWithResponseStream``. ``InvokeModel`` alone covers the
+non-streaming fallback path. No ``Converse``/``ConverseStream`` grant -- those are the
+data-plane API names, not the IAM actions Bedrock evaluates."""
+
+
+def _foundation_model_arns() -> list[str]:
+    """The Nova 2 Lite foundation-model ARNs for every frozen US destination region.
+
+    A foundation-model ARN carries **no account id** -- the resource is AWS-owned -- so the
+    account is never interpolated here. These are the routes the US geographic profile fans an
+    invocation out to; a role that names its profile but not these gets ``AccessDenied`` from a
+    region the request never mentioned, which reads as a model error (deployment contract § 4).
+    """
+
+    return [
+        f"arn:aws:bedrock:{region}::foundation-model/{NOVA_2_LITE_BASE_MODEL_ID}"
+        for region in US_INFERENCE_PROFILE_DESTINATION_REGIONS
+    ]
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RuntimeStatementIds:
     """The policy statement identifiers one runtime's boundary is written under.
@@ -139,6 +184,7 @@ class RuntimeStatementIds:
     """
 
     invoke_profile: str
+    invoke_foundation_models: str
     write_logs: str
     emit_traces: str
     read_artifact: str
@@ -150,6 +196,7 @@ class RuntimeStatementIds:
 
 MONITOR_STATEMENT_IDS = RuntimeStatementIds(
     invoke_profile="InvokeMonitorInferenceProfileOnly",
+    invoke_foundation_models="InvokeMonitorFoundationModelsViaProfileOnly",
     write_logs="WriteOwnLogsOnly",
     emit_traces="EmitOwnTraces",
     read_artifact="ReadOwnDirectCodeArtifact",
@@ -161,6 +208,7 @@ MONITOR_STATEMENT_IDS = RuntimeStatementIds(
 
 INVESTIGATOR_STATEMENT_IDS = RuntimeStatementIds(
     invoke_profile="InvokeInvestigatorInferenceProfileOnly",
+    invoke_foundation_models="InvokeInvestigatorFoundationModelsViaProfileOnly",
     write_logs="WriteOwnInvestigatorLogsOnly",
     emit_traces="EmitOwnInvestigatorTraces",
     read_artifact="ReadOwnInvestigatorArtifact",
@@ -172,6 +220,7 @@ INVESTIGATOR_STATEMENT_IDS = RuntimeStatementIds(
 
 ACTION_STATEMENT_IDS = RuntimeStatementIds(
     invoke_profile="InvokeActionInferenceProfileOnly",
+    invoke_foundation_models="InvokeActionFoundationModelsViaProfileOnly",
     write_logs="WriteOwnActionLogsOnly",
     emit_traces="EmitOwnActionTraces",
     read_artifact="ReadOwnActionArtifact",
@@ -202,11 +251,29 @@ class ChorusAgentStack(Stack):
         Tags.of(self).add("Namespace", config.namespace)
         Tags.of(self).add("DataClass", "PRIVATE")
 
+        # I4: the three application inference-profile ARNs are **discovered** deployment inputs,
+        # never constructed from a friendly name. An application-profile ARN ends in a
+        # service-generated identifier, so ``chorus-monitor-demo`` names nothing (deployment
+        # contract § 4). They are supplied together -- the three profiles deploy in one stage --
+        # or not at all, in which case this stack synthesizes offline with no Bedrock grant and
+        # the deploy pipeline must pass the real ARNs before the runtimes can invoke a model.
+        profiles = {
+            "monitor_model_profile_arn": monitor_model_profile_arn,
+            "investigator_model_profile_arn": investigator_model_profile_arn,
+            "action_model_profile_arn": action_model_profile_arn,
+        }
+        supplied = {name for name, arn in profiles.items() if arn}
+        if supplied and supplied != set(profiles):
+            missing = sorted(set(profiles) - supplied)
+            raise ValueError(
+                "application inference-profile ARNs must be supplied together or not at all; "
+                f"missing: {', '.join(missing)}"
+            )
+
         # The two evidence buckets, named exactly as the data stack names them so the
         # ``GetObject`` deny can be stated against the resources it protects rather than
-        # against ``*``. Literals rather than a cross-stack reference, in the same way
-        # ``_default_profile_arn`` builds the inference-profile ARN: the deny must be present and
-        # correctly scoped even when this stack is synthesized on its own.
+        # against ``*``. Literals rather than a cross-stack reference: the deny must be present
+        # and correctly scoped even when this stack is synthesized on its own.
         self._private_bucket_arn = f"arn:aws:s3:::chorus-private-evidence-{config.environment}"
         self._export_bucket_arn = f"arn:aws:s3:::chorus-export-evidence-{config.environment}"
 
@@ -226,8 +293,7 @@ class ChorusAgentStack(Stack):
         self._grant_runtime_boundary(
             role=self.monitor_role,
             log_group=self.monitor_log_group,
-            profile_arn=monitor_model_profile_arn
-            or self._default_profile_arn("monitor", config.environment),
+            profile_arn=monitor_model_profile_arn,
             artifact_bucket_arn=artifact_bucket_arn,
             artifact_prefix="monitor",
             sids=MONITOR_STATEMENT_IDS,
@@ -251,8 +317,7 @@ class ChorusAgentStack(Stack):
         self._grant_runtime_boundary(
             role=self.investigator_role,
             log_group=self.investigator_log_group,
-            profile_arn=investigator_model_profile_arn
-            or self._default_profile_arn("investigator", config.environment),
+            profile_arn=investigator_model_profile_arn,
             artifact_bucket_arn=artifact_bucket_arn,
             artifact_prefix="investigator",
             sids=INVESTIGATOR_STATEMENT_IDS,
@@ -283,17 +348,10 @@ class ChorusAgentStack(Stack):
         self._grant_runtime_boundary(
             role=self.action_role,
             log_group=self.action_log_group,
-            profile_arn=action_model_profile_arn
-            or self._default_profile_arn("action", config.environment),
+            profile_arn=action_model_profile_arn,
             artifact_bucket_arn=artifact_bucket_arn,
             artifact_prefix="action",
             sids=ACTION_STATEMENT_IDS,
-        )
-
-    def _default_profile_arn(self, agent: str, environment: str) -> str:
-        return (
-            f"arn:aws:bedrock:{self.region}:{self.account}"
-            f":application-inference-profile/chorus-{agent}-{environment}"
         )
 
     def _grant_runtime_boundary(
@@ -301,7 +359,7 @@ class ChorusAgentStack(Stack):
         *,
         role: iam.Role,
         log_group: logs.LogGroup,
-        profile_arn: str,
+        profile_arn: str | None,
         artifact_bucket_arn: str | None,
         artifact_prefix: str,
         sids: RuntimeStatementIds,
@@ -320,16 +378,36 @@ class ChorusAgentStack(Stack):
         listing, and any read of either evidence bucket -- while leaving ``s3:GetObject`` on the
         runtime's own artifact prefix reachable, which a blanket ``GetObject`` deny made
         impossible (deployment contract SS 6).
+
+        I4: the model grant is two statements and appears only once ``profile_arn`` is a
+        discovered deployment input. ``invoke_profile`` allows :data:`RUNTIME_MODEL_ACTIONS`
+        (``bedrock:InvokeModel`` **and** ``bedrock:InvokeModelWithResponseStream`` -- the
+        runtime's ``strands`` structured-output call streams by default) on that exact
+        application inference-profile ARN; ``invoke_foundation_models`` allows the same two
+        actions on the Nova 2 Lite foundation-model ARNs for every frozen US destination region,
+        **condition-bound** to the same profile through ``bedrock:InferenceProfileArn`` so the
+        foundation-model grant -- streaming included -- is usable only through the profile it
+        belongs to and is not a direct unrestricted model invocation (deployment contract § 4).
         """
 
-        role.add_to_policy(
-            iam.PolicyStatement(
-                sid=sids.invoke_profile,
-                effect=iam.Effect.ALLOW,
-                actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-                resources=[profile_arn],
+        if profile_arn is not None:
+            role.add_to_policy(
+                iam.PolicyStatement(
+                    sid=sids.invoke_profile,
+                    effect=iam.Effect.ALLOW,
+                    actions=list(RUNTIME_MODEL_ACTIONS),
+                    resources=[profile_arn],
+                )
             )
-        )
+            role.add_to_policy(
+                iam.PolicyStatement(
+                    sid=sids.invoke_foundation_models,
+                    effect=iam.Effect.ALLOW,
+                    actions=list(RUNTIME_MODEL_ACTIONS),
+                    resources=_foundation_model_arns(),
+                    conditions={"StringEquals": {INFERENCE_PROFILE_ARN_CONDITION_KEY: profile_arn}},
+                )
+            )
         role.add_to_policy(
             iam.PolicyStatement(
                 sid=sids.write_logs,

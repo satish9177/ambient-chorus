@@ -16,6 +16,7 @@ takes no case edge in either table
 from __future__ import annotations
 
 import json
+import re
 from functools import cache
 from typing import Any
 
@@ -256,3 +257,148 @@ def test_the_sender_is_denied_the_outbound_message_locator_prefix() -> None:
     assert len(denies) == 1
     prefixes = denies[0]["Condition"]["ForAnyValue:StringLike"]["dynamodb:LeadingKeys"]
     assert "NS#*#OUTBOUND_MESSAGE#*" in prefixes
+
+
+# =====================================================================================
+# I14 -- the EventBridge Scheduler execution role: exact minimum, and a scoped trust
+# =====================================================================================
+
+ROLE_TYPE = "AWS::IAM::Role"
+
+
+def _scheduler_role() -> dict[str, Any]:
+    roles = watcher_template().find_resources(ROLE_TYPE)
+    return next(
+        dict(role)
+        for role in roles.values()
+        if "chorus-scheduler" in str(role["Properties"].get("RoleName", ""))
+    )
+
+
+def _scheduler_role_statements() -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for logical_id, policy in watcher_template().find_resources(POLICY_TYPE).items():
+        if logical_id.startswith("SchedulerExecutionRole"):
+            found.extend(policy["Properties"]["PolicyDocument"]["Statement"])
+    return found
+
+
+def _scheduler_statement(sid: str) -> dict[str, Any]:
+    for item in _scheduler_role_statements():
+        if item.get("Sid") == sid:
+            return item
+    raise AssertionError(f"no scheduler-role statement with Sid {sid}")
+
+
+def test_the_scheduler_role_trust_is_scoped_to_account_and_the_schedule_group_arn() -> None:
+    """P1-1: the confused-deputy boundary is the exact **schedule-group** ARN -- not an
+    individual schedule ARN and never a wildcard schedule name."""
+
+    statement = _scheduler_role()["Properties"]["AssumeRolePolicyDocument"]["Statement"][0]
+
+    assert statement["Principal"] == {"Service": "scheduler.amazonaws.com"}
+    assert statement["Action"] == "sts:AssumeRole"
+
+    account = statement["Condition"]["StringEquals"]["aws:SourceAccount"]
+    assert account == {"Ref": "AWS::AccountId"} or "AWS::AccountId" in json.dumps(account)
+
+    source_arn = json.dumps(statement["Condition"]["ArnEquals"]["aws:SourceArn"])
+    assert "schedule-group/chorus-development" in source_arn
+    assert "schedule/chorus-development/" not in source_arn  # no individual-schedule prefix
+    assert "*" not in source_arn
+
+
+def test_the_scheduler_role_invokes_the_watcher_live_alias_only() -> None:
+    """P2-1: the invoke resource is the qualified ``:live`` alias ARN, so rollback repoints the
+    alias with no schedule or IAM edit. Never the unqualified function, ``$LATEST``, or a
+    bare version."""
+
+    grant = _scheduler_statement("InvokeCommitmentWatcherLiveAliasOnly")
+
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"lambda:InvokeFunction"}
+    resource = json.dumps(grant["Resource"])
+    # The alias qualifier is part of one joined literal: `:function:<name>:live`.
+    assert "function:chorus-commitment-watcher-development:live" in resource
+    assert "$LATEST" not in resource
+    assert grant["Resource"] != "*"
+
+
+def test_the_scheduler_role_grants_no_unqualified_or_versioned_watcher_invoke() -> None:
+    for item in _scheduler_role_statements():
+        if item["Effect"] != "Allow" or "lambda:InvokeFunction" not in actions_of(item):
+            continue
+        resource = json.dumps(item["Resource"])
+        assert "chorus-commitment-watcher-development:live" in resource
+        # never the unqualified function tail or a numeric version qualifier
+        assert '-watcher-development"' not in resource
+        assert not re.search(r"-watcher-development:\d", resource)
+
+
+def test_the_scheduler_role_sends_to_the_dead_letter_queue_only() -> None:
+    grant = _scheduler_statement("SendDroppedDueEventToDeadLetterQueueOnly")
+
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"sqs:SendMessage"}
+    assert grant["Resource"] != "*"
+    assert "WatcherDeadLetterQueue" in str(grant["Resource"])
+
+
+def test_the_scheduler_role_uses_exactly_the_dlq_key_operations() -> None:
+    grant = _scheduler_statement("UseDeadLetterQueueKeyForEncryptedSendOnly")
+
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"kms:GenerateDataKey", "kms:Decrypt"}
+    assert grant["Resource"] != "*"
+    assert "WatcherDeadLetterKey" in str(grant["Resource"])
+
+
+def test_the_scheduler_role_has_no_other_service_capability() -> None:
+    """ALLOW is exactly {lambda:InvokeFunction, sqs:SendMessage, kms:GenerateDataKey,
+    kms:Decrypt} -- no DynamoDB, Bedrock, SES, AgentCore, Secrets Manager, broad Lambda
+    invoke, general SQS, or general KMS."""
+
+    allowed: set[str] = set()
+    for item in _scheduler_role_statements():
+        if item["Effect"] == "Allow":
+            allowed |= actions_of(item)
+    assert allowed == {
+        "lambda:InvokeFunction",
+        "sqs:SendMessage",
+        "kms:GenerateDataKey",
+        "kms:Decrypt",
+    }
+    for forbidden in ("dynamodb:", "bedrock", "ses", "sesv2", "secretsmanager:", "scheduler:"):
+        assert not any(action.startswith(forbidden) for action in allowed)
+    assert "kms:*" not in allowed and "sqs:*" not in allowed and "lambda:*" not in allowed
+
+
+def test_the_scheduler_role_was_trust_only_before_and_now_carries_one_policy() -> None:
+    assert len(_scheduler_role_statements()) == 3
+
+
+# -- the worker side of I14: application worker Scheduler + PassRole -------------------
+
+
+def test_the_worker_pass_role_condition_binds_the_scheduler_service() -> None:
+    passrole = application_statement("PassSchedulerExecutionRoleOnly")
+
+    assert actions_of(passrole) == {"iam:PassRole"}
+    assert "chorus-scheduler-development" in json.dumps(passrole["Resource"])
+    assert passrole["Condition"]["StringEquals"]["iam:PassedToService"] == "scheduler.amazonaws.com"
+
+
+def test_the_api_role_holds_no_scheduler_authority_and_no_pass_role() -> None:
+    template = build_app().synth().get_stack_by_name("AmbientChorusApplication").template
+    api_allows: set[str] = set()
+    for logical_id, resource in template["Resources"].items():
+        if resource["Type"] != POLICY_TYPE or not logical_id.startswith("ApiRole"):
+            continue
+        for item in resource["Properties"]["PolicyDocument"]["Statement"]:
+            if item["Effect"] != "Allow":
+                continue
+            action = item["Action"]
+            api_allows |= {action} if isinstance(action, str) else set(action)
+
+    assert not any(a.startswith("scheduler:") for a in api_allows)
+    assert "iam:PassRole" not in api_allows

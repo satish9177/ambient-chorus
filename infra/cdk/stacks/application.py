@@ -1,4 +1,13 @@
-"""The application boundary as an identity: one role, one log group, and its exact grants.
+"""The application boundary as identity: the request path and the durable worker as two roles.
+
+``02`` § IAM separates the FastAPI request path from the operation worker; the frozen trust
+matrix (deployment contract § 8.1) keeps them distinct. This stack synthesizes
+``chorus-api-{env}`` and ``chorus-worker-{env}`` -- a shared private-zone data plane, and the
+capabilities that genuinely differ split by which principal makes the call. The API reads the
+demo bearer-token secret and invokes the worker and the compiler; the worker invokes the three
+agent runtimes, the compiler, and the sender, and owns the commitment-schedule grant and the
+single ``iam:PassRole``. Neither can create a compiled view -- the compiler is the sole creator
+of views by IAM and not by convention.
 
 The application is the broadest principal in the system, and that is exactly why its boundary
 has to be written down rather than inferred. It reads and writes the private Core zone, it
@@ -144,6 +153,57 @@ A direct model grant would let application code send an unreviewed prompt to the
 which is the one path around every artifact-level control the runtimes exist to impose.
 """
 
+# -- I5: the request path and the durable worker are two principals, not one ------------
+
+API_SHAREABLE_WRITE_PREFIXES = (
+    "NS#*#ACTION#*",
+    "NS#*#ACTION_CURRENT#*",
+    "NS#*#EXECUTION#*",
+    "NS#*#CASE#*",
+)
+"""What the FastAPI request path writes in the Shareable zone (deployment contract § 8.1).
+
+``ACTION#`` and ``ACTION_CURRENT#`` -- the approval record and the current-action pointer moved
+by ``approve``/``invalidate``; ``EXECUTION#`` -- the ``DRAFT`` execution the same human
+decisions advance; ``CASE#`` -- the commitment edge ``verify`` and the demo-clock ``due`` path
+write.
+
+**Not ``OUTBOUND_MESSAGE#``.** The correlation locator is written only by the action-case
+projection at ``SENT``, which runs in the worker (ADR-026 § 3). The request path never performs
+that projection, so it never names that prefix.
+"""
+
+WORKER_SHAREABLE_WRITE_PREFIXES = APPLICATION_SHAREABLE_PREFIXES
+"""What the asynchronous operation worker writes: the request path's prefixes plus
+``OUTBOUND_MESSAGE#`` (the ``SENT`` projection locator). :data:`APPLICATION_SHAREABLE_PREFIXES`
+is retained as the name other modules and tests import for this full set."""
+
+DENIED_AGENT_RUNTIME_INVOCATION = ("bedrock-agentcore:InvokeAgentRuntime",)
+"""Denied on the **API** role. No request-path route invokes a runtime directly; every
+agent-invoking operation is dispatched to the worker and returns 202 (deployment contract
+§ 8.1). If a route is ever found that needs it, that is a design change, not a grant to add
+quietly."""
+
+DENIED_API_SCHEDULER_ACTIONS = (
+    "scheduler:CreateSchedule",
+    "scheduler:GetSchedule",
+    "scheduler:DeleteSchedule",
+    "scheduler:UpdateSchedule",
+)
+"""Denied on the **API** role, together with the ``scheduler:*`` wildcard. Scheduling a
+commitment is a worker operation; the request path holds no scheduler capability at all, and no
+``iam:PassRole`` to hand the scheduler its execution role."""
+
+DENIED_PASS_ROLE_ACTIONS = ("iam:PassRole",)
+"""Denied on the **API** role. Only the worker passes the scheduler execution role, and only
+that one role (deployment contract § 8.1, § 14)."""
+
+DENIED_SECRET_READ_ACTIONS = ("secretsmanager:GetSecretValue",)
+"""Denied on the **worker** role, table-wide. The worker reads no secret: the demo bearer token
+is the API's, and the destination registry is the sender's. A single role holding both the
+private zone and the demo-token secret is what made that deny unassertable before the split
+(deployment contract § 8.1)."""
+
 
 @dataclass(frozen=True, slots=True)
 class ApplicationTables:
@@ -165,7 +225,32 @@ class ApplicationBuckets:
 
 
 class ChorusApplicationStack(Stack):
-    """The application's role and log group. No compute resource is created here."""
+    """The request path and the durable worker as **two** roles, plus their log groups.
+
+    ``02`` § IAM separates the FastAPI request path from the operation worker, and the frozen
+    trust matrix (deployment contract § 8.1) keeps them apart: a single role is the union of
+    two, which makes the demo-token deny unassertable and hands the request-path role the
+    agent-invoke grant. So this stack synthesizes ``chorus-api-{env}`` and
+    ``chorus-worker-{env}`` -- one shared data-plane boundary, and the capabilities that
+    genuinely differ split by which principal makes the call. No compute resource is created
+    here; the two Lambdas and the demo-token secret are Phase 11's.
+
+    Capability | API (``chorus-api-{env}``) | Worker (``chorus-worker-{env}``)
+    - Core: R/W + ConditionCheck on both.
+    - Shareable read: all, on both.
+    - Shareable write: API -> ``ACTION#`` / ``ACTION_CURRENT#`` / ``EXECUTION#`` / ``CASE#``;
+      worker -> the same **plus ``OUTBOUND_MESSAGE#``** (the ``SENT`` projection locator).
+    - Shareable view prefixes: ``ConditionCheck`` only, on both.
+    - Audit: append, on both. Private S3 + private KMS: yes, on both. Export S3: GetObject +
+      Decrypt, on both.
+    - Secrets Manager: API reads the demo bearer-token secret; worker holds an explicit deny.
+    - Lambda invoke: API -> operation worker + compiler; worker -> compiler + sender.
+    - AgentCore: API denied; worker invokes the Monitor / Investigator / Action runtimes.
+    - Scheduler: API denied outright, including ``iam:PassRole``; worker holds
+      ``CreateSchedule`` / ``GetSchedule`` on the one group and ``iam:PassRole`` on the
+      scheduler execution role alone.
+    - SES and direct Bedrock: denied on both.
+    """
 
     def __init__(
         self,
@@ -178,6 +263,11 @@ class ChorusApplicationStack(Stack):
         agent_runtime_arns: tuple[str, ...] = (),
         scheduler_group_name: str | None = None,
         scheduler_role_arn: str | None = None,
+        worker_function_arn: str | None = None,
+        compiler_function_arn: str | None = None,
+        sender_function_arn: str | None = None,
+        demo_access_secret_arn: str | None = None,
+        destination_registry_secret_arn: str | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
         Tags.of(self).add("Project", config.project)
@@ -185,44 +275,74 @@ class ChorusApplicationStack(Stack):
         Tags.of(self).add("Namespace", config.namespace)
         Tags.of(self).add("DataClass", "PRIVATE")
 
-        self.log_group = logs.LogGroup(
+        self.scheduler_group_name = scheduler_group_name or f"chorus-{config.environment}"
+        self.scheduler_role_arn = scheduler_role_arn
+
+        self.api_log_group = logs.LogGroup(
             self,
-            "ApplicationLogGroup",
-            log_group_name=f"/chorus/{config.environment}/application",
+            "ApiLogGroup",
+            log_group_name=f"/chorus/{config.environment}/api",
             retention=logs.RetentionDays.TWO_WEEKS,
             removal_policy=RemovalPolicy.DESTROY,
         )
-        self.role_name = f"chorus-application-{config.environment}"
-        self.role = iam.Role(
+        self.worker_log_group = logs.LogGroup(
             self,
-            "ApplicationRole",
-            role_name=self.role_name,
-            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
-            description="FastAPI application and operation worker: private zone and actions.",
+            "WorkerLogGroup",
+            log_group_name=f"/chorus/{config.environment}/worker",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=RemovalPolicy.DESTROY,
         )
-        self.scheduler_group_name = scheduler_group_name or f"chorus-{config.environment}"
-        self.scheduler_role_arn = scheduler_role_arn
-        self._grant_boundary(
-            tables=tables, buckets=buckets, agent_runtime_arns=agent_runtime_arns, config=config
+        self.api_role_name = f"chorus-api-{config.environment}"
+        self.api_role = iam.Role(
+            self,
+            "ApiRole",
+            role_name=self.api_role_name,
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="FastAPI request path: private zone, actions, and the demo-token secret.",
+        )
+        self.worker_role_name = f"chorus-worker-{config.environment}"
+        self.worker_role = iam.Role(
+            self,
+            "WorkerRole",
+            role_name=self.worker_role_name,
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Operation worker: runtimes, compiler, sender, and commitment schedules.",
+        )
+        self.api_role_arn_literal = f"arn:aws:iam::{self.account}:role/{self.api_role_name}"
+        self.worker_role_arn_literal = f"arn:aws:iam::{self.account}:role/{self.worker_role_name}"
+
+        for role in (self.api_role, self.worker_role):
+            self._grant_shared_data_plane(role, tables=tables, buckets=buckets)
+
+        self._grant_api_boundary(
+            tables=tables,
+            worker_function_arn=worker_function_arn,
+            compiler_function_arn=compiler_function_arn,
+            demo_access_secret_arn=demo_access_secret_arn,
+            destination_registry_secret_arn=destination_registry_secret_arn,
+        )
+        self._grant_worker_boundary(
+            tables=tables,
+            agent_runtime_arns=agent_runtime_arns,
+            compiler_function_arn=compiler_function_arn,
+            sender_function_arn=sender_function_arn,
         )
 
-    def _grant_boundary(
-        self,
-        *,
-        tables: ApplicationTables,
-        buckets: ApplicationBuckets,
-        agent_runtime_arns: tuple[str, ...],
-        config: CdkBuildConfig,
+    # -- shared boundary ---------------------------------------------------------------------
+
+    def _grant_shared_data_plane(
+        self, role: iam.Role, *, tables: ApplicationTables, buckets: ApplicationBuckets
     ) -> None:
-        """Attach the complete allow list and the explicit denies, in one place.
+        """The boundary both principals hold identically: the private zone and the evidence
+        objects.
 
         Every DynamoDB grant names the *underlying* action a transaction participant needs
         rather than a blanket ``dynamodb:TransactWriteItems``. AWS authorizes a transaction
-        through its members, so the blanket action would be a permission this role does not
-        need and a place for a future participant to hide.
+        through its members, so the blanket action would be a permission neither role needs and
+        a place for a future participant to hide.
         """
 
-        self.role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
                 sid="ReadWritePrivateCore",
                 effect=iam.Effect.ALLOW,
@@ -230,7 +350,7 @@ class ChorusApplicationStack(Stack):
                 resources=[tables.core.table_arn],
             )
         )
-        self.role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
                 sid="ReadShareable",
                 effect=iam.Effect.ALLOW,
@@ -238,26 +358,11 @@ class ChorusApplicationStack(Stack):
                 resources=[tables.shareable.table_arn],
             )
         )
-        # The application's entire Shareable *write* capability, and it reaches exactly the
-        # action and case prefixes. It cannot create a view; the compiler cannot create an
-        # action. Sole-writer-of-views is enforced by key grammar rather than by convention.
-        self.role.add_to_policy(
-            iam.PolicyStatement(
-                sid="WriteActionAndCasePrefixesOnly",
-                effect=iam.Effect.ALLOW,
-                actions=[*WRITE_ACTIONS, CONDITION_CHECK_ACTION],
-                resources=[tables.shareable.table_arn],
-                conditions={
-                    "ForAllValues:StringLike": {
-                        "dynamodb:LeadingKeys": list(APPLICATION_SHAREABLE_PREFIXES)
-                    }
-                },
-            )
-        )
         # ADR-022 § 7. Read-only transactional authority over the compiler-owned view
-        # partitions, so the Phase-7 proposal apply can refuse to commit against a view that
-        # moved while the model was answering -- without ever being able to move one itself.
-        self.role.add_to_policy(
+        # partitions, so the Phase-7 proposal apply (worker) and the approval transaction (API)
+        # can refuse to commit against a view that moved while the model was answering -- without
+        # either being able to move one itself.
+        role.add_to_policy(
             iam.PolicyStatement(
                 sid="ConditionCheckCurrentViewPointer",
                 effect=iam.Effect.ALLOW,
@@ -269,7 +374,7 @@ class ChorusApplicationStack(Stack):
                 },
             )
         )
-        self.role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
                 sid="AppendAudit",
                 effect=iam.Effect.ALLOW,
@@ -277,7 +382,7 @@ class ChorusApplicationStack(Stack):
                 resources=[tables.audit.table_arn],
             )
         )
-        self.role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
                 sid="ReadWritePrivateEvidenceObjects",
                 effect=iam.Effect.ALLOW,
@@ -285,7 +390,7 @@ class ChorusApplicationStack(Stack):
                 resources=[buckets.private.arn_for_objects("*")],
             )
         )
-        self.role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
                 sid="ReadExportEvidenceObjects",
                 effect=iam.Effect.ALLOW,
@@ -293,7 +398,7 @@ class ChorusApplicationStack(Stack):
                 resources=[buckets.export.arn_for_objects("*")],
             )
         )
-        self.role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
                 sid="UsePrivateEvidenceKey",
                 effect=iam.Effect.ALLOW,
@@ -301,7 +406,7 @@ class ChorusApplicationStack(Stack):
                 resources=[buckets.private_key.key_arn],
             )
         )
-        self.role.add_to_policy(
+        role.add_to_policy(
             iam.PolicyStatement(
                 sid="DecryptExportEvidence",
                 effect=iam.Effect.ALLOW,
@@ -309,8 +414,186 @@ class ChorusApplicationStack(Stack):
                 resources=[buckets.export_key.key_arn],
             )
         )
+        # The negative half of the view guarantee, and the statement the ADR-022 static
+        # assertion actually reads. Not merely ungranted -- denied, because an explicit deny
+        # cannot be overridden by a later grant.
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyViewPartitionWrites",
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_VIEW_WRITE_ACTIONS),
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAnyValue:StringLike": {"dynamodb:LeadingKeys": list(VIEW_KEY_PREFIXES)}
+                },
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyApplicationSend",
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_SEND_ACTIONS),
+                resources=["*"],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyDirectModelAccess",
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_MODEL_ACTIONS),
+                resources=["*"],
+            )
+        )
+
+    # -- API request-path boundary --------------------------------------------------------------
+
+    def _grant_api_boundary(
+        self,
+        *,
+        tables: ApplicationTables,
+        worker_function_arn: str | None,
+        compiler_function_arn: str | None,
+        demo_access_secret_arn: str | None,
+        destination_registry_secret_arn: str | None,
+    ) -> None:
+        """The request path's own capabilities and the denies that keep it a front end.
+
+        It writes the action and case prefixes the human decisions move -- and **not**
+        ``OUTBOUND_MESSAGE#``, which only the worker's ``SENT`` projection writes. It invokes
+        the operation worker and (synchronously, for the compile route) the compiler, and
+        nothing else. It reads the demo bearer-token secret and no other. It holds no scheduler
+        capability, no ``iam:PassRole``, and no agent-runtime invocation: every agent-invoking
+        route dispatches to the worker and returns 202.
+        """
+
+        self.api_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="WriteApiActionAndCasePrefixesOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[*WRITE_ACTIONS, CONDITION_CHECK_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": list(API_SHAREABLE_WRITE_PREFIXES)
+                    }
+                },
+            )
+        )
+        self.api_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="WriteOwnApiLogs",
+                effect=iam.Effect.ALLOW,
+                actions=["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
+                resources=[
+                    self.api_log_group.log_group_arn,
+                    f"{self.api_log_group.log_group_arn}:log-stream:*",
+                ],
+            )
+        )
+        invoke_targets = [
+            arn for arn in (worker_function_arn, compiler_function_arn) if arn is not None
+        ]
+        if invoke_targets:
+            # The worker for every asynchronous operation; the compiler synchronously for the
+            # one deterministic compile route. No sender, no watcher, no runtime.
+            self.api_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="InvokeOperationWorkerAndCompilerOnly",
+                    effect=iam.Effect.ALLOW,
+                    actions=["lambda:InvokeFunction"],
+                    resources=invoke_targets,
+                )
+            )
+        if demo_access_secret_arn is not None:
+            self.api_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="ReadDemoAccessTokenSecretOnly",
+                    effect=iam.Effect.ALLOW,
+                    actions=["secretsmanager:GetSecretValue"],
+                    resources=[demo_access_secret_arn],
+                )
+            )
+        if destination_registry_secret_arn is not None:
+            # The destination registry is the sender's alone (deployment contract § 8.1). Denied
+            # by name so a later grant cannot hand the request path a correspondent address.
+            self.api_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="DenyApiDestinationRegistrySecret",
+                    effect=iam.Effect.DENY,
+                    actions=["secretsmanager:GetSecretValue"],
+                    resources=[destination_registry_secret_arn],
+                )
+            )
+        self.api_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyApiAgentRuntimeInvocation",
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_AGENT_RUNTIME_INVOCATION),
+                resources=["*"],
+            )
+        )
+        self.api_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyApiSchedulerAuthority",
+                effect=iam.Effect.DENY,
+                actions=[*DENIED_API_SCHEDULER_ACTIONS, "scheduler:*"],
+                resources=["*"],
+            )
+        )
+        self.api_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyApiPassRole",
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_PASS_ROLE_ACTIONS),
+                resources=["*"],
+            )
+        )
+
+    # -- worker boundary --------------------------------------------------------------------
+
+    def _grant_worker_boundary(
+        self,
+        *,
+        tables: ApplicationTables,
+        agent_runtime_arns: tuple[str, ...],
+        compiler_function_arn: str | None,
+        sender_function_arn: str | None,
+    ) -> None:
+        """The worker's asynchronous-execution capabilities.
+
+        It writes the same action and case prefixes as the API **plus ``OUTBOUND_MESSAGE#``**,
+        the correlation locator its ``SENT`` projection creates (ADR-026 § 3). It invokes the
+        three agent runtimes, the compiler, and the sender. It creates and reads commitment
+        schedules on the one group and passes the scheduler execution role -- and only that
+        role, only to ``scheduler.amazonaws.com``. It reads no secret at all.
+        """
+
+        self.worker_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="WriteActionAndCasePrefixesOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[*WRITE_ACTIONS, CONDITION_CHECK_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": list(WORKER_SHAREABLE_WRITE_PREFIXES)
+                    }
+                },
+            )
+        )
+        self.worker_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="WriteOwnWorkerLogs",
+                effect=iam.Effect.ALLOW,
+                actions=["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
+                resources=[
+                    self.worker_log_group.log_group_arn,
+                    f"{self.worker_log_group.log_group_arn}:log-stream:*",
+                ],
+            )
+        )
         if agent_runtime_arns:
-            self.role.add_to_policy(
+            self.worker_role.add_to_policy(
                 iam.PolicyStatement(
                     sid="InvokeNamedAgentRuntimesOnly",
                     effect=iam.Effect.ALLOW,
@@ -318,8 +601,20 @@ class ChorusApplicationStack(Stack):
                     resources=list(agent_runtime_arns),
                 )
             )
+        downstream = [
+            arn for arn in (compiler_function_arn, sender_function_arn) if arn is not None
+        ]
+        if downstream:
+            self.worker_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="InvokeCompilerAndSenderOnly",
+                    effect=iam.Effect.ALLOW,
+                    actions=["lambda:InvokeFunction"],
+                    resources=downstream,
+                )
+            )
         # ADR-028 § 6. Create and read, on the one schedule group, and nothing else.
-        self.role.add_to_policy(
+        self.worker_role.add_to_policy(
             iam.PolicyStatement(
                 sid="CreateAndGetCommitmentSchedulesOnly",
                 effect=iam.Effect.ALLOW,
@@ -335,9 +630,9 @@ class ChorusApplicationStack(Stack):
         )
         if self.scheduler_role_arn:
             # Passing the scheduler execution role is what lets a created schedule invoke the
-            # watcher. It is scoped to that one role: a broader ``iam:PassRole`` would let the
-            # application hand any role to any target.
-            self.role.add_to_policy(
+            # watcher. It is scoped to that one role and one service: a broader ``iam:PassRole``
+            # would let the worker hand any role to any target.
+            self.worker_role.add_to_policy(
                 iam.PolicyStatement(
                     sid="PassSchedulerExecutionRoleOnly",
                     effect=iam.Effect.ALLOW,
@@ -346,7 +641,7 @@ class ChorusApplicationStack(Stack):
                     conditions={"StringEquals": {"iam:PassedToService": "scheduler.amazonaws.com"}},
                 )
             )
-        self.role.add_to_policy(
+        self.worker_role.add_to_policy(
             iam.PolicyStatement(
                 sid="DenyScheduleDeletionAndUpdate",
                 effect=iam.Effect.DENY,
@@ -354,44 +649,14 @@ class ChorusApplicationStack(Stack):
                 resources=["*"],
             )
         )
-        self.role.add_to_policy(
+        # ``02`` § 8.1: the worker reads no secret. The demo bearer token is the API's and the
+        # destination registry is the sender's; a single role holding the private zone and
+        # either secret is exactly what the split exists to prevent.
+        self.worker_role.add_to_policy(
             iam.PolicyStatement(
-                sid="WriteOwnApplicationLogs",
-                effect=iam.Effect.ALLOW,
-                actions=["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
-                resources=[
-                    self.log_group.log_group_arn,
-                    f"{self.log_group.log_group_arn}:log-stream:*",
-                ],
-            )
-        )
-        # The negative half of the view guarantee, and the statement the ADR-022 static
-        # assertion actually reads. Not merely ungranted -- denied, because an explicit deny
-        # cannot be overridden by a later grant.
-        self.role.add_to_policy(
-            iam.PolicyStatement(
-                sid="DenyViewPartitionWrites",
+                sid="DenyWorkerSecretReads",
                 effect=iam.Effect.DENY,
-                actions=list(DENIED_VIEW_WRITE_ACTIONS),
-                resources=[tables.shareable.table_arn],
-                conditions={
-                    "ForAnyValue:StringLike": {"dynamodb:LeadingKeys": list(VIEW_KEY_PREFIXES)}
-                },
-            )
-        )
-        self.role.add_to_policy(
-            iam.PolicyStatement(
-                sid="DenyApplicationSend",
-                effect=iam.Effect.DENY,
-                actions=list(DENIED_SEND_ACTIONS),
-                resources=["*"],
-            )
-        )
-        self.role.add_to_policy(
-            iam.PolicyStatement(
-                sid="DenyDirectModelAccess",
-                effect=iam.Effect.DENY,
-                actions=list(DENIED_MODEL_ACTIONS),
+                actions=list(DENIED_SECRET_READ_ACTIONS),
                 resources=["*"],
             )
         )

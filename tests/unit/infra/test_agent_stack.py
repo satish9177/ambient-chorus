@@ -25,15 +25,52 @@ from infra.cdk.stacks.agents import (
     DENIED_EVIDENCE_OBJECT_ACTIONS,
     DENIED_OBJECT_MUTATION_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
+    INFERENCE_PROFILE_ARN_CONDITION_KEY,
+    NOVA_2_LITE_BASE_MODEL_ID,
+    RUNTIME_MODEL_ACTIONS,
+    US_INFERENCE_PROFILE_DESTINATION_REGIONS,
 )
+
+# P1-2: the runtime roles need BOTH actions -- ``strands`` structured output streams by
+# default. Sourced from the stack module so a change there fails these tests loudly.
+MODEL_ACTIONS = set(RUNTIME_MODEL_ACTIONS)
 
 POLICY_TYPE = "AWS::IAM::Policy"
 ROLE_TYPE = "AWS::IAM::Role"
 
+# Discovered application inference-profile ARNs carry a service-generated suffix -- they are
+# never constructed from ``chorus-monitor-demo`` (deployment contract § 4). These stand in for
+# that shape in the assertions below.
+MONITOR_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-monitor-a1b2c3d4"
+)
+INVESTIGATOR_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-investigator-e5f6"
+)
+ACTION_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-action-99887766"
+)
+PROFILE_ARNS = {
+    "monitor_model_profile_arn": MONITOR_PROFILE_ARN,
+    "investigator_model_profile_arn": INVESTIGATOR_PROFILE_ARN,
+    "action_model_profile_arn": ACTION_PROFILE_ARN,
+}
 
-def template(config: CdkBuildConfig | None = None) -> assertions.Template:
+
+def template(config: CdkBuildConfig | None = None, **kwargs: object) -> assertions.Template:
     app = App()
-    stack = ChorusAgentStack(app, "TestAgents", config=config or CdkBuildConfig())
+    stack = ChorusAgentStack(
+        app,
+        "TestAgents",
+        config=config or CdkBuildConfig(),
+        **{**PROFILE_ARNS, **kwargs},  # type: ignore[arg-type]
+    )
+    return assertions.Template.from_stack(stack)
+
+
+def template_without_profiles() -> assertions.Template:
+    app = App()
+    stack = ChorusAgentStack(app, "TestAgents", config=CdkBuildConfig())
     return assertions.Template.from_stack(stack)
 
 
@@ -77,12 +114,141 @@ def test_the_role_may_invoke_only_its_own_inference_profile() -> None:
     allowed = statement("InvokeMonitorInferenceProfileOnly")
 
     assert allowed["Effect"] == "Allow"
-    assert set(allowed["Action"]) == {
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream",
-    }
-    assert "application-inference-profile/chorus-monitor" in str(allowed["Resource"])
+    # I4 / P1-2: BOTH model actions -- ``strands`` ``structured_output`` -> ``stream`` ->
+    # ``converse_stream`` (streaming defaults on), which IAM authorizes through
+    # ``bedrock:InvokeModelWithResponseStream``; ``InvokeModel`` covers the non-streaming path.
+    assert actions_of("InvokeMonitorInferenceProfileOnly") == MODEL_ACTIONS
+    assert allowed["Resource"] == MONITOR_PROFILE_ARN
     assert allowed["Resource"] != "*"
+    assert "Condition" not in allowed
+
+
+# -- I4: Nova 2 Lite through one application inference profile per agent -----------------
+
+
+def test_no_model_grant_at_all_until_the_profile_arn_is_a_discovered_input() -> None:
+    """``_default_profile_arn`` is gone: no name-constructed ARN can become authority.
+
+    With no profile ARN supplied the role synthesizes offline with **no** Bedrock statement,
+    and the deploy pipeline must pass the discovered ARN before a runtime can invoke a model.
+    """
+
+    for policy in template_without_profiles().find_resources(POLICY_TYPE).values():
+        for item in policy["Properties"]["PolicyDocument"]["Statement"]:
+            for action in item["Action"] if isinstance(item["Action"], list) else [item["Action"]]:
+                assert not action.startswith("bedrock:"), item.get("Sid")
+
+
+def test_profile_arns_must_be_supplied_together_or_not_at_all() -> None:
+    with pytest.raises(ValueError, match="together or not at all"):
+        ChorusAgentStack(
+            App(),
+            "PartialAgents",
+            config=CdkBuildConfig(),
+            monitor_model_profile_arn=MONITOR_PROFILE_ARN,
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile_sid", "fm_sid", "profile_arn"),
+    [
+        (
+            "InvokeMonitorInferenceProfileOnly",
+            "InvokeMonitorFoundationModelsViaProfileOnly",
+            MONITOR_PROFILE_ARN,
+        ),
+        (
+            "InvokeInvestigatorInferenceProfileOnly",
+            "InvokeInvestigatorFoundationModelsViaProfileOnly",
+            INVESTIGATOR_PROFILE_ARN,
+        ),
+        (
+            "InvokeActionInferenceProfileOnly",
+            "InvokeActionFoundationModelsViaProfileOnly",
+            ACTION_PROFILE_ARN,
+        ),
+    ],
+)
+def test_each_role_invokes_its_own_profile_and_the_fm_arns_bound_to_it(
+    profile_sid: str, fm_sid: str, profile_arn: str
+) -> None:
+    """ALLOW own application profile; ALLOW the Nova 2 Lite FM ARNs for the three frozen US
+    regions, condition-bound to that same profile so it is not a direct FM invocation."""
+
+    profile = statement(profile_sid)
+    assert profile["Effect"] == "Allow"
+    # P1-2: both actions present in the application-profile statement.
+    assert actions_of(profile_sid) == MODEL_ACTIONS
+    assert profile["Resource"] == profile_arn
+
+    fm = statement(fm_sid)
+    assert fm["Effect"] == "Allow"
+    # P1-2: both actions present in the condition-bound foundation-model statement too.
+    assert actions_of(fm_sid) == MODEL_ACTIONS
+    assert set(fm["Resource"]) == {
+        f"arn:aws:bedrock:{region}::foundation-model/{NOVA_2_LITE_BASE_MODEL_ID}"
+        for region in US_INFERENCE_PROFILE_DESTINATION_REGIONS
+    }
+    # No account id in a foundation-model ARN, and all three frozen regions present.
+    assert all("111122223333" not in arn for arn in fm["Resource"])
+    for region in ("us-east-1", "us-east-2", "us-west-2"):
+        assert any(f":{region}::foundation-model/" in arn for arn in fm["Resource"])
+    assert fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY] == profile_arn
+
+
+def test_no_role_receives_another_agents_profile_or_fm_condition() -> None:
+    """Monitor's FM grant is bound to Monitor's profile, never Investigator's or Action's."""
+
+    monitor_fm = statement("InvokeMonitorFoundationModelsViaProfileOnly")
+    bound = monitor_fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY]
+    assert bound == MONITOR_PROFILE_ARN
+    assert INVESTIGATOR_PROFILE_ARN not in str(monitor_fm)
+    assert ACTION_PROFILE_ARN not in str(monitor_fm)
+
+
+def test_no_unconditioned_foundation_model_invocation_statement_exists() -> None:
+    """Every model allow -- ``InvokeModel`` *or* ``InvokeModelWithResponseStream`` -- either
+    names an application profile ARN, or names FM ARNs and is condition-bound to one. No
+    statement grants unrestricted foundation-model invocation, streaming included (P1-2)."""
+
+    for item in statements():
+        if item["Effect"] != "Allow":
+            continue
+        actions = set(item["Action"] if isinstance(item["Action"], list) else [item["Action"]])
+        if not actions & MODEL_ACTIONS:
+            continue
+        resources = item["Resource"] if isinstance(item["Resource"], list) else [item["Resource"]]
+        if any("foundation-model/" in arn for arn in resources):
+            assert INFERENCE_PROFILE_ARN_CONDITION_KEY in str(item.get("Condition")), item["Sid"]
+        else:
+            assert all("application-inference-profile/" in arn for arn in resources), item["Sid"]
+
+
+def test_no_unconditioned_streaming_foundation_model_grant() -> None:
+    """P1-2 specifically: any statement that grants ``InvokeModelWithResponseStream`` over a
+    foundation-model ARN carries the ``bedrock:InferenceProfileArn`` condition."""
+
+    for item in statements():
+        if item["Effect"] != "Allow":
+            continue
+        actions = set(item["Action"] if isinstance(item["Action"], list) else [item["Action"]])
+        if "bedrock:InvokeModelWithResponseStream" not in actions:
+            continue
+        resources = item["Resource"] if isinstance(item["Resource"], list) else [item["Resource"]]
+        if any("foundation-model/" in arn for arn in resources):
+            bound = item.get("Condition", {}).get("StringEquals", {})
+            assert bound.get(INFERENCE_PROFILE_ARN_CONDITION_KEY) is not None, item["Sid"]
+
+
+def test_converse_is_never_granted() -> None:
+    """Streaming *is* granted (P1-2); the ``Converse`` API-name actions never are."""
+
+    for item in statements():
+        if item["Effect"] != "Allow":
+            continue
+        actions = item["Action"] if isinstance(item["Action"], list) else [item["Action"]]
+        for action in actions:
+            assert action not in {"bedrock:Converse", "bedrock:ConverseStream"}
 
 
 def test_the_role_writes_only_to_its_own_log_group() -> None:

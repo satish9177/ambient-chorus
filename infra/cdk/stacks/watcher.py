@@ -102,6 +102,18 @@ DENIED_SCHEDULER_ACTIONS = (
 )
 """A target, not a client. Even ``GetSchedule`` is denied: nothing here reads a schedule."""
 
+SCHEDULER_INVOKE_ACTION = "lambda:InvokeFunction"
+"""The scheduler execution role's entire compute reach: invoke the one watcher function."""
+
+SCHEDULER_DLQ_SEND_ACTION = "sqs:SendMessage"
+"""A dropped one-time schedule delivery lands in the DLQ; the role may put it there and nothing
+else on any queue."""
+
+SCHEDULER_DLQ_KEY_ACTIONS = ("kms:GenerateDataKey", "kms:Decrypt")
+"""What EventBridge Scheduler needs to write an encrypted message to the KMS-encrypted DLQ:
+a data key to encrypt the payload, and decrypt for the SQS envelope. Scoped to the DLQ CMK
+alone -- no other key, and no ``kms:*``."""
+
 DLQ_RETENTION_DAYS = 14
 DLQ_DEPTH_ALARM_THRESHOLD = 1
 """One dropped invocation is worth a person's attention.
@@ -208,18 +220,54 @@ class ChorusWatcherStack(Stack):
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             description="Commitment watcher: one edge, one Shareable partition, nothing else.",
         )
+        # The watcher Lambda is deployed in Phase 11 (I2) into this same stack, under the frozen
+        # name below, and rollback repoints its ``live`` alias at a published version rather than
+        # editing schedules or IAM (deployment contract § 20). So both the scheduler target and
+        # the scheduler role's invoke authority bind to the **alias** ARN, not the unqualified
+        # function ARN. Deterministic literals here: the resources do not exist yet, they land
+        # beside this role later, and the worker's stack already depends on this one -- no cycle.
+        self.watcher_function_name = f"chorus-commitment-watcher-{config.environment}"
+        self.watcher_alias_name = "live"
+        self.watcher_function_arn_literal = (
+            f"arn:aws:lambda:{self.region}:{self.account}:function:{self.watcher_function_name}"
+        )
+        self.watcher_alias_arn_literal = (
+            f"{self.watcher_function_arn_literal}:{self.watcher_alias_name}"
+        )
+        # The confused-deputy boundary for a Scheduler execution role is the **schedule-group**
+        # ARN, not an individual schedule ARN and never a wildcard schedule name (deployment
+        # contract § 8.5, AWS cross-service guidance). Deterministic literal rather than
+        # ``schedule_group.attr_arn`` so the frozen group name is legible in the synthesized
+        # trust policy; no cycle either way since the group is built above.
+        self.schedule_group_arn = self.format_arn(
+            service="scheduler",
+            resource="schedule-group",
+            resource_name=self.schedule_group_name,
+        )
+
         self.scheduler_role_name = f"chorus-scheduler-{config.environment}"
         self.scheduler_role = iam.Role(
             self,
             "SchedulerExecutionRole",
             role_name=self.scheduler_role_name,
-            assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"),
+            # Not an unconstrained service trust: EventBridge Scheduler may assume this role only
+            # for this account and only on behalf of a schedule in the frozen group. The
+            # ``aws:SourceArn`` is the exact schedule-group ARN -- an individual schedule ARN or
+            # a wildcard tail would be a wider boundary than the confused-deputy guidance draws.
+            assumed_by=iam.ServicePrincipal(
+                "scheduler.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": self.account},
+                    "ArnEquals": {"aws:SourceArn": self.schedule_group_arn},
+                },
+            ),
             description="EventBridge Scheduler: invokes the commitment watcher and nothing else.",
         )
         self.scheduler_role_arn_literal = (
             f"arn:aws:iam::{self.account}:role/{self.scheduler_role_name}"
         )
         self._grant_boundary(tables=tables, buckets=buckets)
+        self._grant_scheduler_execution_boundary()
 
     def _grant_boundary(self, *, tables: WatcherTables, buckets: WatcherBuckets) -> None:
         """Attach the complete allow list and every explicit deny, in one place."""
@@ -320,6 +368,46 @@ class ChorusWatcherStack(Stack):
             )
         )
 
+    def _grant_scheduler_execution_boundary(self) -> None:
+        """The exact minimum EventBridge Scheduler needs to deliver one due event.
+
+        Three grants and no fourth (deployment contract § 8.5): invoke the watcher's ``live``
+        alias, put a dropped delivery on the one DLQ, and use the one DLQ key to encrypt that
+        message. No DynamoDB, no Bedrock, no SES, no AgentCore, no Secrets Manager, no broad
+        ``lambda:InvokeFunction``, no general ``sqs:*`` or ``kms:*``. The role had a trust
+        policy and zero attached policies until now.
+
+        The invoke resource is the **qualified alias** ARN (``…:function:…:live``), never the
+        unqualified function ARN and never ``$LATEST`` or a bare version: rollback repoints the
+        alias at a published version and no schedule or policy statement changes (deployment
+        contract § 20).
+        """
+
+        self.scheduler_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="InvokeCommitmentWatcherLiveAliasOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[SCHEDULER_INVOKE_ACTION],
+                resources=[self.watcher_alias_arn_literal],
+            )
+        )
+        self.scheduler_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="SendDroppedDueEventToDeadLetterQueueOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[SCHEDULER_DLQ_SEND_ACTION],
+                resources=[self.dead_letter_queue.queue_arn],
+            )
+        )
+        self.scheduler_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="UseDeadLetterQueueKeyForEncryptedSendOnly",
+                effect=iam.Effect.ALLOW,
+                actions=list(SCHEDULER_DLQ_KEY_ACTIONS),
+                resources=[self.dead_letter_key.key_arn],
+            )
+        )
+
 
 __all__ = [
     "AUDIT_WRITE_ACTIONS",
@@ -332,6 +420,9 @@ __all__ = [
     "DLQ_DEPTH_ALARM_THRESHOLD",
     "DLQ_RETENTION_DAYS",
     "FORBIDDEN_WRITE_PREFIXES",
+    "SCHEDULER_DLQ_KEY_ACTIONS",
+    "SCHEDULER_DLQ_SEND_ACTION",
+    "SCHEDULER_INVOKE_ACTION",
     "ChorusWatcherStack",
     "WatcherBuckets",
     "WatcherTables",
