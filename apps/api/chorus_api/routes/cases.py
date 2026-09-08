@@ -40,6 +40,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
+from chorus.application.queries.case_surface import CaseSurfaceExtras
 from chorus.application.queries.current_action import CurrentActionProjection
 from chorus.domain.ids import CaseId
 from chorus.ports.scopes import CaseScope
@@ -50,6 +51,7 @@ from chorus_api.dependencies import (
     require_actor,
     require_case_reader,
 )
+from chorus_api.routes.views import ShareableCaseViewBody, view_body
 
 router = APIRouter(tags=["cases"])
 
@@ -82,10 +84,18 @@ class RenderedPreviewProjection(BaseModel):
 
 
 class ExecutionProjection(BaseModel):
-    """The safe ``DRAFT`` projection. Its absent fields are absent on purpose (ADR-022 § 1)."""
+    """The safe execution projection. Its absent fields are absent on purpose (ADR-022 § 1).
+
+    ``approval_id`` is ``None`` at ``DRAFT`` and the row's own durable value from ``APPROVED``
+    onward -- surfaced (P2-4) so a browser that approved a proposal and then reloaded before
+    executing can read back the exact binding it needs for ``POST .../executions`` instead of
+    depending on the one-time approval response it may no longer hold.
+    """
 
     execution_id: UUID
     state: str
+    version: int
+    approval_id: UUID | None
 
 
 class CurrentActionResponse(BaseModel):
@@ -103,17 +113,97 @@ class CurrentActionResponse(BaseModel):
     proposal_hash: str
     preview: RenderedPreviewProjection
     execution: ExecutionProjection
+    approval_authorization_current: bool
+    """Whether the durable approval (if any) is still valid for the case's authorization epoch.
+
+    ``True`` when there is no durable approval yet, or when the epoch recorded on the approval
+    row equals the case's *current* ``authorization_version``. ``False`` once a mandate
+    revocation (or any other authorization-sensitive edge) has bumped that epoch: the approval a
+    browser still holds no longer authorizes a send, so the frontend must hide "Execute" and
+    require a fresh compile/proposal/approval path. Send-time authority is still re-derived by
+    the Phase-8 fence regardless of this hint -- it exists so the UI stops offering a control
+    the server would refuse (P2), not to become a second authority.
+    """
+
+
+class EvidenceSummaryRowResponse(BaseModel):
+    fact_id: UUID
+    fact_type: str
+    sensitivity: str
+    evidence_status: str
+    status: str
+    contributor_id: UUID
+    evidence_ids: tuple[UUID, ...]
+    version: int
+
+
+class CommitmentSafeResponse(BaseModel):
+    """Every field of ``Commitment`` except the four deliberately omitted ones.
+
+    ``source_evidence_id`` and ``due_event_id`` are the correlation/replay identities the
+    watcher authenticates against, ``scheduler_name`` is transport addressing, and
+    ``verification_evidence_id`` names a private artifact. ``case_id`` and ``schema_version``
+    are already carried by the path and the response version.
+
+    ``schedule_status``/``schedule_last_error_code`` (P2-9) are the safe half of
+    ``CommitmentScheduleProjection`` -- whether the one-time schedule exists yet, and the one
+    closed code naming why not, never ``schedule_name`` or the due-event/replay identities the
+    watcher itself authenticates against.
+    """
+
+    commitment_id: UUID
+    action_id: UUID | None
+    obligor: str
+    action_text: str
+    due_at: str
+    verification_method: str
+    status: str
+    schedule_generation: int
+    version: int
+    verified_by_contributor_id: UUID | None
+    outcome_note: str | None
+    created_at: str
+    updated_at: str
+    schedule_status: str | None
+    schedule_last_error_code: str | None
+
+
+class PrivacyCountsResponse(BaseModel):
+    compile_id: UUID
+    included: int
+    excluded: int
+    denied_by_reason: dict[str, int]
+
+
+class CaseHeaderResponse(BaseModel):
+    case_id: UUID
+    title: str | None
+    state: str
+    version: int
+    authorization_version: int
+    issue_type: str
+    corroboration_source_count: int
+    state_reason_code: str
 
 
 class CaseSurfaceResponse(BaseModel):
-    """The frozen case surface, with the sections this phase owns.
+    """The frozen case surface: the Phase 7 section plus the five Phase 10 completes.
 
     ``current_action`` is ``null`` when the case has never held a proposal. That is a state, not
     an error: a case in ``READY_FOR_ACTION`` legitimately has no action yet.
+
+    For ``case_approver``, ``case.title``, ``evidence_summary``, and ``privacy_counts`` are
+    omitted -- the private title/fact labels and privacy exclusion reasons stay presenter-only,
+    and only view/action-safe fields remain.
     """
 
     case_id: UUID
+    case: CaseHeaderResponse | None
+    evidence_summary: tuple[EvidenceSummaryRowResponse, ...] | None
+    current_shareable_view: ShareableCaseViewBody | None
     current_action: CurrentActionResponse | None
+    commitments: tuple[CommitmentSafeResponse, ...]
+    privacy_counts: PrivacyCountsResponse | None
 
 
 @router.get("/cases/{case_id}", response_model=CaseSurfaceResponse)
@@ -135,16 +225,119 @@ async def read_case(
         community_id=container.community_id,
         case_id=CaseId(case_id),
     )
-    projection = await container.read_current_action.execute(scope)
+    action_projection = await container.read_current_action.execute(scope)
+    presenter = actor is DemoActor.PRESENTER_ADMIN
+
+    extras: CaseSurfaceExtras | None = None
+    if container.case_surface is not None:
+        extras = await container.case_surface.execute(scope)
+
     return CaseSurfaceResponse(
         case_id=case_id,
-        current_action=None if projection is None else _project(projection),
+        case=(
+            None
+            if extras is None
+            else CaseHeaderResponse(
+                case_id=extras.case.case_id,
+                title=extras.case.title if presenter else None,
+                state=extras.case.state.value,
+                version=extras.case.version,
+                authorization_version=extras.case.authorization_version,
+                issue_type=extras.case.issue_type,
+                corroboration_source_count=extras.case.corroboration_source_count,
+                state_reason_code=extras.case.state_reason_code,
+            )
+        ),
+        evidence_summary=(
+            None
+            if extras is None or not presenter
+            else tuple(
+                EvidenceSummaryRowResponse(
+                    fact_id=row.fact_id,
+                    fact_type=row.fact_type.value,
+                    sensitivity=row.sensitivity,
+                    evidence_status=row.evidence_status.value,
+                    status=row.status.value,
+                    contributor_id=row.contributor_id,
+                    evidence_ids=row.evidence_ids,
+                    version=row.version,
+                )
+                for row in extras.evidence_summary
+            )
+        ),
+        current_shareable_view=(
+            None
+            if extras is None or extras.current_shareable_view is None
+            else view_body(extras.current_shareable_view)
+        ),
+        current_action=(
+            None
+            if action_projection is None
+            else _project(
+                action_projection,
+                current_authorization_version=(
+                    None if extras is None else extras.case.authorization_version
+                ),
+            )
+        ),
+        commitments=(
+            ()
+            if extras is None
+            else tuple(
+                CommitmentSafeResponse(
+                    commitment_id=item.commitment_id,
+                    action_id=item.action_id,
+                    obligor=item.obligor,
+                    action_text=item.action_text,
+                    due_at=item.due_at,
+                    verification_method=item.verification_method,
+                    status=item.status.value,
+                    schedule_generation=item.schedule_generation,
+                    version=item.version,
+                    verified_by_contributor_id=item.verified_by_contributor_id,
+                    outcome_note=item.outcome_note,
+                    created_at=item.created_at,
+                    updated_at=item.updated_at,
+                    schedule_status=(
+                        None if item.schedule_status is None else item.schedule_status.value
+                    ),
+                    schedule_last_error_code=item.schedule_last_error_code,
+                )
+                for item in extras.commitments
+            )
+        ),
+        privacy_counts=(
+            None
+            if extras is None or extras.privacy_counts is None or not presenter
+            else PrivacyCountsResponse(
+                compile_id=extras.privacy_counts.compile_id,
+                included=extras.privacy_counts.included,
+                excluded=extras.privacy_counts.excluded,
+                denied_by_reason=extras.privacy_counts.denied_by_reason,
+            )
+        ),
     )
 
 
-def _project(projection: CurrentActionProjection) -> CurrentActionResponse:
-    """Map the query's projection onto the transport shape, adding nothing."""
+def _project(
+    projection: CurrentActionProjection,
+    *,
+    current_authorization_version: int | None,
+) -> CurrentActionResponse:
+    """Map the query's projection onto the transport shape.
 
+    The one derived field is ``approval_authorization_current``: a comparison between the
+    epoch the durable approval recorded and the case's live ``authorization_version``, both of
+    which are authoritative stored values. It is ``True`` when no approval exists yet, or when
+    the case surface was served without its header (the Phase-7 fallback), where there is no
+    current epoch to compare against and this route has nothing new to assert.
+    """
+
+    approval_authorization_current = (
+        projection.approval_authorization_version is None
+        or current_authorization_version is None
+        or projection.approval_authorization_version == current_authorization_version
+    )
     return CurrentActionResponse(
         action_id=projection.action_id.value,
         status=projection.status.value,
@@ -174,7 +367,10 @@ def _project(projection: CurrentActionProjection) -> CurrentActionResponse:
         execution=ExecutionProjection(
             execution_id=projection.execution_id.value,
             state=projection.execution_state.value,
+            version=projection.execution_version,
+            approval_id=None if projection.approval_id is None else projection.approval_id.value,
         ),
+        approval_authorization_current=approval_authorization_current,
     )
 
 

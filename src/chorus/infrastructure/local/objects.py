@@ -52,6 +52,22 @@ class InMemoryObjectStore:
 
     # -- seeding ------------------------------------------------------------------------
 
+    def purge_namespace(self, namespace: Namespace) -> int:
+        """Drop every stored object whose key belongs to ``namespace``.
+
+        Object keys begin ``ns/{namespace}/...`` (:mod:`chorus.ports.objects`), so this names
+        exactly one namespace and never touches another. Used only by the local demo reset,
+        which re-seeds the two private evidence objects immediately afterwards.
+        """
+
+        prefix = f"ns/{namespace.value}/"
+        removed = 0
+        for store in (self.private, self.export):
+            for key in [key for key in store if key.startswith(prefix)]:
+                del store[key]
+                removed += 1
+        return removed
+
     def seed_private_evidence(
         self,
         *,

@@ -35,6 +35,10 @@ from chorus.application.commands.apply_commitment import (
     ApplyCommitmentCommand,
     ApplyCommitmentResult,
 )
+from chorus.application.commands.create_due_schedule import (
+    CreateDueSchedule,
+    CreateDueScheduleCommand,
+)
 from chorus.application.operations import ApplicationOperations, extract_commitment_binding_hash
 from chorus.contracts.commitment import (
     COMMITMENT_EXTRACTION_PROMPT_VERSION,
@@ -70,14 +74,28 @@ from chorus.ports.agents import (
 )
 from chorus.ports.clock import Clock
 from chorus.ports.errors import PersistenceError
-from chorus.ports.records import AgentInvocationOutcome
-from chorus.ports.repositories import CoreRepositoryPort
+from chorus.ports.records import AgentInvocationOutcome, CommitmentScheduleStatus
+from chorus.ports.repositories import CoreRepositoryPort, ShareableRepositoryPort
 from chorus.ports.scopes import CaseScope
 from chorus.privacy.canonical import hash_value
 
 INTERNAL_ERROR_CODE = "INTERNAL_ERROR"
 EXTRACTION_INPUT_SCHEMA = "commitment-extraction-input-hash/v1"
 EXTRACTION_OUTPUT_SCHEMA = "commitment-extraction-output-hash/v1"
+SCHEDULE_INCOMPLETE_ERROR_CODE = "SCHEDULE_NOT_CREATED"
+
+
+class ExtractionScheduleIncomplete(Exception):
+    """The commitment was applied but its deadline schedule did not reach ``CREATED``.
+
+    The model call and the commitment are already durable, so this is not a failure of the
+    extraction -- it is a signal that the operation must go back to ``PENDING`` so a redelivery
+    retries only the idempotent ``CreateDueSchedule`` step (ADR-028 § 4), never the model.
+    """
+
+    def __init__(self, failure_code: str | None) -> None:
+        super().__init__(failure_code or SCHEDULE_INCOMPLETE_ERROR_CODE)
+        self.failure_code = failure_code or SCHEDULE_INCOMPLETE_ERROR_CODE
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -176,13 +194,22 @@ def extraction_output_hash(output: CommitmentExtractionOutput) -> Sha256Digest:
 
 @dataclass(slots=True)
 class ExtractCommitment:
-    """Invoke the extraction once over one artifact, then apply what deterministic code allows."""
+    """Invoke the extraction once over one artifact, then apply what deterministic code allows.
+
+    When ``schedule`` and ``schedule_commitments`` are wired (the local demo composition), a
+    successful apply that produced a commitment is followed -- in the same orchestration, never
+    in a route -- by exactly one ``CreateDueSchedule`` request for that commitment's deadline.
+    ``CreateDueSchedule`` is itself idempotent under the derived schedule name, so a recovered
+    or replayed extraction issues no second request.
+    """
 
     core: CoreRepositoryPort
     agent: CommitmentExtractionPort
     apply: ApplyCommitment
     clock: Clock
     policy_version: str
+    schedule: CreateDueSchedule | None = None
+    schedule_commitments: ShareableRepositoryPort | None = None
 
     async def execute(self, job: ExtractCommitmentJob) -> ApplyCommitmentResult:
         artifact = await self._artifact(job)
@@ -195,7 +222,7 @@ class ExtractCommitment:
 
         recovered = await self._recovered(job, input_hash)
         if recovered is not None:
-            return recovered
+            return await self._with_schedule(job, recovered)
 
         invocation = AgentInputEnvelope[CommitmentExtractionInput](
             schema_version=AGENT_INPUT_SCHEMA_VERSION,
@@ -215,7 +242,7 @@ class ExtractCommitment:
         )
         result = await self.agent.invoke_commitment_extraction(invocation)
         self._require_envelope(job, result)
-        return await self.apply.execute(
+        applied = await self.apply.execute(
             ApplyCommitmentCommand(
                 namespace=job.namespace,
                 community_id=job.community_id,
@@ -230,6 +257,48 @@ class ExtractCommitment:
                 output_hash=extraction_output_hash(result.output),
             )
         )
+        return await self._with_schedule(job, applied)
+
+    # -- scheduling -------------------------------------------------------------------
+
+    async def _with_schedule(
+        self, job: ExtractCommitmentJob, result: ApplyCommitmentResult
+    ) -> ApplyCommitmentResult:
+        """After a commitment is applied, ask the local scheduler for its deadline -- once.
+
+        ``CreateDueSchedule`` reads the strongly consistent schedule projection first and does
+        nothing when it is already ``CREATED``, so a recovered or replayed apply that reaches
+        here again issues no second request (ADR-028 § 4). Absent wiring, this is a no-op and
+        the deadline is driven by the demo clock alone, exactly as before.
+
+        When the scheduler adapter fails, ``CreateDueSchedule`` records the projection back at
+        ``PENDING_SCHEDULE`` and returns without raising; this raises
+        :class:`ExtractionScheduleIncomplete` so the operation goes back to ``PENDING`` rather
+        than terminally succeeding with the deadline unscheduled.
+        """
+
+        if (
+            result.commitment_id is None
+            or self.schedule is None
+            or self.schedule_commitments is None
+        ):
+            return result
+        commitment = await self.schedule_commitments.load_commitment(
+            job.scope, result.commitment_id
+        )
+        outcome = await self.schedule.execute(
+            CreateDueScheduleCommand(
+                namespace=job.namespace,
+                community_id=job.community_id,
+                commitment=commitment,
+                actor_id_hash=job.actor_id_hash,
+                correlation_id=job.correlation_id,
+                logical_now=self.clock.now(),
+            )
+        )
+        if outcome.status is not CommitmentScheduleStatus.CREATED:
+            raise ExtractionScheduleIncomplete(outcome.failure_code)
+        return result
 
     # -- guards --------------------------------------------------------------------------
 
@@ -357,6 +426,12 @@ class ExtractCommitmentOperationWorker:
             )
         try:
             result = await self.extract.execute(job)
+        except ExtractionScheduleIncomplete as incomplete:
+            # The model call and the commitment are durable; only the deadline schedule did not
+            # take. Return the operation to PENDING so a redelivery retries the idempotent
+            # CreateDueSchedule step -- never the model -- rather than terminally succeeding
+            # with the commitment unscheduled.
+            return await self._release_for_reschedule(job, claimed, incomplete.failure_code)
         except (AgentError, PersistenceError, DomainError) as error:
             return await self._settle(job, claimed, error_code=_safe_code(error))
         except Exception:
@@ -410,6 +485,27 @@ class ExtractCommitmentOperationWorker:
                 namespace=job.namespace, operation_id=job.operation_id
             )
 
+    async def _release_for_reschedule(
+        self,
+        job: ExtractCommitmentJob,
+        claimed: ApplicationOperation,
+        failure_code: str,
+    ) -> ApplicationOperation:
+        observability.lambda_replay(
+            namespace=job.namespace,
+            community_id=job.community_id,
+            operation_id=job.operation_id,
+            invocation_id=job.invocation_id,
+            correlation_id=job.correlation_id,
+            outcome=failure_code,
+        )
+        try:
+            return await self.operations.release_for_reschedule(claimed)
+        except (StateTransitionError, PersistenceError):
+            return await self.operations.load(
+                namespace=job.namespace, operation_id=job.operation_id
+            )
+
     def _emit_replay(self, job: ExtractCommitmentJob, outcome: str) -> None:
         observability.lambda_replay(
             namespace=job.namespace,
@@ -433,10 +529,12 @@ def _safe_code(error: Exception) -> str:
 __all__ = [
     "EXTRACTION_INPUT_SCHEMA",
     "EXTRACTION_OUTPUT_SCHEMA",
+    "SCHEDULE_INCOMPLETE_ERROR_CODE",
     "ExtractCommitment",
     "ExtractCommitmentJob",
     "ExtractCommitmentJobBinding",
     "ExtractCommitmentOperationWorker",
+    "ExtractionScheduleIncomplete",
     "extraction_input_hash",
     "extraction_output_hash",
 ]

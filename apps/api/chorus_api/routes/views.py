@@ -226,7 +226,7 @@ def _response(result: CompileViewResult) -> CompileViewResponse:
         decision="ALLOW",
         compile_id=result.compile_id,
         audit_event_id=result.audit_event_id,
-        view=None if view is None else _view_body(view),
+        view=None if view is None else view_body(view),
         included=[
             IncludedFactBody(
                 fact_id=entry.fact_id.value, export_fact_ids=list(entry.export_fact_ids)
@@ -241,7 +241,7 @@ def _response(result: CompileViewResult) -> CompileViewResponse:
     )
 
 
-def _view_body(view: StoredShareableView) -> ShareableCaseViewBody:
+def view_body(view: StoredShareableView) -> ShareableCaseViewBody:
     return ShareableCaseViewBody(
         schema_version=view.schema_version,
         view_id=view.view_id.value,

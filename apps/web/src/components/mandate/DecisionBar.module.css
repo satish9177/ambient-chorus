@@ -1,0 +1,40 @@
+.bar {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-3) 0;
+  flex-wrap: wrap;
+}
+
+.button {
+  border: 1px solid var(--color-neutral-border);
+  background: var(--color-surface);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-4);
+  font-weight: 600;
+}
+
+.button[data-variant="approve"] {
+  border-color: var(--color-success-border);
+  color: var(--color-success-text);
+}
+
+.button[data-variant="adjust"] {
+  border-color: var(--color-private-border);
+  color: var(--color-private-strong);
+}
+
+.button[data-variant="refuse"],
+.button[data-variant="revoke"] {
+  border-color: var(--color-danger-border);
+  color: var(--color-danger-text);
+}
+
+.button:disabled {
+  opacity: 0.55;
+}
+
+.hint {
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+}

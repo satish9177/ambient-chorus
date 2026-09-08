@@ -156,6 +156,50 @@ class InMemoryStorageDriver:
         else:
             self._current.pop(address, None)
 
+    async def purge_namespace(self, namespace: str) -> int:
+        """Delete every item whose partition key belongs to ``namespace``, in any table.
+
+        Bounded by construction: the frozen three-table grammar prefixes every partition key
+        with ``NS#{namespace}`` (or ``NS#{namespace}#...``), so this walks the committed set
+        once and removes exactly one namespace -- it is not a table-wide scan, and it can name
+        no partition outside the namespace it was handed. Used only by the local demo reset,
+        which then re-seeds; nothing in the repository layer can reach it.
+        """
+
+        exact = f"NS#{namespace}"
+        prefix = f"NS#{namespace}#"
+        victims = [
+            address
+            for address in self._current
+            if address[1] == exact or address[1].startswith(prefix)
+        ]
+        for address in victims:
+            self._previous[address] = self._current.get(address)
+            self._current.pop(address, None)
+        # A re-seed transaction reuses deterministic client-request tokens; the dedup window
+        # would otherwise silently skip the write that repopulates the namespace just purged.
+        self._tokens.clear()
+        return len(victims)
+
+    async def namespace_items(self, namespace: str) -> tuple[StoredItem, ...]:
+        """Every committed item whose partition key belongs to ``namespace``, in any table.
+
+        The read counterpart of :meth:`purge_namespace`, and bounded the same way: the frozen
+        three-table grammar prefixes every partition key with ``NS#{namespace}``, so this walks
+        the committed set once and returns exactly one namespace's rows. It is local-only --
+        there is deliberately no ``Scan`` on the production :class:`StorageDriver` port -- and
+        the demo reset uses it to establish that no execution anywhere in the namespace it is
+        about to erase is still SENDING or SEND_UNKNOWN.
+        """
+
+        exact = f"NS#{namespace}"
+        prefix = f"NS#{namespace}#"
+        return tuple(
+            _copy_item(item)
+            for address, item in self._current.items()
+            if address[1] == exact or address[1].startswith(prefix)
+        )
+
     async def get_item(self, key: ItemKey, *, consistent: bool) -> StoredItem | None:
         return self._read(self._address(key), consistent=consistent)
 

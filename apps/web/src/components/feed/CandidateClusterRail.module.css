@@ -1,0 +1,44 @@
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-shareable-border);
+  background: var(--color-shareable-bg);
+  border-radius: var(--radius-md);
+}
+
+.title {
+  margin: 0;
+  color: var(--color-shareable-strong);
+  font-size: 1rem;
+}
+
+.subtitle {
+  margin: 2px 0 0;
+  font-size: 0.85rem;
+  color: var(--color-shareable-text);
+}
+
+.cta {
+  flex: none;
+  font-weight: 600;
+  color: var(--color-shareable-strong);
+  text-decoration: none;
+  border: 1px solid var(--color-shareable-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface);
+}
+
+.cta:hover {
+  background: var(--color-shareable-bg);
+}

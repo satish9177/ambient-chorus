@@ -83,5 +83,17 @@ class InMemoryDeadlineScheduler:
 
         return len(self.created)
 
+    def reset(self) -> None:
+        """Drop every recorded schedule and request log.
+
+        Used only by the local demo reset, which erases the namespace these schedules belong
+        to; V1 has one demo namespace, so clearing the lot is exact rather than approximate.
+        """
+
+        self.schedules.clear()
+        self.created.clear()
+        self.outcomes.clear()
+        self.describe_calls.clear()
+
 
 __all__ = ["InMemoryDeadlineScheduler"]

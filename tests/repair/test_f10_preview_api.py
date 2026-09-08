@@ -271,7 +271,13 @@ async def test_the_surface_exposes_no_private_or_internal_value(
         "preview_hash",
         "matches_committed_hash",
     }
-    assert set(action["execution"]) == {"execution_id", "state"}
+    # Phase 10 adds `version` -- the row's own OCC version, surfaced so a browser can submit
+    # `expected_execution_version` without guessing it (08-api-design.md § Execution version).
+    # The frontend repair pass adds `approval_id` (`None` at DRAFT) so a browser that approved a
+    # proposal and reloaded before executing can recover the exact binding `POST .../executions`
+    # requires, instead of depending on the one-time approval response (P2-4).
+    assert set(action["execution"]) == {"execution_id", "state", "version", "approval_id"}
+    assert action["execution"]["approval_id"] is None
 
 
 # ---------------------------------------------------------------------------------------
@@ -290,12 +296,21 @@ async def test_the_approver_may_read_the_surface(
     assert response.json()["current_action"] is not None
 
 
-async def test_a_resident_may_not_read_the_surface(
+async def test_a_resident_reads_the_safe_subset_only(
     proposed: ActionHarness, storage: StorageDriver
 ) -> None:
+    """A resident is admitted (P1-1) so they can see a due commitment to verify it -- but they
+    get the same strictly-safe subset the approver does, never the private title / evidence
+    summary / privacy counts, and the private surfaces stay presenter-only elsewhere."""
+
     response, _api, _result = await _surface(proposed, storage, actor="resident_a")
 
-    assert response.status_code == 403
+    assert response.status_code == 200
+    body = response.json()
+    assert body["current_action"] is not None
+    assert body["case"] is None or body["case"]["title"] is None
+    assert body["evidence_summary"] is None
+    assert body["privacy_counts"] is None
 
 
 async def test_an_actor_header_is_required(proposed: ActionHarness, storage: StorageDriver) -> None:

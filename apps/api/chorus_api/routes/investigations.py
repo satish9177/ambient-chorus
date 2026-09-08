@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from chorus.application.commands.run_investigation import InvestigationReason
@@ -31,12 +31,14 @@ from chorus.application.operations import (
     StartReservation,
     investigate_binding_hash,
 )
+from chorus.application.queries.investigation import InvestigationProjectionResponse
 from chorus.application.services.mandate_terms import key_hash
 from chorus.domain.entities import ApplicationOperationKind, ApplicationOperationStatus
 from chorus.domain.ids import CaseId, Sha256Digest
 from chorus.ports.errors import PersistenceConflictError
 from chorus.ports.idempotency import IdempotentCommand
 from chorus.ports.operations import InvestigationOperationJob
+from chorus.ports.scopes import CaseScope
 from chorus_api.dependencies import (
     ApiContainer,
     DemoActor,
@@ -190,3 +192,242 @@ def _key_hash(idempotency_key: str) -> Sha256Digest:
     """Hash the caller's key, because caller text never enters a storage key."""
 
     return key_hash(f"investigate-start\x1f{idempotency_key}")
+
+
+# -- GET /cases/{case_id}/investigation: the private investigation surface -------------------
+
+
+class FactResponse(BaseModel):
+    fact_id: UUID
+    fact_type: str
+    sensitivity: str
+    value_preview: str
+    evidence_status: str
+    status: str
+    contributor_id: UUID
+    evidence_ids: tuple[UUID, ...]
+    source_message_ids: tuple[UUID, ...]
+    version: int
+
+
+class ReportResponse(BaseModel):
+    report_id: UUID
+    contributor_id: UUID
+    status: str
+    created_at: str
+
+
+class FindingResponse(BaseModel):
+    fact_id: UUID
+    evidence_status: str
+    reason_code: str
+
+
+class ContradictionResponse(BaseModel):
+    statement_fact_ids: tuple[UUID, ...]
+    description: str
+    materiality: str
+
+
+class AlternativeExplanationResponse(BaseModel):
+    description: str
+    cited_report_ids: tuple[UUID, ...]
+    cited_fact_ids: tuple[UUID, ...]
+    cited_evidence_ids: tuple[UUID, ...]
+
+
+class AssessmentResponse(BaseModel):
+    assessment_id: UUID
+    based_on_case_version: int
+    linkage_decision: str
+    independent_source_count: int
+    is_corroborated: bool
+    recommended_disposition: str
+    assessment_hash: str
+    created_at: str
+    findings: tuple[FindingResponse, ...]
+    contradictions: tuple[ContradictionResponse, ...]
+    alternative_explanations: tuple[AlternativeExplanationResponse, ...]
+
+
+class CompileFactResponse(BaseModel):
+    fact_id: UUID
+    included: bool
+    granted_scope: str | None
+    reason_codes: tuple[str, ...]
+    export_fact_ids: tuple[UUID, ...]
+    transformation_rule_id: str | None
+
+
+class CompileEvidenceResponse(BaseModel):
+    source_evidence_id: UUID
+    included: bool
+    reason_codes: tuple[str, ...]
+    export_handle_id: UUID | None
+    derivative_sha256: str | None
+
+
+class CompileExplanationResponse(BaseModel):
+    compile_id: UUID
+    decision: str
+    based_on_case_version: int
+    policy_version: str
+    compiler_version: str
+    view_id: UUID | None
+    view_hash: str | None
+    reason_codes: tuple[str, ...]
+    facts: tuple[CompileFactResponse, ...]
+    evidence: tuple[CompileEvidenceResponse, ...]
+
+
+class InvestigationCaseResponse(BaseModel):
+    case_id: UUID
+    title: str
+    state: str
+    version: int
+    authorization_version: int
+    corroboration_source_count: int
+
+
+class InvestigationResponse(BaseModel):
+    case: InvestigationCaseResponse
+    reports: tuple[ReportResponse, ...]
+    facts: tuple[FactResponse, ...]
+    assessment: AssessmentResponse | None
+    compile: CompileExplanationResponse | None
+
+
+@router.get("/cases/{case_id}/investigation", response_model=InvestigationResponse)
+async def read_investigation(
+    request: Request,
+    case_id: UUID,
+    actor: Annotated[DemoActor, Depends(require_actor)],
+) -> InvestigationResponse:
+    """Presenter-only. Creates nothing; the private half of ``PrivacyBoundaryCompare``."""
+
+    require_presenter(actor)
+    container: ApiContainer = container_of(request)
+    if container.investigation is None:
+        raise HTTPException(status_code=503, detail="The investigation surface is not wired.")
+    scope = CaseScope(
+        namespace=container.namespace,
+        community_id=container.community_id,
+        case_id=CaseId(case_id),
+    )
+    projection: InvestigationProjectionResponse = await container.investigation.execute(scope)
+    return InvestigationResponse(
+        case=InvestigationCaseResponse(
+            case_id=projection.case.case_id,
+            title=projection.case.title,
+            state=projection.case.state.value,
+            version=projection.case.version,
+            authorization_version=projection.case.authorization_version,
+            corroboration_source_count=projection.case.corroboration_source_count,
+        ),
+        reports=tuple(
+            ReportResponse(
+                report_id=report.report_id,
+                contributor_id=report.contributor_id,
+                status=report.status.value,
+                created_at=report.created_at.isoformat(),
+            )
+            for report in projection.reports
+        ),
+        facts=tuple(
+            FactResponse(
+                fact_id=fact.fact_id,
+                fact_type=fact.fact_type.value,
+                sensitivity=fact.sensitivity.value,
+                value_preview=fact.value_preview,
+                evidence_status=fact.evidence_status.value,
+                status=fact.status.value,
+                contributor_id=fact.contributor_id,
+                evidence_ids=fact.evidence_ids,
+                source_message_ids=fact.source_message_ids,
+                version=fact.version,
+            )
+            for fact in projection.facts
+        ),
+        assessment=(
+            None
+            if projection.assessment is None
+            else AssessmentResponse(
+                assessment_id=projection.assessment.assessment_id,
+                based_on_case_version=projection.assessment.based_on_case_version,
+                linkage_decision=projection.assessment.linkage_decision,
+                independent_source_count=projection.assessment.independent_source_count,
+                is_corroborated=projection.assessment.is_corroborated,
+                recommended_disposition=projection.assessment.recommended_disposition,
+                assessment_hash=projection.assessment.assessment_hash,
+                created_at=projection.assessment.created_at.isoformat(),
+                findings=tuple(
+                    FindingResponse(
+                        fact_id=f.fact_id,
+                        evidence_status=f.evidence_status.value,
+                        reason_code=f.reason_code,
+                    )
+                    for f in projection.assessment.findings
+                ),
+                contradictions=tuple(
+                    ContradictionResponse(
+                        statement_fact_ids=c.statement_fact_ids,
+                        description=c.description,
+                        materiality=c.materiality,
+                    )
+                    for c in projection.assessment.contradictions
+                ),
+                alternative_explanations=tuple(
+                    AlternativeExplanationResponse(
+                        description=a.description,
+                        cited_report_ids=a.cited_report_ids,
+                        cited_fact_ids=a.cited_fact_ids,
+                        cited_evidence_ids=a.cited_evidence_ids,
+                    )
+                    for a in projection.assessment.alternative_explanations
+                ),
+            )
+        ),
+        compile=(
+            None
+            if projection.compile is None
+            else CompileExplanationResponse(
+                compile_id=projection.compile.compile_id,
+                decision=projection.compile.decision.value,
+                based_on_case_version=projection.compile.based_on_case_version,
+                policy_version=projection.compile.policy_version,
+                compiler_version=projection.compile.compiler_version,
+                view_id=None
+                if projection.compile.view_id is None
+                else projection.compile.view_id.value,
+                view_hash=(
+                    None
+                    if projection.compile.view_hash is None
+                    else projection.compile.view_hash.value
+                ),
+                reason_codes=projection.compile.reason_codes,
+                facts=tuple(
+                    CompileFactResponse(
+                        fact_id=f.fact_id.value,
+                        included=f.included,
+                        granted_scope=None if f.granted_scope is None else f.granted_scope.value,
+                        reason_codes=f.reason_codes,
+                        export_fact_ids=tuple(item.value for item in f.export_fact_ids),
+                        transformation_rule_id=f.transformation_rule_id,
+                    )
+                    for f in projection.compile.facts
+                ),
+                evidence=tuple(
+                    CompileEvidenceResponse(
+                        source_evidence_id=e.source_evidence_id.value,
+                        included=e.included,
+                        reason_codes=e.reason_codes,
+                        export_handle_id=e.export_handle_id,
+                        derivative_sha256=(
+                            None if e.derivative_sha256 is None else e.derivative_sha256.value
+                        ),
+                    )
+                    for e in projection.compile.evidence
+                ),
+            )
+        ),
+    )

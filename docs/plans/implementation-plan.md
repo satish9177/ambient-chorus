@@ -229,9 +229,18 @@ Three ADRs are accepted at the Phase-9 freeze gate, each closing a place where i
 
 **Dependencies:** stable API/OpenAPI for all flows.
 
-**Files/modules:** `apps/web/src/{api,components,surfaces,styles}`, generated schema, UI tests/Playwright.
+**Files/modules:** `apps/web/src/{api,components,surfaces,styles}`, generated schema, UI tests/Playwright; `src/chorus/composition/local.py`, `apps/api/chorus_api/asgi.py`, the reset application service and its `chorus-demo`/`chorus-api`/`chorus-openapi` entry points, four read queries and their routes, `tests/smoke/test_local_hero_flow.py`.
 
 **Tasks:** token/persona session; feed timeline/signals; mandate form/history; case stepper/evidence/contradiction; always-obvious private vs shareable compare; privacy table; deterministic preview/approval/execution; commitment/verification; operation polling; stale/unknown/error states; responsive/accessibility.
+
+**Phase 10 also owns the backend support without which none of the above has a data source.** The UI gate found the frontend architecture frozen and complete, and the API half of its contract incomplete: nine of the sixteen hero-flow steps had no working read, and nothing outside pytest could construct an `ApiContainer`. Four ownership decisions follow, and each is *local*, with the deployed counterpart staying in Phase 11 under the same static-now split the runtimes, the compiler, and the sender already use.
+
+1. **The local runnable composition root** ([11](../architecture/11-frontend-and-demo.md#the-local-composition-root)) — an ASGI factory over a container of the local fakes that already exist, requiring no AWS credentials and reaching no live service. It also wires the five Phase-9 slots the earlier composition left `None`, which is what moves the reply, clock, and verification routes off their `503`. Wiring changes no Phase-9 domain or security semantics.
+2. **The local demo reset and seed path** ([08](../architecture/08-api-design.md#reset)) — the reset application service, the route, and the `chorus-demo reset` command against local adapters. Phase 11 owns the durable manifest row, the reset lock, S3 prefix deletion, and schedule deletion.
+3. **Read-only query plumbing over repository methods that already exist** — the five remaining `GET /cases/{case_id}` sections, `execution.version`, `GET /cases/{case_id}/investigation`, `GET /cases/{case_id}/audit`, and `GET /session`. Every one was already frozen in [08](../architecture/08-api-design.md) and simply never built; every one reads a method the persistence layer already exposes. **No new domain state, no new pointer, no new persisted projection, no write path, and no ADR** — the one field that is new, `execution.version`, is the row's existing OCC version surfaced so a browser stops having to guess it.
+4. **The deterministic OpenAPI export and TypeScript client generation** ([11](../architecture/11-frontend-and-demo.md#generated-api-types-never-hand-written-ones)), with both artifacts committed and diff-checked in CI. Phase 10's own stated dependency is "stable API/OpenAPI for all flows", and nothing generated one.
+
+The `tests/smoke/test_local_hero_flow.py` backend-only HTTP smoke is the executable form of gate 10→11's "full local smoke" and lands **before** the frontend, so a UI failure can never be confused with a backend gap.
 
 **Tests:** component query/error/loading states; no dangerous HTML; exact version/hash submission; accessibility; Playwright three-surface flow and sentinel absence from safe DOM/network.
 
@@ -239,7 +248,7 @@ Three ADRs are accepted at the Phase-9 freeze gate, each closing a place where i
 
 **Risks:** visual scope creep and polling timing. Reuse small components and fixed script; polish boundary comparison first.
 
-**Do not implement:** dashboard suite, admin/settings/users, mobile app, realtime websockets, design-system package.
+**Do not implement:** dashboard suite, admin/settings/users, mobile app, realtime websockets, design-system package; any AWS deployment of the local composition, live SES, AgentCore, or EventBridge wiring, or the durable demo-manifest and reset-lock rows -- all of which stay in Phase 11. No read added here may grow a write verb, and no private field may reach a shareable-zone response.
 
 ## Phase 11 — AWS deployment and AgentCore hardening
 

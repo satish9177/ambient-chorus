@@ -1,0 +1,57 @@
+.panel {
+  border: 1px solid var(--color-shareable-border);
+  background: var(--color-shareable-bg);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  height: 100%;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.title {
+  margin: 0;
+  color: var(--color-shareable-strong);
+  font-size: 1rem;
+}
+
+.meta {
+  font-size: 0.78rem;
+  color: var(--color-shareable-text);
+  margin-bottom: var(--space-3);
+}
+
+.factRow {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--color-shareable-border) 60%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  margin-bottom: var(--space-2);
+  font-size: 0.88rem;
+}
+
+.factMeta {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+  font-size: 0.76rem;
+  color: var(--color-text-muted);
+}
+
+.counts {
+  display: flex;
+  gap: var(--space-3);
+  font-size: 0.82rem;
+  color: var(--color-shareable-text);
+  margin-bottom: var(--space-3);
+}
+
+.empty {
+  font-size: 0.85rem;
+  color: var(--color-shareable-text);
+}

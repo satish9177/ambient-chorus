@@ -54,6 +54,7 @@ Lambda async delivery may repeat; the operation/input hash and underlying comman
 | `POST /ingest/messages` | presenter admin/synthetic adapter | 202 monitor operation | channel-message uniqueness; content-bound key |
 | `GET /feed` | presenter/admin | 200 page | namespace/community isolation |
 | `GET /operations/{operation_id}` | initiating role/presenter | 200 status | actor/case visibility |
+| `GET /session` | any seeded persona | 200 persona binding | actor header resolves the persona; no body |
 | `GET /cases/{case_id}` | presenter/approver safe subset | 200 case surface | case membership; approver gets no private data |
 | `GET /cases/{case_id}/investigation` | presenter admin | 200 private projection | private role only |
 | `POST /cases/{case_id}/mandates` | presenter admin | 200 proposals + case version | case `CANDIDATE`; expected case version; no active send fence |
@@ -85,7 +86,36 @@ These endpoints support exactly the three UI surfaces; route count does not impl
 }
 ```
 
-Returns `{reset_id, namespace, seed_version, counts, logical_now, audit_event_id}`. It rejects production, non-DEMO namespaces, active `SENDING` or `SEND_UNKNOWN` executions, unresolved target prefixes, or unknown seed version. Reset details are in the demo doc.
+It rejects a non-`DEMO` namespace, an environment that is not `test`/`development`/`demo`, an active `SENDING` or `SEND_UNKNOWN` execution, an unresolved target prefix, or an unknown seed version. Reset details are in the demo doc.
+
+The frozen response:
+
+```json
+{
+  "reset_id": "uuid",
+  "namespace": "DEMO",
+  "seed_version": "elevator/v1",
+  "corpus_sha256": "sha256:6a501c33bdac1765fafe17b9f988a4cf06fed5935b95b9a44f1ab9c9621b337d",
+  "logical_now": "2030-01-14T09:00:00.000000Z",
+  "community_id": "18669fad-d8e1-5995-99fd-296c1ac62a9a",
+  "destination_id": "property_manager:demo",
+  "contributors": [
+    {"actor": "resident_a", "pseudonym": "resident-a", "contributor_id": "c635eb97-..."}
+  ],
+  "evidence": [{"evidence_id": "uuid", "media_type": "image/jpeg", "sha256": "sha256:..."}],
+  "counts": {"deleted": 0, "messages": 24, "contributors": 4, "evidence": 2},
+  "replayed": false,
+  "audit_event_id": "uuid"
+}
+```
+
+Every identifier in it is UUIDv5-derived from the seed manifest, so two resets of the same seed return the same values — that is what makes the response usable as the UI's entry point and what makes the reset idempotent in the sense that matters: a repeated reset produces an identical namespace, not merely a second successful call. `replayed` reports whether the `Idempotency-Key` matched a completed reset; a repeat under a *new* key re-runs the delete-and-seed and still lands on the same identifiers.
+
+**Reset seeds, and only seeds.** It creates the community, the four contributors, the logical clock, the 24 messages, the two private evidence objects, the destination registry entry, and the reply fixture catalog. It creates **no** report, fact, candidate case, assessment, mandate proposal or decision, view, action, approval, execution, commitment, schedule, or verification result — those are live outcomes, and a reset that pre-created one would be the demo asserting a result it had not earned. It runs no agent, no compiler, no sender, and no watcher.
+
+`counts.messages` is `24` and `corpus_sha256` is the manifest's declared corpus digest, both verified against the bytes on load. A response whose count or digest disagrees with the manifest is a failed reset, not a reset with a warning.
+
+**Ownership.** Phase 10 owns the reset application service, its local invocation path, and this route against local adapters. Phase 11 owns the deployed version: the durable `DemoManifest` row and `DEMO_RESET_LOCK` in the demo-manifest partition, S3 prefix resolution and bounded deletion, and EventBridge schedule deletion. The service is one implementation with one contract; what changes between the two is which adapters it holds, and a local reset therefore deletes local storage and local objects by exactly the manifest-listed enumeration the deployed one uses — never a scan, never a recursive delete, never a table or bucket drop.
 
 ### Ingest messages
 
@@ -130,9 +160,124 @@ commitments: [CommitmentSafeProjection]
 privacy_counts: {included,excluded,denied_by_reason}
 ```
 
-`current_action` is the Phase-7 section and is served by `ReadCurrentAction`: the immutable proposal's safe fields, the **regenerated** plain-text and HTML preview with the `preview_hash` the proposal committed and whether the two still agree, and the safe `DRAFT` execution projection. Nothing is read back from a persisted body, because ADR-022 § 3 stores neither. The remaining sections arrive with the phases that own their artifacts; a case with no proposal returns `current_action: null`, which is a state rather than an error. Reading a `DRAFT` here is Phase 7 — approving or sending one is Phase 8, and neither verb exists on this surface.
+`current_action` is the Phase-7 section and is served by `ReadCurrentAction`: the immutable proposal's safe fields, the **regenerated** plain-text and HTML preview with the `preview_hash` the proposal committed and whether the two still agree, and the safe `DRAFT` execution projection. Nothing is read back from a persisted body, because ADR-022 § 3 stores neither. A case with no proposal returns `current_action: null`, which is a state rather than an error. Reading a `DRAFT` here is Phase 7 — approving or sending one is Phase 8, and neither verb exists on this surface.
+
+**Phase 10 completes the other five sections**, and completes them as *reads over repository methods that already exist*. No section adds domain state, a persisted projection, a new pointer, or a write path; each is a query and a serializer over a method the persistence layer already exposes. Every field below is either an identifier, a closed enum, a count, a digest, a version, or text that is already externally safe.
+
+| Section | Source | Shape |
+|---|---|---|
+| `case` | `CoreRepositoryPort.read_case_for_display` | `{case_id, title, issue_type, state, version, authorization_version, corroboration_source_count, state_reason_code}` |
+| `evidence_summary` | `CoreRepositoryPort.read_case_facts` | `[{fact_id, fact_type, sensitivity, evidence_status, status, contributor_id, evidence_ids[], version}]` |
+| `current_shareable_view` | `load_current_view_pointer` → `load_view` | `ShareableCaseView` (the exact body `POST /views` already returns) or `null` |
+| `current_action` | `ReadCurrentAction` | unchanged, plus `execution.version` (§ B below) |
+| `commitments` | `ShareableRepositoryPort.read_case_commitments` | `[CommitmentSafeProjection]` |
+| `privacy_counts` | current view's compile projection | `{compile_id, included, excluded, denied_by_reason}` |
+
+`case.title` is a **private** field. It is returned to `presenter_admin` and omitted for `case_approver`, which is the rule the paragraph below already states; `state`, the two versions, and the counts are safe for both.
+
+`evidence_summary` carries **no `FactValue`**. It is the fact's identity, type, sensitivity category, resolved `evidence_status`, and owner — enough for `EvidenceStatusList` to render a row and a lock, and never the private text behind it. It is presenter-only for the same reason `case.title` is.
+
+`CommitmentSafeProjection` is frozen as:
+
+```json
+{
+  "commitment_id": "uuid",
+  "action_id": "uuid-or-null",
+  "obligor": "Property manager",
+  "action_text": "restore elevator B to service",
+  "due_at": "2030-01-14T00:00:00.000000Z",
+  "verification_method": "resident confirmation",
+  "status": "PENDING|DUE|FULFILLED|MISSED|CANCELLED",
+  "schedule_generation": 1,
+  "version": 3,
+  "verified_by_contributor_id": "uuid-or-null",
+  "outcome_note": "string-or-null",
+  "created_at": "...",
+  "updated_at": "..."
+}
+```
+
+It is every field of `Commitment` except the four that are omitted deliberately — `source_evidence_id` and `due_event_id` are the correlation and replay identities the watcher authenticates against, `scheduler_name` is transport addressing, and `verification_evidence_id` names a private artifact — plus `case_id` and `schema_version`, which the path and the response version already carry. `obligor`, `action_text`, and `verification_method` are already span-cited safe text produced by the deterministic validator under [ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md), not model prose. `version` is present because `POST .../verification` requires `expected_version`, and a client that cannot read a version cannot submit one.
+
+`privacy_counts` is located without a new pointer. The compile transaction already writes an audit event carrying `AuditEntityRef(entity_type="COMPILER_AUDIT_PROJECTION", entity_id=compile_id)` alongside its `SHAREABLE_VIEW` ref, so the query resolves the current view's `compile_id` from the case's own audit events and then reads `load_compile_projection`. Counts come from `CompileExplanation.included_count` / `.excluded_count`, and `denied_by_reason` is a tally of the exclusion `reason_codes` already on that projection. The per-fact rows behind those counts are **private** and live on the investigation surface below, never here: `ExcludedFactBody` names a private `fact_id` against a denial reason, which is exactly the pairing the safe zone must not carry. `privacy_counts` is `null` when the case has no current view.
 
 For `case_approver`, private title/fact labels and privacy exclusion reasons are omitted; only view/action-safe fields remain. `GET .../investigation` returns reports, private facts, contradictions, root/independence groups, assessment, and per-fact compile inclusion/exclusion explanations to presenter admin. Contradictions are returned structured, each with its cited fact IDs, description, and `materiality`; alternative explanations are returned with their citations; each fact carries its resolved `evidence_status`. It never returns contributor contact or private S3 URI; private evidence uses a separate controlled preview reference.
+
+#### Execution version on the case surface
+
+`current_action.execution` is `{execution_id, state, version}`. The `version` field is added in Phase 10 and it closes a hole rather than adding a feature: `POST .../approvals`, `POST .../invalidation`, and `POST .../executions` all require `expected_execution_version`, and before this field no read returned one. A browser that cannot read the version can only guess it, and a guessed optimistic-concurrency token is the browser deciding that the row it is about to authorize has not moved — which is precisely the decision [11](11-frontend-and-demo.md) forbids it from making. It is the row's existing OCC version, surfaced; it is not a new counter, and it is not the `authorization_version`.
+
+#### Private investigation projection
+
+`GET /v1/cases/{case_id}/investigation`, `presenter_admin` only, is a read over `read_case_facts`, `read_case_reports`, `load_current_assessment`, and `ReadCompileExplanation`. It creates nothing and it is the private half of `PrivacyBoundaryCompare`.
+
+```text
+case: {case_id, title, state, version, authorization_version, corroboration_source_count}
+reports: [{report_id, contributor_id, evidence_root_id, created_at}]
+facts: [{fact_id, fact_type, sensitivity, value_preview, evidence_status, status,
+         contributor_id, evidence_ids[], source_message_ids[], version}]
+assessment: {assessment_id, based_on_case_version, linkage_decision,
+             independent_source_count, is_corroborated, recommended_disposition,
+             assessment_hash, created_at,
+             findings: [{fact_id, evidence_status, reason_code}],
+             contradictions: [{statement_fact_ids[], description, materiality}],
+             alternative_explanations: [{description, cited_report_ids[],
+                                         cited_fact_ids[], cited_evidence_ids[]}]} | null
+compile: {compile_id, decision, based_on_case_version, policy_version, compiler_version,
+          view_id, view_hash, reason_codes[],
+          facts: [{fact_id, included, granted_scope, reason_codes[],
+                   export_fact_ids[], transformation_rule_id}],
+          evidence: [{source_evidence_id, included, reason_codes[],
+                      export_handle_id, derivative_sha256}]} | null
+```
+
+`facts[].value_preview` is the private fact text and it is the one genuinely private payload on this surface. That is the point of the surface: the demo's strongest single moment is a presenter pointing at the mother's health detail and the injected instruction on the left, and their absence from the compiled view on the right. It is served to `presenter_admin` alone, it never appears in the case surface, it never appears in an Action input, and no shareable-zone component may receive it (§ [11](11-frontend-and-demo.md) freezes that boundary in the type system).
+
+`findings[].evidence_status` is the **resolved** status, never the model's proposal: it is the deterministic recomputation against the downgrade-only ladder of [ADR-015](../adr/ADR-015-evidence-status-and-verification.md), and `reason_code` is the single closed code explaining how it got there. No proposed status is persisted, so none is returned; a UI that wanted to show "the agent asked for `VERIFIED` and was refused" has nothing to read, and that is correct — the assessment records what application code decided.
+
+`compile` is `ReadCompileExplanation` verbatim, resolved through the same audit-event ref chain `privacy_counts` uses. It never returns a bucket, a key, a private S3 URI, a contributor contact value, a prompt, or a model completion — the projection type cannot hold any of them.
+
+#### Safe audit page
+
+`GET /v1/cases/{case_id}/audit?limit=100&cursor=...`, `presenter_admin` only, pages `read_case_events` in occurrence order:
+
+```json
+{
+  "items": [{
+    "audit_event_id": "uuid",
+    "event_type": "compile.decided",
+    "occurred_at": "...",
+    "actor_type": "HUMAN|AGENT|SYSTEM",
+    "decision": "ALLOW|DENY|NONE",
+    "reason_codes": ["SCOPE_INTERNAL_ONLY"],
+    "entity_refs": [{"entity_type": "COMPILER_AUDIT_PROJECTION", "entity_id": "uuid", "version": null}],
+    "safe_details": {"count": 4, "rule_id": "redact/v1"},
+    "correlation_id": "uuid",
+    "causation_id": "uuid-or-null",
+    "input_hash": "sha256:...",
+    "output_hash": "sha256:..."
+  }],
+  "next_cursor": "string-or-null"
+}
+```
+
+`actor_id_hash` and `idempotency_key_hash` are omitted. They identify *who* and *which request* rather than *what happened*, they are a correlation channel across personas, and no audit drawer needs them. Everything returned is already a closed code, a bounded count, an identifier, or a digest — `AuditDetails` cannot hold free text, which is what makes "no raw payload leakage" a property of the type rather than a review promise.
+
+#### Persona session binding
+
+`GET /v1/session`, any seeded persona, no body:
+
+```json
+{
+  "actor": "resident_b",
+  "contributor_id": "4b112227-4176-5cfb-bb9a-370d96f4a73a",
+  "community_id": "18669fad-d8e1-5995-99fd-296c1ac62a9a",
+  "namespace": "DEMO",
+  "capabilities": ["DECIDE_MANDATE", "VERIFY_COMMITMENT"]
+}
+```
+
+`contributor_id` is `null` for `presenter_admin` and `case_approver`, which act as no contributor. This exists because the persona-to-contributor mapping is seeded configuration held only in the composition root: before it, the only way a browser learned a `contributor_id` was the transient `POST /cases/{id}/mandates` response, so a page reload lost the binding and `GET /contributors/{id}/mandates/current` became unaddressable. It is a read of `container.contributor_by_actor` for the *calling* persona only — it resolves who the caller already is and can neither enumerate other personas nor name one. `capabilities` is a closed set derived from the same `require_*` predicates the routes enforce; it is display guidance for the UI, never authorization, and the routes re-decide independently.
 
 ### Mandate thread and decision
 

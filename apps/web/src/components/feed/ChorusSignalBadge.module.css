@@ -1,0 +1,19 @@
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  text-decoration: none;
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+.link:hover {
+  background: var(--color-shareable-bg);
+}
+
+.label {
+  font-size: 0.85rem;
+  color: var(--color-shareable-strong);
+  font-weight: 500;
+}

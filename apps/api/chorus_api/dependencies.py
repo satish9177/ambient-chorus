@@ -37,10 +37,14 @@ from chorus.application.commands.propose_mandates import ProposeMandates
 from chorus.application.commands.record_commitment_due import RecordCommitmentDue
 from chorus.application.commands.verify_commitment import VerifyCommitment
 from chorus.application.operations import ApplicationOperations
+from chorus.application.queries.audit_page import ReadCaseAudit
+from chorus.application.queries.case_surface import ReadCaseSurface
 from chorus.application.queries.current_action import ReadCurrentAction
 from chorus.application.queries.feed import ReadAmbientFeed
+from chorus.application.queries.investigation import ReadInvestigation
 from chorus.application.queries.mandates import ReadMandateThread
 from chorus.application.services.inbound_mail import InboundMailAttester
+from chorus.composition.demo_reset import DemoResetService
 from chorus.domain.entities import Commitment
 from chorus.domain.ids import (
     CaseId,
@@ -174,6 +178,27 @@ class ApiContainer:
 
     dispatcher: OperationDispatchPort
 
+    reset_demo: DemoResetService | None = None
+    """The Phase 10 local reset service, or ``None`` for a composition with no reset route.
+
+    Optional for the same reason ``verify_commitment`` is: a composition may wire every read
+    surface without it, and a route that finds it absent answers ``503`` rather than pretending
+    a reset happened.
+    """
+
+    investigation: ReadInvestigation | None = None
+    """The Phase 10 private investigation read, presenter-only. ``None`` answers ``503``."""
+
+    audit_page: ReadCaseAudit | None = None
+    """The Phase 10 safe audit page read, presenter-only. ``None`` answers ``503``."""
+
+    case_surface: ReadCaseSurface | None = None
+    """The Phase 10 completion of the five remaining ``GET /cases/{id}`` sections.
+
+    ``None`` falls back to the Phase 7 ``current_action``-only surface, which is what every
+    existing Phase 3-9 contract test still constructs and still expects to keep working.
+    """
+
     async def read_commitment(self, *, case_id: CaseId, commitment_id: CommitmentId) -> Commitment:
         """Strongly read one commitment for the demo clock route, or refuse.
 
@@ -223,16 +248,25 @@ def require_presenter(actor: DemoActor) -> DemoActor:
 
 
 def require_case_reader(actor: DemoActor) -> DemoActor:
-    """Restrict the case surface to the two personas the frozen access table names.
+    """Admit any seeded persona to the case surface; the route serves each its safe subset.
 
-    ``GET /cases/{case_id}`` is "presenter/approver safe subset". The presenter runs the demo
-    and the approver has to read a proposal before deciding on it; a resident persona has no
-    business reading the case surface, and this route returns action-safe data only, so the
-    approver's narrower view and the presenter's coincide for everything Phase 7 puts here.
+    ``GET /cases/{case_id}`` returns action-safe data only. The presenter gets the full
+    presenter subset (private title, evidence summary, privacy counts); every other persona --
+    the approver, and a resident -- gets the strictly narrower shareable subset the route
+    already computes for a non-presenter: no private title, no evidence summary, no privacy
+    counts, and nothing the compiler did not mark shareable.
+
+    A resident is admitted because the *only* path by which a case is resolved is a resident
+    recording an affected contributor's verification of a due commitment
+    (``POST .../commitments/{id}/verification``), and the commitment they must see to do that
+    lives on this surface. Before this repair a resident reached it only by the browser
+    replaying an earlier presenter/approver identity -- a privileged read elevation this
+    persona never held (P1-1). Removing that elevation without admitting the resident here
+    would leave them no honest way to see their own community's due commitment. The private
+    surfaces stay presenter-only regardless: ``GET .../investigation`` and ``GET .../audit``
+    still call :func:`require_presenter`.
     """
 
-    if actor not in {DemoActor.PRESENTER_ADMIN, DemoActor.CASE_APPROVER}:
-        raise HTTPException(status_code=403, detail="This surface requires a case reader role.")
     return actor
 
 

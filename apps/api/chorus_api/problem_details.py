@@ -273,6 +273,12 @@ def register_problem_handlers(app: FastAPI) -> None:
             shape=shape,
             instance=safe_instance(request),
             correlation_id=correlation_id_of(request),
+            # Additive: a domain error that carries a closed ``safe_code`` (an
+            # ``ApprovalDeniedError`` naming which stale binding it refused, a ``SendDeniedError``
+            # naming a replay-table outcome) reports it here so a caller can tell a stale/binding
+            # conflict apart from an ordinary malformed body -- both otherwise arrive as
+            # ``VALIDATION_ERROR``. It is a fixed enum value, never a stored value or a hash.
+            reason_codes=_domain_reason_codes(error),
         )
 
     @app.exception_handler(PersistenceError)
@@ -310,6 +316,24 @@ def register_problem_handlers(app: FastAPI) -> None:
             # revealing the identifier, quotation, or text that failed it.
             reason_codes=error.reason_codes,
         )
+
+
+_SAFE_REASON_CODE: Final = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+
+def _domain_reason_codes(error: DomainError) -> tuple[str, ...]:
+    """The closed ``safe_code`` a domain error declares, if any, pattern-checked before use.
+
+    Only errors that opted in by defining ``safe_code`` (``ApprovalDeniedError``,
+    ``SendDeniedError``) contribute one; a plain ``ValidationError`` or ``IntegrityError`` has
+    none and the field stays empty, exactly as before. The pattern guard is belt-and-braces: a
+    ``safe_code`` is always a ``StrEnum`` value defined in this repository, never caller text.
+    """
+
+    value = getattr(error, "safe_code", None)
+    if isinstance(value, str) and _SAFE_REASON_CODE.fullmatch(value) is not None:
+        return (value,)
+    return ()
 
 
 def correlation_id_of(request: Request) -> UUID:

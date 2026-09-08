@@ -30,8 +30,10 @@ from chorus_api.problem_details import (
 from chorus_api.routes import (
     actions,
     approvals,
+    audit,
     cases,
     commitments,
+    demo,
     feed,
     ingest,
     investigations,
@@ -85,6 +87,10 @@ def build_app(container: ApiContainer) -> FastAPI:
     # satisfy a promise or resolve a case.
     app.include_router(replies.router, prefix=API_PREFIX)
     app.include_router(commitments.router, prefix=API_PREFIX)
+    # The Phase-10 surfaces: local reset/session, and the two private/safe reads that complete
+    # the case surface's contract.
+    app.include_router(demo.router, prefix=API_PREFIX)
+    app.include_router(audit.router, prefix=API_PREFIX)
     return app
 
 
