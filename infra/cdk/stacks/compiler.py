@@ -52,6 +52,27 @@ locators, and -- because the compiler's Shareable writes are confined to these t
 the compile idempotency record as well.
 """
 
+SHAREABLE_READ_KEY_PREFIXES = (
+    "NS#*#VIEW#*",
+    "NS#*#VIEW_CURRENT#*",
+    "NS#*#ACTION#*",
+    "NS#*#ACTION_CURRENT#*",
+)
+"""The safe/shareable partitions the send-authorization service reads to compile a send.
+
+``CompilerSendAuthorization`` runs *inside* the compiler Lambda and, before it can acquire the
+send fence, it reloads the shareable side of the case: ``load_view`` (``VIEW#``),
+``load_current_view_pointer`` (``VIEW_CURRENT#``), ``load_current_action_pointer``
+(``ACTION_CURRENT#``), ``load_proposal`` and ``load_approval`` (both ``ACTION#``). ``CompileView``
+reads the first two. Without this grant every one of those calls is ``AccessDenied`` in the
+deployed system and no send can ever be authorized (deployment contract SS 8.2).
+
+``EXECUTION#`` is deliberately excluded -- the compiler never loads an execution, the sender
+loads its own -- and so is ``CASE#`` on the Shareable table, whose partitions are the watcher's.
+The prefixes are distinct literals: ``NS#*#VIEW#*`` matches neither ``VIEW_CURRENT`` nor
+``EXECUTION``, and ``NS#*#ACTION#*`` matches neither ``ACTION_CURRENT`` nor ``EXECUTION``.
+"""
+
 CASE_KEY_PREFIX = "NS#*#CASE#*"
 """Case partitions. The compiler reads these and condition-checks them; it never writes one."""
 
@@ -260,6 +281,23 @@ class ChorusCompilerStack(Stack):
                 resources=[tables.shareable.table_arn],
                 conditions={
                     "ForAllValues:StringLike": {"dynamodb:LeadingKeys": list(VIEW_KEY_PREFIXES)}
+                },
+            )
+        )
+        # Read-only authority over the safe/shareable records the send-authorization service
+        # reloads before it acquires the fence. Read actions only: no ``PutItem`` here, so the
+        # compiler still creates a view and nothing else on this table, and the ``ACTION#`` /
+        # ``ACTION_CURRENT#`` partitions it may now read it still cannot write.
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadShareableViewAndActionPrefixes",
+                effect=iam.Effect.ALLOW,
+                actions=list(READ_ACTIONS),
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": list(SHAREABLE_READ_KEY_PREFIXES)
+                    }
                 },
             )
         )

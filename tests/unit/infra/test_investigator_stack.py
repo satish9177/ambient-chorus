@@ -19,7 +19,9 @@ from infra.cdk.config import CdkBuildConfig
 from infra.cdk.stacks import ChorusAgentStack
 from infra.cdk.stacks.agents import (
     AGENTCORE_SERVICE_PRINCIPAL,
-    DENIED_DATA_PLANE_ACTIONS,
+    DENIED_DATASTORE_ACTIONS,
+    DENIED_EVIDENCE_OBJECT_ACTIONS,
+    DENIED_OBJECT_MUTATION_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
     INVESTIGATOR_STATEMENT_IDS,
     MONITOR_STATEMENT_IDS,
@@ -65,6 +67,8 @@ def test_the_two_runtimes_have_separate_statement_identifiers() -> None:
         "emit_traces",
         "read_artifact",
         "deny_data",
+        "deny_evidence_objects",
+        "deny_object_mutation",
         "deny_effects",
     )
     monitor = {getattr(MONITOR_STATEMENT_IDS, name) for name in fields}
@@ -101,8 +105,42 @@ def test_the_investigator_is_denied_every_data_store() -> None:
     built = template()
     denied = statement(built, INVESTIGATOR_STATEMENT_IDS.deny_data)
     assert denied["Effect"] == "Deny"
-    assert set(denied["Action"]) == set(DENIED_DATA_PLANE_ACTIONS)
+    assert set(denied["Action"]) == set(DENIED_DATASTORE_ACTIONS)
     assert denied["Resource"] == "*"
+    assert not any(str(a).startswith("s3:") for a in denied["Action"])
+
+
+def test_the_investigator_evidence_object_deny_is_bucket_scoped() -> None:
+    """SS 6: the ``GetObject`` deny names the evidence buckets, so the artifact prefix is free."""
+
+    built = template()
+    denied = statement(built, INVESTIGATOR_STATEMENT_IDS.deny_evidence_objects)
+    assert denied["Effect"] == "Deny"
+    assert set(denied["Action"]) == set(DENIED_EVIDENCE_OBJECT_ACTIONS)
+    rendered = str(denied["Resource"])
+    assert "chorus-private-evidence" in rendered and "chorus-export-evidence" in rendered
+    assert denied["Resource"] != "*"
+
+    mutation = statement(built, INVESTIGATOR_STATEMENT_IDS.deny_object_mutation)
+    assert mutation["Resource"] == "*"
+    assert set(mutation["Action"]) == set(DENIED_OBJECT_MUTATION_ACTIONS)
+    assert "s3:GetObject" not in mutation["Action"]
+
+
+def test_the_investigator_reads_its_own_artifact_with_no_deny_overriding_it() -> None:
+    """ALLOW own artifact object; DENY another runtime's (no allow names it)."""
+
+    built = template(artifact_bucket_arn="arn:aws:s3:::chorus-artifacts")
+    allow = statement(built, INVESTIGATOR_STATEMENT_IDS.read_artifact)
+    assert allow["Resource"] == "arn:aws:s3:::chorus-artifacts/investigator/*"
+
+    for item in statements(built):
+        if item["Effect"] != "Deny":
+            continue
+        acts = item["Action"] if isinstance(item["Action"], list) else [item["Action"]]
+        if "s3:GetObject" in acts:
+            assert "chorus-artifacts" not in str(item["Resource"])
+            assert item["Resource"] != "*"
 
 
 def test_the_investigator_is_denied_every_external_effect_and_every_other_agent() -> None:
@@ -137,5 +175,11 @@ def test_neither_runtime_is_granted_a_data_action_anywhere() -> None:
         if item.get("Effect") == "Allow":
             action = item["Action"]
             allowed.update({action} if isinstance(action, str) else action)
-    assert allowed & set(DENIED_DATA_PLANE_ACTIONS) - {"s3:GetObject"} == set()
+    forbidden = (
+        set(DENIED_DATASTORE_ACTIONS)
+        | set(DENIED_EVIDENCE_OBJECT_ACTIONS)
+        | set(DENIED_OBJECT_MUTATION_ACTIONS)
+    )
+    # ``s3:GetObject`` is the one the artifact grant legitimately uses.
+    assert allowed & forbidden - {"s3:GetObject"} == set()
     assert allowed & set(DENIED_SIDE_EFFECT_ACTIONS) == set()

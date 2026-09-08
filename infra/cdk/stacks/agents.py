@@ -38,7 +38,7 @@ from infra.cdk.config import CdkBuildConfig
 
 AGENTCORE_SERVICE_PRINCIPAL = "bedrock-agentcore.amazonaws.com"
 
-DENIED_DATA_PLANE_ACTIONS = (
+DENIED_DATASTORE_ACTIONS = (
     "dynamodb:GetItem",
     "dynamodb:BatchGetItem",
     "dynamodb:Query",
@@ -48,12 +48,8 @@ DENIED_DATA_PLANE_ACTIONS = (
     "dynamodb:DeleteItem",
     "dynamodb:TransactWriteItems",
     "dynamodb:TransactGetItems",
-    "s3:GetObject",
-    "s3:PutObject",
-    "s3:DeleteObject",
-    "s3:ListBucket",
 )
-"""Storage no agent runtime may ever touch.
+"""Every DynamoDB action, denied table-wide on ``*``. No agent runtime reaches a data store.
 
 The Monitor and the Investigator are inside the private zone and are deliberately *given*
 private text in their payloads. That is exactly why neither may also read the stores: a
@@ -67,6 +63,41 @@ redundant one -- a runtime that could read the Shareable table could read *other
 and a runtime that could read Core could read the private facts its own view was compiled to
 exclude. Being given only safe data is not the same as being unable to reach unsafe data.
 """
+
+DENIED_EVIDENCE_OBJECT_ACTIONS = (
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:ListBucket",
+)
+"""Read and write, denied on the private and export evidence buckets **by name**.
+
+This used to be a blanket ``s3:GetObject`` deny on ``*`` folded into the data-store list -- and
+because an explicit deny always wins, it also caught each runtime's own direct-code artifact
+object, so no AgentCore runtime could cold-start (deployment contract SS 6). Splitting it so the
+``GetObject`` denial is scoped to the evidence resources it is actually about is *stronger*, not
+weaker: private-evidence and export isolation is now stated against those buckets, and the
+artifact prefix each runtime must read is left readable. No agent can read either evidence
+bucket, and the DynamoDB denies above are untouched.
+"""
+
+DENIED_OBJECT_MUTATION_ACTIONS = (
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:ListBucket",
+)
+"""Write and list, denied on ``*``.
+
+A runtime reads exactly its own artifact prefix and nothing else. It never writes an object
+anywhere and never enumerates a bucket, so these stay a wildcard deny -- an action wildcard
+inside a deny is the strongest form, and there is no legitimate object write on any of these
+roles for it to collide with.
+"""
+
+DENIED_DATA_PLANE_ACTIONS = (*DENIED_DATASTORE_ACTIONS, *DENIED_EVIDENCE_OBJECT_ACTIONS)
+"""The union an external sweep still reasons about: every table action plus every evidence
+object action. Retained as the name other modules and tests import; the two denies it spans are
+now written as separate statements so the artifact read is not caught by the object one."""
 
 DENIED_SIDE_EFFECT_ACTIONS = (
     "ses:SendEmail",
@@ -112,6 +143,8 @@ class RuntimeStatementIds:
     emit_traces: str
     read_artifact: str
     deny_data: str
+    deny_evidence_objects: str
+    deny_object_mutation: str
     deny_effects: str
 
 
@@ -121,6 +154,8 @@ MONITOR_STATEMENT_IDS = RuntimeStatementIds(
     emit_traces="EmitOwnTraces",
     read_artifact="ReadOwnDirectCodeArtifact",
     deny_data="DenyEveryDataStore",
+    deny_evidence_objects="DenyEvidenceObjectAccess",
+    deny_object_mutation="DenyObjectMutation",
     deny_effects="DenyEveryExternalEffect",
 )
 
@@ -130,6 +165,8 @@ INVESTIGATOR_STATEMENT_IDS = RuntimeStatementIds(
     emit_traces="EmitOwnInvestigatorTraces",
     read_artifact="ReadOwnInvestigatorArtifact",
     deny_data="DenyEveryDataStoreForInvestigator",
+    deny_evidence_objects="DenyEvidenceObjectAccessForInvestigator",
+    deny_object_mutation="DenyObjectMutationForInvestigator",
     deny_effects="DenyEveryExternalEffectForInvestigator",
 )
 
@@ -139,6 +176,8 @@ ACTION_STATEMENT_IDS = RuntimeStatementIds(
     emit_traces="EmitOwnActionTraces",
     read_artifact="ReadOwnActionArtifact",
     deny_data="DenyEveryDataStoreForAction",
+    deny_evidence_objects="DenyEvidenceObjectAccessForAction",
+    deny_object_mutation="DenyObjectMutationForAction",
     deny_effects="DenyEveryExternalEffectForAction",
 )
 
@@ -162,6 +201,14 @@ class ChorusAgentStack(Stack):
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)
         Tags.of(self).add("DataClass", "PRIVATE")
+
+        # The two evidence buckets, named exactly as the data stack names them so the
+        # ``GetObject`` deny can be stated against the resources it protects rather than
+        # against ``*``. Literals rather than a cross-stack reference, in the same way
+        # ``_default_profile_arn`` builds the inference-profile ARN: the deny must be present and
+        # correctly scoped even when this stack is synthesized on its own.
+        self._private_bucket_arn = f"arn:aws:s3:::chorus-private-evidence-{config.environment}"
+        self._export_bucket_arn = f"arn:aws:s3:::chorus-export-evidence-{config.environment}"
 
         self.monitor_log_group = logs.LogGroup(
             self,
@@ -259,13 +306,20 @@ class ChorusAgentStack(Stack):
         artifact_prefix: str,
         sids: RuntimeStatementIds,
     ) -> None:
-        """Attach one agent runtime's complete allow list and its two explicit denies.
+        """Attach one agent runtime's complete allow list and its explicit denies.
 
         One helper for every agent, so the boundary is a property of one construction rather
-        than of two blocks that happen to look alike today. The denies are defence in depth:
+        than of three blocks that happen to look alike today. The denies are defence in depth:
         none of them is reachable through an allow, and an explicit deny cannot be overridden by
         a later grant, so a future change that accidentally attaches a data policy to one of
         these roles still fails closed.
+
+        The S3 deny is deliberately in two parts. ``deny_evidence_objects`` names the private
+        and export buckets and denies read and write on both; ``deny_object_mutation`` denies
+        write and list on ``*``. Together they forbid every object write anywhere, every bucket
+        listing, and any read of either evidence bucket -- while leaving ``s3:GetObject`` on the
+        runtime's own artifact prefix reachable, which a blanket ``GetObject`` deny made
+        impossible (deployment contract SS 6).
         """
 
         role.add_to_policy(
@@ -308,7 +362,28 @@ class ChorusAgentStack(Stack):
             iam.PolicyStatement(
                 sid=sids.deny_data,
                 effect=iam.Effect.DENY,
-                actions=list(DENIED_DATA_PLANE_ACTIONS),
+                actions=list(DENIED_DATASTORE_ACTIONS),
+                resources=["*"],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid=sids.deny_evidence_objects,
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_EVIDENCE_OBJECT_ACTIONS),
+                resources=[
+                    self._private_bucket_arn,
+                    f"{self._private_bucket_arn}/*",
+                    self._export_bucket_arn,
+                    f"{self._export_bucket_arn}/*",
+                ],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                sid=sids.deny_object_mutation,
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_OBJECT_MUTATION_ACTIONS),
                 resources=["*"],
             )
         )

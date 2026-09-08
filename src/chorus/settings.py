@@ -55,6 +55,18 @@ class Settings(BaseSettings):
     audit_table: str = "chorus-audit-development"
     private_evidence_bucket: str = "chorus-private-evidence-development"
     export_evidence_bucket: str = "chorus-export-evidence-development"
+    private_evidence_key_arn: str | None = None
+    export_evidence_key_arn: str | None = None
+    """The exact KMS key ARN each evidence bucket is encrypted under, from CDK outputs.
+
+    ``S3ObjectStore`` passes these as ``SSEKMSKeyId`` on every ``put_object``. The deployed
+    bucket policy denies a write whose ``s3:x-amz-server-side-encryption-aws-kms-key-id`` is
+    absent or not the configured key, so a production composition that leaves these unset must
+    fail closed rather than write an object the policy rejects (deployment contract SS 9). They
+    stay **separate** so the private/export trust split is two keys and not one. ``None`` in the
+    environments Phase 9 ships, where the in-memory object store is used and no bucket policy is
+    evaluated.
+    """
     dynamodb_endpoint: AnyHttpUrl | None = AnyHttpUrl("http://localhost:8000")
     local_data_dir: Path = Path(".local")
 

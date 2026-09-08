@@ -44,10 +44,16 @@ def build_app() -> App:
         "AmbientChorusData",
         config=config,
     )
+    # The customer artifact bucket is a third bucket, separate from both evidence buckets and
+    # their keys, because agent code is not evidence (deployment contract SS 6). Its ARN is a
+    # literal derived from the environment token -- the same shape every other stack uses for a
+    # cross-stack name -- so each runtime role can scope ``s3:GetObject`` to its own
+    # ``{agent}/*`` prefix. No bucket resource is created here.
     ChorusAgentStack(
         app,
         "AmbientChorusAgents",
         config=config,
+        artifact_bucket_arn=f"arn:aws:s3:::chorus-agent-artifacts-{config.environment}",
     )
     ChorusCompilerStack(
         app,

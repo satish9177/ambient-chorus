@@ -25,7 +25,9 @@ from infra.cdk.config import CdkBuildConfig
 from infra.cdk.stacks import ChorusAgentStack
 from infra.cdk.stacks.agents import (
     AGENTCORE_SERVICE_PRINCIPAL,
-    DENIED_DATA_PLANE_ACTIONS,
+    DENIED_DATASTORE_ACTIONS,
+    DENIED_EVIDENCE_OBJECT_ACTIONS,
+    DENIED_OBJECT_MUTATION_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
 )
 
@@ -109,11 +111,12 @@ def test_the_role_writes_only_to_its_own_log_group() -> None:
     assert "ActionRuntimeLogGroup" in str(allowed["Resource"])
 
 
-@pytest.mark.parametrize("action", sorted(DENIED_DATA_PLANE_ACTIONS))
+@pytest.mark.parametrize("action", sorted(DENIED_DATASTORE_ACTIONS))
 def test_every_data_store_action_is_explicitly_denied(action: str) -> None:
     denied = statement("DenyEveryDataStoreForAction")
 
     assert denied["Effect"] == "Deny"
+    assert denied["Resource"] == "*"
     assert action in denied["Action"]
 
 
@@ -148,9 +151,46 @@ def test_the_role_can_never_read_core_shareable_or_audit() -> None:
 
 
 def test_the_role_can_never_read_or_write_either_evidence_bucket() -> None:
-    denied = actions_of("DenyEveryDataStoreForAction")
+    """SS 6: the evidence ``GetObject`` deny is scoped to the two buckets, never to ``*``."""
 
-    assert {"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"} <= denied
+    denied = statement("DenyEvidenceObjectAccessForAction")
+
+    assert denied["Effect"] == "Deny"
+    assert set(denied["Action"]) == set(DENIED_EVIDENCE_OBJECT_ACTIONS)
+    assert {"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"} <= set(
+        denied["Action"]
+    )
+    rendered = str(denied["Resource"])
+    assert "chorus-private-evidence" in rendered and "chorus-export-evidence" in rendered
+    assert denied["Resource"] != "*"
+
+    mutation = statement("DenyObjectMutationForAction")
+    assert mutation["Resource"] == "*"
+    assert set(mutation["Action"]) == set(DENIED_OBJECT_MUTATION_ACTIONS)
+    assert "s3:GetObject" not in mutation["Action"]
+
+
+def test_the_action_runtime_reads_its_own_artifact_and_no_deny_overrides_it() -> None:
+    """ALLOW own artifact object; the deny split is what keeps it reachable (I8)."""
+
+    document = template(artifact_bucket_arn="arn:aws:s3:::chorus-agent-artifacts").find_resources(
+        POLICY_TYPE
+    )
+    items = [
+        item
+        for policy in document.values()
+        for item in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    allow = next(item for item in items if item.get("Sid") == "ReadOwnActionArtifact")
+    assert allow["Resource"] == "arn:aws:s3:::chorus-agent-artifacts/action/*"
+
+    for item in items:
+        if item["Effect"] != "Deny":
+            continue
+        acts = item["Action"] if isinstance(item["Action"], list) else [item["Action"]]
+        if "s3:GetObject" in acts:
+            assert item["Resource"] != "*"
+            assert "chorus-agent-artifacts" not in str(item["Resource"])
 
 
 def test_the_role_can_never_send_email() -> None:

@@ -23,6 +23,7 @@ from infra.cdk.stacks.compiler import (
     DENIED_MODEL_ACTIONS,
     DENIED_OBJECT_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
+    SHAREABLE_READ_KEY_PREFIXES,
 )
 
 
@@ -338,6 +339,120 @@ def test_the_compiler_cannot_invoke_a_model(compiler: Template) -> None:
 
     assert not any(action.startswith("bedrock") for action in granted)
     assert not any(action.startswith("ses:") for action in granted)
+
+
+# -- I6: the compiler's Shareable read authority for send authorization ------------------
+
+
+def shareable_statements(template: Template) -> list[dict[str, Any]]:
+    """Every statement that names the Shareable table, allow or deny."""
+
+    return [
+        item for item in statements(template) if "ShareableTable" in json.dumps(item["Resource"])
+    ]
+
+
+def test_the_compiler_reads_the_safe_view_and_action_shareable_prefixes(
+    compiler: Template,
+) -> None:
+    """SS 8.2: ``CompilerSendAuthorization`` reloads the shareable side before the fence.
+
+    ``load_view``/``load_current_view_pointer``/``load_current_action_pointer``/
+    ``load_proposal``/``load_approval`` all read one of these four partitions, and every one is
+    ``AccessDenied`` without this grant -- which makes a send impossible in the deployed system.
+    """
+
+    read = statement(compiler, "ReadShareableViewAndActionPrefixes")
+
+    assert read["Effect"] == "Allow"
+    assert actions(read) == {"dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query"}
+    assert leading_keys(read) == [
+        "NS#*#VIEW#*",
+        "NS#*#VIEW_CURRENT#*",
+        "NS#*#ACTION#*",
+        "NS#*#ACTION_CURRENT#*",
+    ]
+    assert leading_keys(read) == list(SHAREABLE_READ_KEY_PREFIXES)
+    assert not actions(read) & WRITE_ACTIONS
+
+
+def test_the_compiler_shareable_read_excludes_execution_and_case_partitions(
+    compiler: Template,
+) -> None:
+    """``EXECUTION#`` is the sender's to load; Shareable ``CASE#`` is the watcher's.
+
+    Neither prefix is granted, and the literals cannot reach them by accident: ``NS#*#ACTION#*``
+    requires the ``#ACTION#`` delimiter, which ``NS#DEMO#EXECUTION#...`` does not contain.
+    """
+
+    for item in shareable_statements(compiler):
+        if item["Effect"] != "Allow":
+            continue
+        for prefix in leading_keys(item):
+            assert not prefix.startswith("NS#*#EXECUTION#")
+            assert not prefix.startswith("NS#*#CASE#")
+
+
+def test_no_shareable_write_grant_reaches_beyond_the_view_prefixes(compiler: Template) -> None:
+    """The read grant widens no write: the only Shareable write is still ``VIEW``/``VIEW_CURRENT``.
+
+    An exhaustive sweep rather than a spot check -- a future statement that granted a write on
+    ``ACTION#`` or ``EXECUTION#`` would have to pass this and could not.
+    """
+
+    for item in shareable_statements(compiler):
+        if item["Effect"] != "Allow":
+            continue
+        granted = actions(item) & WRITE_ACTIONS
+        if not granted:
+            continue
+        prefixes = leading_keys(item)
+        assert prefixes, f"{item['Sid']} grants {granted} on Shareable with no LeadingKeys"
+        assert all(
+            prefix.startswith(("NS#*#VIEW#", "NS#*#VIEW_CURRENT#")) for prefix in prefixes
+        ), f"{item['Sid']} grants {granted} outside the view prefixes: {prefixes}"
+
+
+def test_the_shareable_read_grant_adds_no_core_authority(compiler: Template) -> None:
+    """I6 touches the Shareable table only. Core reads/writes are exactly as before.
+
+    One Core read grant (``ReadPrivateCore``), one Core write grant (``WriteSendFenceOnly``),
+    two read-only condition checks -- and no statement the read repair added names Core.
+    """
+
+    read = statement(compiler, "ReadShareableViewAndActionPrefixes")
+    assert "CoreTable" not in json.dumps(read["Resource"])
+
+    core_allows = [item for item in core_statements(compiler) if item["Effect"] == "Allow"]
+    sids = {item["Sid"] for item in core_allows}
+    assert sids == {
+        "ReadPrivateCore",
+        "ConditionCheckCaseVersion",
+        "ConditionCheckSendFence",
+        "WriteSendFenceOnly",
+    }
+
+
+def test_the_shareable_read_grant_does_not_reintroduce_a_model_or_ses_path(
+    compiler: Template,
+) -> None:
+    """Preserved invariant: the compiler decides policy, it never asks a model and never sends.
+
+    Restated here beside the I6 change so a future edit to the read grant that also loosened
+    the deny is caught in the same file.
+    """
+
+    assert actions(statement(compiler, "DenyModelAccess")) == set(DENIED_MODEL_ACTIONS)
+    assert "bedrock-agentcore:InvokeAgentRuntime" in actions(statement(compiler, "DenyModelAccess"))
+    assert actions(statement(compiler, "DenySideEffects")) == set(DENIED_SIDE_EFFECT_ACTIONS)
+
+    granted = {
+        action
+        for item in statements(compiler)
+        if item["Effect"] == "Allow"
+        for action in actions(item)
+    }
+    assert not any(action.startswith(("bedrock", "ses:", "sesv2:")) for action in granted)
 
 
 # -- the buckets --------------------------------------------------------------------------

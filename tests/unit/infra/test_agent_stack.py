@@ -21,7 +21,9 @@ from infra.cdk.config import CdkBuildConfig
 from infra.cdk.stacks import ChorusAgentStack
 from infra.cdk.stacks.agents import (
     AGENTCORE_SERVICE_PRINCIPAL,
-    DENIED_DATA_PLANE_ACTIONS,
+    DENIED_DATASTORE_ACTIONS,
+    DENIED_EVIDENCE_OBJECT_ACTIONS,
+    DENIED_OBJECT_MUTATION_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
 )
 
@@ -95,12 +97,14 @@ def test_the_role_writes_only_to_its_own_log_group() -> None:
     }
 
 
-@pytest.mark.parametrize("action", sorted(DENIED_DATA_PLANE_ACTIONS))
+@pytest.mark.parametrize("action", sorted(DENIED_DATASTORE_ACTIONS))
 def test_every_data_store_action_is_explicitly_denied(action: str) -> None:
     denied = statement("DenyEveryDataStore")
 
     assert denied["Effect"] == "Deny"
+    assert denied["Resource"] == "*"
     assert action in denied["Action"]
+    assert not any(str(a).startswith("s3:") for a in denied["Action"])
 
 
 @pytest.mark.parametrize("action", sorted(DENIED_SIDE_EFFECT_ACTIONS))
@@ -118,9 +122,49 @@ def test_the_role_can_never_read_a_dynamodb_table() -> None:
 
 
 def test_the_role_can_never_read_or_write_either_evidence_bucket() -> None:
-    denied = actions_of("DenyEveryDataStore")
+    """SS 6: the GetObject deny is scoped to the evidence buckets it protects, not to ``*``.
 
-    assert {"s3:GetObject", "s3:PutObject", "s3:ListBucket"} <= denied
+    Read and write on both the private and the export bucket -- and their objects -- are denied
+    by name, which is stronger than the wildcard that also blocked the runtime's own artifact.
+    """
+
+    denied = statement("DenyEvidenceObjectAccess")
+
+    assert denied["Effect"] == "Deny"
+    assert set(denied["Action"]) == set(DENIED_EVIDENCE_OBJECT_ACTIONS)
+    assert {"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"} <= set(
+        denied["Action"]
+    )
+    rendered = str(denied["Resource"])
+    assert "chorus-private-evidence" in rendered
+    assert "chorus-export-evidence" in rendered
+    assert denied["Resource"] != "*" and "*" not in [denied["Resource"]]
+
+
+def test_the_role_can_never_write_or_list_any_bucket() -> None:
+    """``deny_object_mutation`` keeps write and list denied on ``*`` -- read is not, so the
+    artifact prefix stays reachable."""
+
+    denied = statement("DenyObjectMutation")
+
+    assert denied["Effect"] == "Deny"
+    assert denied["Resource"] == "*"
+    assert set(denied["Action"]) == set(DENIED_OBJECT_MUTATION_ACTIONS)
+    assert "s3:GetObject" not in denied["Action"]
+
+
+def test_no_deny_statement_blocks_get_object_on_a_wildcard_resource() -> None:
+    """The defect I8 repairs: a blanket ``s3:GetObject`` deny wins over the artifact allow.
+
+    Every Deny that names ``s3:GetObject`` must be scoped to a concrete resource, never ``*``.
+    """
+
+    for item in statements():
+        if item["Effect"] != "Deny":
+            continue
+        acts = item["Action"] if isinstance(item["Action"], list) else [item["Action"]]
+        if "s3:GetObject" in acts:
+            assert item["Resource"] != "*", item.get("Sid")
 
 
 def test_the_role_can_never_send_email() -> None:
@@ -177,6 +221,101 @@ def test_the_artifact_grant_is_scoped_to_the_monitor_prefix_when_supplied() -> N
 
     assert found
     assert found[0]["Resource"] == "arn:aws:s3:::chorus-agent-artifacts/monitor/*"
+
+
+# -- I8: each runtime reads its own artifact and remains blind to evidence --------------
+
+ARTIFACT_BUCKET = "arn:aws:s3:::chorus-agent-artifacts-development"
+
+
+def _with_artifacts() -> list[dict[str, Any]]:
+    app = App()
+    stack = ChorusAgentStack(
+        app, "TestAgents", config=CdkBuildConfig(), artifact_bucket_arn=ARTIFACT_BUCKET
+    )
+    built = assertions.Template.from_stack(stack)
+    found: list[dict[str, Any]] = []
+    for policy in built.find_resources(POLICY_TYPE).values():
+        found.extend(policy["Properties"]["PolicyDocument"]["Statement"])
+    return found
+
+
+@pytest.mark.parametrize("prefix", ["monitor", "investigator", "action"])
+def test_each_runtime_may_read_its_own_artifact_object(prefix: str) -> None:
+    """ALLOW: ``s3:GetObject`` on ``{artifact-bucket}/{agent}/*`` and no deny takes it back.
+
+    The deny split is what makes this true -- a blanket ``s3:GetObject`` deny would win over
+    this allow and the runtime could not cold-start (SS 6).
+    """
+
+    allows = [
+        item
+        for item in _with_artifacts()
+        if item["Effect"] == "Allow"
+        and "s3:GetObject"
+        in (item["Action"] if isinstance(item["Action"], list) else [item["Action"]])
+        and f"/{prefix}/*" in str(item["Resource"])
+    ]
+    assert len(allows) == 1
+    assert allows[0]["Resource"] == f"{ARTIFACT_BUCKET}/{prefix}/*"
+
+    denies_hitting_getobject = [
+        item
+        for item in _with_artifacts()
+        if item["Effect"] == "Deny"
+        and "s3:GetObject"
+        in (item["Action"] if isinstance(item["Action"], list) else [item["Action"]])
+    ]
+    for item in denies_hitting_getobject:
+        rendered = str(item["Resource"])
+        assert item["Resource"] != "*"
+        assert f"/{prefix}/*" not in rendered
+        assert "chorus-agent-artifacts" not in rendered
+
+
+def test_no_runtime_may_read_another_runtimes_artifact() -> None:
+    """DENY (by absence of allow): the only ``GetObject`` allow is this agent's own prefix.
+
+    Each role's artifact grant names exactly one ``{agent}/*`` prefix, so a role reaching for
+    another agent's object matches no allow at all.
+    """
+
+    get_allows = [
+        item
+        for item in _with_artifacts()
+        if item["Effect"] == "Allow"
+        and "s3:GetObject"
+        in (item["Action"] if isinstance(item["Action"], list) else [item["Action"]])
+    ]
+    # Three roles, three prefixes, no prefix granted twice.
+    resources = sorted(str(item["Resource"]) for item in get_allows)
+    assert resources == [
+        f"{ARTIFACT_BUCKET}/action/*",
+        f"{ARTIFACT_BUCKET}/investigator/*",
+        f"{ARTIFACT_BUCKET}/monitor/*",
+    ]
+
+
+def test_no_runtime_may_read_a_private_or_export_evidence_object() -> None:
+    """DENY: ``deny_evidence_objects`` covers both evidence buckets and their objects."""
+
+    denied = statement("DenyEvidenceObjectAccess")
+    resources = {str(r) for r in denied["Resource"]}
+    assert resources == {
+        "arn:aws:s3:::chorus-private-evidence-development",
+        "arn:aws:s3:::chorus-private-evidence-development/*",
+        "arn:aws:s3:::chorus-export-evidence-development",
+        "arn:aws:s3:::chorus-export-evidence-development/*",
+    }
+    assert "s3:GetObject" in denied["Action"]
+
+
+def test_no_runtime_may_write_delete_or_list_any_object() -> None:
+    """DENY: arbitrary S3 write/delete/list stays a wildcard deny."""
+
+    denied = statement("DenyObjectMutation")
+    assert denied["Resource"] == "*"
+    assert set(denied["Action"]) == {"s3:PutObject", "s3:DeleteObject", "s3:ListBucket"}
 
 
 def test_the_runtime_log_group_is_dedicated_to_the_monitor() -> None:

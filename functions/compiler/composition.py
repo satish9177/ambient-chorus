@@ -67,6 +67,17 @@ class CompilerSettings:
     community_public_label: str
     destination: StoredSafeDestination
     cursor_secret: bytes
+    private_evidence_key_arn: str | None = None
+    export_evidence_key_arn: str | None = None
+    """The exact KMS key ARN each evidence bucket is encrypted under, from CDK outputs
+    (``CHORUS_PRIVATE_EVIDENCE_KEY_ARN`` / ``CHORUS_EXPORT_EVIDENCE_KEY_ARN``).
+
+    Required for a deployed composition and refused when absent (below), the same split the
+    sender's ``compiler_function_arn`` expresses. ``S3ObjectStore`` passes each as
+    ``SSEKMSKeyId`` and the deployed bucket policy denies a write that omits or misnames the
+    key, so a compiler built with no key ARN fails every safe-evidence write in an account and
+    nowhere else -- which is exactly the failure that must happen at construction instead.
+    """
     dynamodb_endpoint: str | None = None
 
 
@@ -96,10 +107,19 @@ def build_compile_view(
         },
     )
     cursors = SignedCursorCodec(secret=settings.cursor_secret)
+    private_key_arn = settings.private_evidence_key_arn
+    export_key_arn = settings.export_evidence_key_arn
+    if not private_key_arn or not export_key_arn:
+        # Refused rather than defaulted, the same way the deployed sender refuses a missing
+        # compiler ARN: a compiler with no evidence key ARN can never write a safe derivative
+        # under the deployed bucket policy, so it must fail here and not at the first compile.
+        raise ValueError("a deployed compiler needs the private and export evidence KMS key ARNs")
     objects = S3ObjectStore(
         client=create_s3_client(region_name=settings.region),
         private_bucket=settings.private_evidence_bucket,
         export_bucket=settings.export_evidence_bucket,
+        private_kms_key_id=private_key_arn,
+        export_kms_key_id=export_key_arn,
     )
     generator = ids or Uuid4Generator()
     registry = reviews or FixtureEvidenceReviewRegistry.from_fixtures(
