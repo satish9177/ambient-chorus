@@ -84,6 +84,7 @@ class EntityType(StrEnum):
     OUTBOUND_MESSAGE_LOCATOR = "OUTBOUND_MESSAGE_LOCATOR"
     AUDIT_EVENT = "AUDIT_EVENT"
     COMPILER_AUDIT_PROJECTION = "COMPILER_AUDIT_PROJECTION"
+    DEMO_CLOCK = "DEMO_CLOCK"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

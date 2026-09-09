@@ -17,7 +17,7 @@ on the scripted agent is what makes it reachable in a test at all.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -40,11 +40,34 @@ from chorus.domain.entities import (
 )
 from chorus.domain.ids import ActionId, ApprovalId, ExecutionId, ViewId
 from chorus.domain.state import CaseTransitionContext, bump_case_authorization, transition_case
+from chorus.ports.demo_clock import DemoClockRecord
 from chorus.ports.records import ActionPointerExpectation, SendFence
 from chorus.ports.scopes import ActionScope
 from chorus.ports.unit_of_work import TransactionPlan
 
 pytestmark = pytest.mark.anyio
+
+
+class _MutableClockStore:
+    """A durable clock double whose reading can move mid-invocation (P2-3 regression tests).
+
+    ``seed_instant`` is pinned to the first reading rather than mutated, since only
+    ``logical_time`` is ever compared by ``ProposeAction``'s freshness check -- but
+    ``DemoClockRecord`` still requires every field to be a real, internally consistent record.
+    """
+
+    def __init__(self, instant: datetime) -> None:
+        self.instant = instant
+        self._seed = instant
+
+    async def read(self) -> DemoClockRecord:
+        return DemoClockRecord(
+            logical_time=self.instant,
+            version=1,
+            reset_generation=1,
+            seed_instant=self._seed,
+            advance_count=0,
+        )
 
 
 # ---------------------------------------------------------------------------------------
@@ -262,6 +285,84 @@ async def test_case_change_during_invocation_persists_nothing(
     assert after.state is CaseState.READY_FOR_ACTION
     assert after.authorization_version == before.authorization_version + 1
     assert await harness.compile.shareable.load_current_action_pointer(harness.scope) is None
+
+
+async def test_a_view_that_expires_during_invocation_is_caught_by_a_fresh_reread(
+    harness: ActionHarness,
+) -> None:
+    """P2-3, Phase 11 batch 4 repair: the freshness sample must be a genuinely independent
+    read, or the exact race this test drives goes uncaught.
+
+    ``harness.compile.clock`` -- the deployed equivalent of a
+    :class:`~chorus.infrastructure.persistent_clock.ScopedLogicalClock` bound once per worker
+    invocation -- never moves during this test, matching how a real invocation's bound reading
+    does not move either. Only the *durable* clock -- ``freshness_clock`` here -- advances past
+    the view's expiry, mid-model-call, exactly as ``POST /v1/demo/clock/advance`` would move it
+    in a live deployment while an entirely different Lambda invocation was answering. If step 6
+    asked ``self.clock.now()`` a second time it would get back the identical frozen reading and
+    accept a proposal against an already-expired view; asking ``freshness_clock`` instead is
+    what catches it.
+    """
+
+    await harness.prepare()
+
+    freshness_clock = _MutableClockStore(harness.compile.clock.instant)
+
+    async def advance_past_expiry(_invocation: object) -> None:
+        # The durable clock moves; the invocation's own bound reading does not -- exactly the
+        # split a real deployment has between a Lambda's ``ScopedLogicalClock`` and the row in
+        # ``NS#DEMO#CLOCK`` another process just advanced.
+        freshness_clock.instant = harness.view.expires_at
+
+    harness.agent.on_invoke = advance_past_expiry
+
+    # The post-model freshness check raises ``StaleAuthorizationError`` -- not the
+    # pre-invocation ``ProposalDeniedError`` -- because it is discovered *after* the one
+    # licensed model call, and the module's own recovery path records that as a durable failed
+    # invocation for the same reason every other post-invocation failure is.
+    with pytest.raises(StaleAuthorizationError) as caught:
+        await harness.propose_action(freshness_clock=freshness_clock).execute(  # type: ignore[arg-type]
+            await harness.command()
+        )
+    assert caught.value.reason_codes == (ProposalDenial.VIEW_EXPIRED.value,)
+
+    # Exactly one model call: an expired view is not regenerated against a newer one.
+    assert len(harness.agent.invocations) == 1
+    assert await harness.compile.shareable.load_current_action_pointer(harness.scope) is None
+
+
+async def test_stable_artifact_timestamps_survive_a_wired_freshness_clock(
+    harness: ActionHarness,
+) -> None:
+    """The other half of P2-3: wiring ``freshness_clock`` must not disturb ``now`` -- the
+    canonical artifact instant every timestamp this command mints is still stamped with.
+
+    ``freshness_clock`` here reads a *different* instant than ``self.clock``, and the test
+    proves that difference reached only the freshness comparison: the proposal still commits
+    (the view has not actually expired), and the mandate/audit timestamps it wrote are still
+    ``self.clock``'s reading, not the freshness clock's.
+    """
+
+    await harness.prepare()
+
+    # A different (but still unexpired) reading than ``self.clock`` -- proving the two are
+    # genuinely independent rather than one silently deferring to the other.
+    freshness_clock = _MutableClockStore(harness.compile.clock.instant + timedelta(minutes=1))
+
+    result = await harness.propose_action(freshness_clock=freshness_clock).execute(  # type: ignore[arg-type]
+        await harness.command()
+    )
+
+    execution = await harness.compile.shareable.load_execution(
+        ActionScope(
+            namespace=harness.scope.namespace,
+            community_id=harness.scope.community_id,
+            case_id=harness.scope.case_id,
+            action_id=result.action_id,
+        ),
+        result.execution_id,
+    )
+    assert execution.created_at == harness.compile.clock.instant
 
 
 # ---------------------------------------------------------------------------------------

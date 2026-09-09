@@ -422,9 +422,9 @@ unassertable and hands the request-path role the agent-invoke grant.
 
 | | **API Lambda role** `chorus-api-demo` | **Worker Lambda role** `chorus-worker-demo` |
 |---|---|---|
-| READ | Core (all), Shareable (all safe), private S3 + private KMS, export S3 (decrypt), **demo-token secret**, strong read of `NS#DEMO#CLOCK` | same, **minus the demo-token secret**; no clock grant |
-| WRITE | Core; Shareable `ACTION#`/`ACTION_CURRENT#`/`EXECUTION#`/`CASE#`; Audit; the forward-only guarded CAS on `NS#DEMO#CLOCK`; `ConditionCheck` on `VIEW_CURRENT#` | same, minus the clock CAS |
-| INVOKE | worker Lambda, compiler Lambda | **Monitor / Investigator / Action runtimes**, compiler, sender |
+| READ | Core (all), Shareable (all safe), private S3 + private KMS, export S3 (decrypt), **demo-token secret**, strong read of `NS#DEMO#CLOCK` | same, **minus the demo-token secret**; strong read of `NS#DEMO#CLOCK` (§ 8.9) |
+| WRITE | Core; Shareable `ACTION#`/`ACTION_CURRENT#`/`EXECUTION#`/`CASE#`; Audit; the forward-only guarded CAS on `NS#DEMO#CLOCK`; `ConditionCheck` on `VIEW_CURRENT#` | same, minus the clock CAS — and **denied** every clock write by name |
+| INVOKE | worker Lambda, compiler Lambda, **commitment watcher `:live` alias** (§ 8.9) | **Monitor / Investigator / Action runtimes**, compiler, sender |
 | SCHEDULER | — | `CreateSchedule` + `GetSchedule` on `schedule/chorus-demo/*`; `iam:PassRole` on the scheduler execution role alone, `iam:PassedToService = scheduler.amazonaws.com` |
 | DENIED | SES, Bedrock, `bedrock-agentcore`, view-prefix writes, destination secret, `DeleteSchedule`/`UpdateSchedule` | SES, direct Bedrock, **demo-token secret**, destination secret, view-prefix writes, `DeleteSchedule`/`UpdateSchedule` |
 
@@ -511,6 +511,168 @@ function's behalf, so function code that reached for `ec2:CreateNetworkInterface
 denied. Where `ec2:Subnet` is not supported for a given action, `lambda:SourceFunctionArn` alone
 carries it. `DescribeSubnets` and `DescribeNetworkInterfaces` remain unconditioned reads of
 non-sensitive network metadata; that is stated rather than dressed up.
+
+### 8.9 Two contradictions, resolved exactly (Phase 11 batch 4)
+
+Building the production handlers surfaced two places where the frozen composition and the frozen
+policy disagreed. Both are resolved here, narrowly, and each resolution is asserted from the
+synthesized template rather than argued from this document.
+
+**A. The API invokes the commitment watcher, synchronously.**
+
+`POST /v1/demo/clock/advance` returns `{logical_now, watcher_outcome, commitment_status}`. Its
+frozen response therefore promises *what the watcher decided*, not that a decision was
+scheduled — and § 8.1 gave the request path no watcher invoke authority at all. Routing the
+endpoint through the asynchronous worker would resolve the permission by changing the promise,
+so it is not done. The API instead:
+
+1. advances the durable clock through the normal clock port (§ 8.9 B, ADR-029 § 3);
+2. invokes the watcher **synchronously** and parses its typed answer;
+3. returns the accepted response.
+
+```text
+InvokeCommitmentWatcherLiveAliasOnly  ALLOW  lambda:InvokeFunction
+  Resource = arn:aws:lambda:{region}:{account}:function:chorus-commitment-watcher-{env}:live
+```
+
+The **qualified `live` alias** and nothing else: no unqualified function ARN, no numeric
+version, no wildcard. Rollback repoints the alias at a published version and this statement does
+not change (§ 20). It is a statement of its own rather than a third resource on
+`InvokeOperationWorkerAndCompilerOnly`, so widening one cannot silently widen the other.
+`CHORUS_WATCHER_FUNCTION_ARN` carries the alias ARN. The worker holds no watcher invoke.
+
+**B. The worker genuinely requires authoritative logical time, read-only.**
+
+[ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md) § 2 listed the worker as holding no
+clock authority, while `EXTRACT_COMMITMENT` — which runs on that principal — supplies
+`clock.now()` as the `logical_now` of its `CreateDueSchedule` request. The demo mapping there is
+`actual_now + max(10 minutes, logical_due - logical_now)`, so wall time in the `logical_now` slot
+schedules a thirty-day deadline thirty days out and the demo's deadline segment stops working.
+Removing the dependency was rejected: it is not dead composition, and replacing logical time
+with wall time is the defect, not the fix. `actual_now` itself is the opposite mistake in the
+same formula — it must be genuinely wall-clock, never the logical reading this grant supplies;
+see § 8.10 F.
+
+```text
+ReadDemoClockItemOnly     ALLOW  dynamodb:GetItem
+  on the Shareable table, ForAllValues:StringLike dynamodb:LeadingKeys = NS#DEMO#CLOCK
+DenyWorkerDemoClockWrites DENY   PutItem, UpdateItem, DeleteItem, ConditionCheckItem
+  on the Shareable table, ForAnyValue:StringLike dynamodb:LeadingKeys = NS#DEMO#CLOCK
+```
+
+The table-wide `ReadShareable` statement both principals already hold reached this row; the
+positive statement makes the authority **stated and assertable** rather than incidental, and the
+deny makes "the worker cannot move logical time" an explicit refusal rather than the absence of
+a grant. **This amends ADR-029 § 2's principal table for the worker row and nothing else.**
+
+**C. The API's clock write, and the watcher's clock read.**
+
+Neither existed in the synthesized policy before this batch, and both are required by ADR-029:
+
+```text
+AdvanceDemoClockItemOnly  ALLOW  dynamodb:PutItem      (API role)
+ReadDemoClockItemOnly     ALLOW  dynamodb:GetItem      (watcher role)
+  both on the Shareable table, LeadingKeys = NS#DEMO#CLOCK
+```
+
+`NS#DEMO#CLOCK` joins the watcher's `FORBIDDEN_WRITE_PREFIXES`, so its total absence of clock
+write authority is backed by an explicit deny (ADR-029 § 2).
+
+`PutItem` alone on the write side. The storage driver has no attribute-level update path by
+design, so the guarded forward CAS is a conditional whole-item put whose three fences —
+`version`, `reset_generation`, and a strictly-earlier stored `logical_time_micros` — are
+condition expressions the table evaluates. That also leaves § 8.8's "no `dynamodb:UpdateItem`
+anywhere" sentence untouched, which is why it is not amended here.
+
+**Every clock grant in this system names the exact literal `NS#DEMO#CLOCK`.** There is no
+`NS#*#CLOCK*` anywhere, template tests sweep for one on every role that touches the partition,
+and a policy containing one fails review.
+
+### 8.10 The compiler's clock authority, and the wall/logical split for scheduling (Phase 11 batch 4 repair)
+
+An independent review found two further places where a clock-domain mismatch had reached
+production code. Both are resolved here, but **the amendment itself lives in ADR-029, not in
+this document** — a plan cannot override an accepted ADR under
+[docs/README.md](../README.md)'s own precedence order, so a prior version of this section that
+claimed to "amend ADR-029 § 2's principal table" was itself the defect a later review caught.
+[ADR-029 § "Accepted Phase 11 batch 4 amendment"](../adr/ADR-029-deployed-demo-clock-authority.md#accepted-phase-11-batch-4-amendment)
+is the authoritative principal table; everything below describes the same two repairs and the
+IAM template that implements them, and restates that table only for convenience.
+
+**D. The compiler genuinely requires authoritative logical time, read-only.**
+
+Unresolved architectural question 0 (below) asked what clock the deployed compiler stamps a view
+with. `functions/compiler/handler.py` supplied `SystemClock`, so a compiled view's
+`generated_at` and `expires_at` were wall-clock instants while the case world runs on the demo
+logical clock, seeded at `2030-01-14`. A caller comparing a view's expiry against logical time —
+exactly what `ProposeAction`'s freshness check does — was comparing two different clocks; a view
+minted "now" in logical 2030 could read as already expired against a wall-clock instant in the
+2020s. The compiler now reads the durable logical clock once per invocation, the same shape as
+the worker's grant in **B** above:
+
+```text
+ReadDemoClockItemOnly       ALLOW  dynamodb:GetItem
+  on the Shareable table, ForAllValues:StringLike dynamodb:LeadingKeys = NS#DEMO#CLOCK
+DenyCompilerDemoClockWrites DENY   PutItem, UpdateItem, DeleteItem, ConditionCheckItem
+  on the Shareable table, ForAnyValue:StringLike dynamodb:LeadingKeys = NS#DEMO#CLOCK
+```
+
+The compiler's Core authority is unchanged — the clock lives in Shareable. Its existing
+Shareable read (`ReadShareableViewAndActionPrefixes`) is **prefix-scoped** to the view and
+action `LeadingKeys` it already had reason to read, not table-wide, and `NS#DEMO#CLOCK` is not
+one of those prefixes — which is exactly why this is a genuinely new, separate statement rather
+than something the existing grant already covered: a table-wide read would have needed no new
+policy statement at all, and one was needed. **The compiler's row of ADR-029's effective
+principal table is the amendment section's, not § 2's** — see the ADR link above; the sender
+and watcher's clock authority is described in **C** and below, and the API's in **A** and **C**.
+
+The chosen resolution is the first of the two the open question named — a read-only compiler
+clock grant, mechanically identical to **B** — and not the alternative (an ADR statement that
+view lifetime is wall-clock everywhere). The alternative would have meant deciding it is
+acceptable for a compiled view's own timestamps to run on a different clock than the case they
+describe, which is the defect, not a design option.
+
+**E. The sender's clock authority needed no new statement.**
+
+The sender's `SEND_ACTION` execution and the send authorization fence it reads both reason about
+the same logical timeline the compiler and worker use, so the sender's trust-matrix row now
+names logical-clock read authority as well. Unlike the compiler, this costs no new IAM
+statement: the sender already holds the unrestricted, table-wide `ReadShareable` grant its send
+path needs for the send fence and view partitions, and that grant already reaches
+`NS#DEMO#CLOCK`. Only the negative side changes — `NS#DEMO#CLOCK` joins the sender's
+`FORBIDDEN_WRITE_PREFIXES`, so the existing deny statement that already blocks writes to the
+proposal/approval/view/case prefixes now blocks the clock prefix by the same mechanism, and the
+absence of clock write authority is an explicit deny rather than an accident of what nobody
+granted.
+
+**F. The wall/logical split for real AWS scheduling arithmetic (P2-2).**
+
+**B** above states the demo mapping as `actual_now + max(10 minutes, logical_due - logical_now)`
+without saying what supplies `actual_now`. It was, incorrectly, the same logical clock read that
+supplies `logical_now` — so with the browser's logical clock advanced into 2030 (the demo's own
+seed year), `CreateDueSchedule` computed a real `CreateSchedule` `at_utc` in 2030 real time, an
+EventBridge Scheduler resource that would never fire during any demo. The fix is not a new IAM
+grant — `actual_now` needs no durable authority at all, only the ordinary process clock — but a
+second, distinct `Clock` field on `CreateDueSchedule` (`wall_clock`, alongside the existing
+logical `clock`), so the one arithmetic step that anchors a real AWS resource to real time reads
+`SystemClock` while every other computation in the same command — `logical_due - logical_now`,
+and everything upstream of it in the case world — continues to read the logical clock
+unchanged. The worker's principal-table row therefore reads **both** logical-clock read
+authority (the grant in **B**) **and** wall-clock read (no authority at all — `SystemClock`
+reads no store and needs none), and the two are never the same reading in a single computation.
+
+**The same table, restated here for convenience — [ADR-029's amendment section](../adr/ADR-029-deployed-demo-clock-authority.md#accepted-phase-11-batch-4-amendment)
+is the authoritative version if the two ever appear to disagree:**
+
+| Principal | Logical clock read | Logical clock write | Wall clock |
+|---|---|---|---|
+| API (presenter path) | strongly consistent | guarded forward CAS (§ 3) | not read for any clock-domain decision |
+| Worker | strongly consistent (**B**) | none | `SystemClock`, for `CreateDueSchedule`'s `actual_now` only (**F**) |
+| Commitment watcher | strongly consistent | none | never |
+| Compiler | strongly consistent (**D**, new) | none | never |
+| Sender | strongly consistent, via the existing unrestricted grant (**E**, new) | none | never |
+| Demo reset principal | strongly consistent | read/write, sole reset exception (§ 3) | never |
+| Three agent runtimes, scheduler execution role | none | none | never |
 
 ### 8.7 The complete remaining wildcard inventory
 
@@ -891,29 +1053,69 @@ No secret is committed; `.env` is local-development only and is never deployed s
 **Host: API Gateway HTTP API (payload format 2.0) + FastAPI on Lambda**, plus a separate
 application-worker Lambda. Frozen by [08-api-design.md](../architecture/08-api-design.md).
 
-**API entry point needs, none of which exist yet:**
+**API entry point — built in Phase 11 batch 4** (`functions/api/`):
 
-- an **ASGI adapter** — `mangum` or equivalent, pinned; `apps/api` has an ASGI app and no Lambda
-  binding;
-- **payload format 2.0** handling, including the `requestContext.http` shape;
-- **bearer demo-token validation** against Secrets Manager — no Secrets Manager client is
-  constructed anywhere in the repository today; the token is compared by hash, constant-time;
-- **persona header handling** — `X-Chorus-Demo-Actor` selects one fixed seeded persona **only
-  after** token validation, in the deployed demo exactly as locally. Persona headers are the
-  frozen demo mechanic, not a local-only shortcut;
-- **CORS** admitting the configured web origin only; `Cache-Control: no-store` and
-  `X-Correlation-Id` on every response; API Gateway throttling;
-- **no localhost DynamoDB default** — `CHORUS_DYNAMODB_ENDPOINT` must be absent in `demo`, and the
-  deployed composition asserts it rather than trusting the default.
+- the **ASGI adapter** is `mangum`, pinned in `pyproject.toml`, with `lifespan="off"` (the
+  application is built around an explicitly constructed container, so no start-up hook exists to
+  run). It handles **payload format 2.0** — `requestContext.http`, `rawPath`, `rawQueryString`,
+  single-valued `headers`, the `cookies` array — and payload-v2 contract tests drive the real
+  binding with real events;
+- **`application/problem+json` is added to Mangum's text media types.** It is not in its default
+  list, so without that every 401, 404, 409, 422 and 503 — the whole frozen error contract —
+  would reach a browser base64-encoded while the happy path looked perfect;
+- **bearer demo-token validation** against Secrets Manager, as ASGI middleware so it applies
+  identically to a deployed request and to a contract test. The secret holds the token's
+  **hash**; the presented token is hashed and compared with `hmac.compare_digest`. Missing token,
+  wrong token, and an unreadable secret are **one** response shape, and an unreadable secret
+  fails **closed**. The check is installed only when the composition supplies a verifier, so a
+  deployment without one has no check rather than a permissive one;
+- **persona header handling** unchanged — `X-Chorus-Demo-Actor` selects one fixed seeded persona
+  **after** token validation, in the deployed demo exactly as locally;
+- **one authoritative logical instant per request.** The deployed clock is a durable row, not a
+  Python object, and a `Clock` answers synchronously, so the row is read once per request —
+  strongly consistent — and bound for that request's duration. A clock that is missing, corrupt,
+  or unreachable is a typed `503` and no work, never a fallback (ADR-029 § 4);
+- `Cache-Control: no-store` and `X-Correlation-Id` on every response, refusals included;
+- **no localhost DynamoDB default** — `api_settings` refuses to construct when
+  `CHORUS_DYNAMODB_ENDPOINT` is set, rather than trusting the default.
 
-**Worker entry point needs** a **durable dispatcher** — asynchronous `lambda:InvokeFunction` with
-`InvocationType=Event` — replacing `InProcessOperationDispatcher`. **No `BackgroundTasks`
-substitute**: an operation that lives in a request process dies with it. Async delivery may
-repeat; the operation/input hash and the conditional `PENDING→RUNNING` claim already make repeats
-safe, and that claim is the duplicate-execution boundary.
+**The deployed API does not compile and does not run agents.** Its role is denied every write on
+the view prefixes, so the compile route invokes the compiler function synchronously
+(`compile-request/v1`); it holds no `bedrock-agentcore:InvokeAgentRuntime`, so every
+agent-invoking route dispatches to the worker and returns `202`.
 
-Compiler, sender, watcher, and inbound entry points bind their existing composition roots to real
-AWS clients and add nothing else.
+**Worker entry point — built in Phase 11 batch 4** (`functions/worker/`): the **durable
+dispatcher** is `InvocationType="Event"` against the one configured worker ARN, replacing
+`InProcessOperationDispatcher`. **No `BackgroundTasks` substitute**: an operation that lives in a
+request process dies with it. The handover contract is `worker-job/v1` — identifiers, versions,
+digests and instants, and **no message text, projected payload, agent output, or request
+object**; the kind is read from the envelope's declared field and an unknown one fails closed
+before anything is loaded.
+
+Async delivery may repeat, and **nothing in the handler tries to prevent that**: a process-local
+seen-set is an answer to a cross-process question. The operation/input hash and the conditional
+`PENDING→RUNNING` claim are the duplicate-execution boundary, and `SEND_ACTION` is protected more
+strongly still by the execution's own `APPROVED@v → SENDING@v+1` compare-and-swap. A test
+delivers one identical event twice through the production handler over the real worker and
+asserts the model was invoked exactly once.
+
+**Compiler, sender, and watcher entry points — built in Phase 11 batch 4.** Each binds its
+existing composition root to real AWS clients and adds nothing else:
+
+| Function | Operations | Notes |
+|---|---|---|
+| `functions/compiler/handler.py` | `CompileView`, `AcquireSendAuthorizationFence`, `ReleaseSendAuthorizationFence` | the sole creator of views and the sole send authority; no model, no mail, no scheduler |
+| `functions/sender/handler.py` | `SendAction` | `send-action-request/v1`; the failure *kind* travels with its safe code so an ambiguous outcome stays ambiguous and `SEND_UNKNOWN` stays a quarantine |
+| `functions/commitment_watcher/handler.py` | `RecordCommitmentDue` | one `commitment-watcher-request/v1` for **both** callers — Scheduler and the demo-clock route reach the identical use case |
+
+Every handler builds its object graph **lazily on first invocation**, so importing one needs no
+credentials, no configuration, and no network; a test imports all five with AWS credential
+resolution disabled. Every refusal body is a reason code and nothing else: no traceback, no
+payload echo, no downstream body.
+
+**The inbound-mail entry point is not built.** It is [ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md)'s
+and belongs to a later batch; the deployed container wires `inbound_replies=None`, so the route
+answers `503` rather than accepting an unauthenticated delivery.
 
 **Frontend hosting is a conditional, not a deferral.** Two branches, and the hackathon rules
 decide which (P4):
@@ -1160,7 +1362,7 @@ presentation, submission, and cost cleanup.
 | | Item |
 |---|---|
 | ~~**I1**~~ | **Done.** AgentCore server binding: a bare ASGI application on the already-locked `uvicorn` rather than a `bedrock-agentcore` dependency, `main.py` with `/ping` + `/invocations` per runtime, the archive import bootstrap, `deployed_name`, and the corrected `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` names (§ 5). Live evaluation remains `NOT_RUN`. |
-| **I2** | Six Lambda entry points; ASGI adapter; Secrets Manager client; durable async dispatcher; deployed composition root (§ 14) |
+| **I2** | **Five of six done** (§ 14): API (Mangum, payload v2, bearer-token middleware, per-request logical time), operation worker, compiler, sender, and commitment watcher — handlers, composition roots, the `worker-job/v1` async boundary, and the synchronous compile/fence/send/watcher contracts. **Still owed:** the inbound-mail entry point (I9/I10, awaiting ADR-030), and the `Function`/alias/API-Gateway **resources** themselves, which belong to the resource-wiring batch. |
 | **I3** | `InboundMailTransportAuthenticator` and `SesEventTransportAuthenticator` |
 | **I4** | Agent IAM: discovered inference-profile ARNs + conditioned foundation-model ARNs (§ 4) |
 | **I5** | Split API and worker roles; add the missing `lambda:InvokeFunction` and `secretsmanager:GetSecretValue` grants (§ 8.1) |
@@ -1170,7 +1372,7 @@ presentation, submission, and cost cleanup.
 | **I9** | SES receipt decoder corrections per [ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md) — single S3 action + `TopicArn`, `receipt.action.type == "S3"`, one bounded pinned read reused everywhere, `mail.headers` with pinned-bytes fallback, `From` mailbox, `receipt.recipients` — with golden tests over **captured real** payloads. *Awaits ADR-030 acceptance.* |
 | **I10** | Inbound bucket/key policy carve-out (six statements, nine proved cases) and ingress-object accounting (§ 10.3). *Awaits ADR-030 acceptance.* |
 | ~~**I11**~~ | **Done offline.** Live commitment extraction in the Investigator runtime (§ 11): `investigator-request/v1`, the `commitment-extraction/v1` prompt, and the safe destination label the deterministic obligor check needs. Not yet run against a real model. |
-| **I12** | Durable demo clock with `reset_generation` fencing per accepted [ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md) (§ 9, § 12). |
+| **I12** | **Adapter done.** `DynamoDbDemoClockStore` at the exact literal `NS#DEMO#CLOCK`: strongly consistent read, and one guarded forward compare-and-swap whose `version`, `reset_generation`, and strictly-earlier-`logical_time` fences are all condition expressions the table evaluates. Missing, corrupt, and unreachable each fail closed and typed, with no fallback to a process-local clock, to `SystemClock`, or to an event's timestamp. The normal adapter exposes **no reset and no reseed** — asserted by absence. **Still owed:** the reset principal that seeds and reseeds the row (I13, § 12). |
 | **I13** | Reset authority: function, narrow role, bounded purge (§ 12) |
 | **I14** | Scheduler execution role policies (§ 8.5); Lambda VPC ENI grants (§ 8.6) |
 | **I15** | Artifact **build** done — lock-based, `aarch64-manylinux2014`/3.12, ELF-verified, with its own secret gate (§ 5). Still owed: artifact **publish**, the deploy CLI with the § 2 identity refusal, and AZ-ID resolution (§ 6). |
@@ -1181,6 +1383,12 @@ in a way that reads as an unrelated error: no send, no object write, no agent co
 
 ### Unresolved architectural questions
 
+0. ~~**What clock does the deployed compiler stamp a view with?**~~ **Resolved** (Phase 11
+   batch 4 repair, § 8.10 D): the compiler reads the durable logical clock, read-only, the same
+   shape as the worker's grant in § 8.9 B. A compiled view's `generated_at` and `expires_at` are
+   now logical-clock instants, in the same domain as the case world they describe and the
+   freshness check that later compares against them. The rejected alternative was an ADR
+   statement that view lifetime is wall-clock everywhere.
 1. **Does AgentCore fetch the S3 artifact under the execution role or under a service-owned
    mechanism?** § 6 assumes the execution role and repairs the deny accordingly. Canary F3 plus a
    real cold start (canary J) settles it. If it is service-owned, the artifact grant is

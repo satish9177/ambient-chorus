@@ -129,8 +129,8 @@ class EventBridgeDeadlineScheduler:
             raise
         expression = str(response.get("ScheduleExpression", ""))
         target = response.get("Target") or {}
-        payload = _decode_payload(target.get("Input"))
-        event_id = payload.get("event_id")
+        target_input = _decode_payload(target.get("Input"))
+        event_id = _event_id_of(target_input)
         return ScheduleDescription(
             schedule_name=str(response.get("Name", name)),
             at_utc=_parse_at_expression(expression),
@@ -157,9 +157,19 @@ def _parse_at_expression(expression: str) -> Any:
 
 
 def _json_payload(request: DueScheduleRequest) -> str:
+    """``Target.Input``, verbatim.
+
+    ``request.target_input`` (P2-1, Phase 11 batch 4 repair) is the full operation-wrapped
+    ``commitment-watcher-request/v1`` envelope the application layer already assembled -- the
+    same shape ``POST /v1/demo/clock/advance`` sends the watcher synchronously. This adapter
+    holds no opinion about that shape: it serializes the mapping it was given and nothing else,
+    because what EventBridge Scheduler delivers to a Lambda target *is* ``Target.Input``
+    verbatim as the invocation event.
+    """
+
     import json
 
-    return json.dumps(request.payload.as_payload(), sort_keys=True, separators=(",", ":"))
+    return json.dumps(dict(request.target_input), sort_keys=True, separators=(",", ":"))
 
 
 def _decode_payload(value: object) -> dict[str, Any]:
@@ -172,6 +182,24 @@ def _decode_payload(value: object) -> dict[str, Any]:
     except ValueError:
         return {}
     return decoded if isinstance(decoded, dict) else {}
+
+
+def _event_id_of(target_input: dict[str, Any]) -> object:
+    """Reach into the operation-wrapped envelope for the one field ``describe_schedule`` reads.
+
+    ``target_input["payload"]["event"]["event_id"]`` -- three nested objects deep, because the
+    envelope is ``{"operation": ..., "payload": {"schema": ..., "event": {"event_id": ..., ...},
+    ...}}`` (P2-1). Each level is read defensively; a response that does not have this shape at
+    all yields ``None`` rather than raising, exactly as the previous flat lookup did.
+    """
+
+    payload = target_input.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return None
+    return event.get("event_id")
 
 
 __all__ = [

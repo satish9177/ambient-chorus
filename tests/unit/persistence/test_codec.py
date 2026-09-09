@@ -19,6 +19,7 @@ from chorus.infrastructure.dynamodb import (
     codec_idempotency,
     codec_mandate,
     codec_share,
+    demo_clock,
 )
 from chorus.infrastructure.dynamodb.attributes import decode_item, encode_item
 from chorus.infrastructure.dynamodb.codec import (
@@ -27,6 +28,7 @@ from chorus.infrastructure.dynamodb.codec import (
     ATTR_NAMESPACE,
     ATTR_SCHEMA_VERSION,
 )
+from chorus.ports.demo_clock import DemoClockRecord
 from chorus.ports.idempotency import (
     IdempotencyRecord,
     IdempotencyStatus,
@@ -285,6 +287,27 @@ def _cases() -> tuple[Case, ...]:
             codec_audit.decode_audit_event,
             world.audit_event(),
         ),
+        (
+            "DEMO_CLOCK",
+            lambda w: demo_clock.encode_demo_clock(w.namespace, _clock_record()),
+            # The only shape addressed by namespace rather than by a scope: the deployed clock
+            # lives at one exact literal partition per namespace, and the decoder is handed the
+            # namespace it must agree with rather than recovering one from the row.
+            lambda item: (None, demo_clock.decode_demo_clock(world.namespace, item)),
+            _clock_record(),
+        ),
+    )
+
+
+def _clock_record() -> DemoClockRecord:
+    """The deployed demo clock, seeded and never advanced -- ADR-029 § 1's five fields."""
+
+    return DemoClockRecord(
+        logical_time=NOW,
+        version=1,
+        reset_generation=1,
+        seed_instant=NOW,
+        advance_count=0,
     )
 
 

@@ -88,6 +88,7 @@ def _destination() -> StoredSafeDestination:
 def _settings(*, outbox: Path | None, compiler_arn: str | None) -> SenderSettings:
     return SenderSettings(
         region="us-east-1",
+        namespace="DEMO",
         core_table="chorus-core",
         shareable_table="chorus-shareable",
         audit_table="chorus-audit",

@@ -147,6 +147,20 @@ class Settings(BaseSettings):
     destination_routing_token: UUID = UUID("00000000-0000-0000-0000-000000000000")
     destination_registry_secret_arn: str | None = None
     demo_access_secret_arn: str | None = None
+    cursor_signing_secret_arn: str | None = None
+    """The one Secrets Manager identity a pagination cursor's HMAC key is drawn from.
+
+    Deliberately its own secret rather than a field folded into the demo access secret: the two
+    have unrelated blast radii (a leaked cursor key lets a caller forge a page token; a leaked
+    access digest lets a caller pass the bearer check) and unrelated rotation schedules, and a
+    purpose-separated secret is what keeps rotating one from ever touching the other.
+
+    Read once per execution environment when the API's request path is composed
+    (:func:`functions.api.composition.build_api_container`) and never regenerated per cold
+    start: a cursor a browser is holding when its serving container recycles must still verify
+    on whichever container answers the next page request, and a random per-container key
+    cannot promise that (Phase 11 batch 4 repair, P2-5).
+    """
     demo_clock_enabled: bool = True
     otel_enabled: bool = False
 

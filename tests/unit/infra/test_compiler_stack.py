@@ -433,6 +433,51 @@ def test_the_shareable_read_grant_adds_no_core_authority(compiler: Template) -> 
     }
 
 
+# -- P1 (Phase 11 batch 4 repair): the compiler's clock read, and only a read --------------
+
+
+def test_the_compiler_may_strongly_read_the_demo_clock_item(compiler: Template) -> None:
+    """A compiled view's ``generated_at``/``expires_at`` and every freshness comparison the
+    send fence makes must be stamped against the same authoritative clock the rest of the
+    case timeline uses, or a caller comparing a view's expiry against logical time is
+    comparing two different clocks.
+    """
+
+    grant = statement(compiler, "ReadDemoClockItemOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions(grant) == {"dynamodb:GetItem"}
+    assert grant["Condition"]["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == [
+        "NS#DEMO#CLOCK"
+    ]
+
+
+def test_the_compiler_holds_no_write_of_any_form_on_the_clock(compiler: Template) -> None:
+    deny = statement(compiler, "DenyCompilerDemoClockWrites")
+    assert deny["Effect"] == "Deny"
+    assert {"dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"} <= actions(deny)
+    assert deny["Condition"]["ForAnyValue:StringLike"]["dynamodb:LeadingKeys"] == ["NS#DEMO#CLOCK"]
+
+    for item in shareable_statements(compiler):
+        if item["Effect"] != "Allow":
+            continue
+        prefixes = leading_keys(item)
+        if "NS#DEMO#CLOCK" in prefixes:
+            assert actions(item) == {"dynamodb:GetItem"}, (
+                f"{item['Sid']} grants {actions(item)} on the clock partition"
+            )
+
+
+def test_no_clock_grant_on_the_compiler_is_a_wildcard(compiler: Template) -> None:
+    """ADR-029 § 2: there is no ``NS#*#CLOCK*``, and a policy containing one fails review."""
+
+    for item in statements(compiler):
+        for block in ("ForAllValues:StringLike", "ForAnyValue:StringLike"):
+            keys = item.get("Condition", {}).get(block, {}).get("dynamodb:LeadingKeys", [])
+            for key in keys if isinstance(keys, list) else [keys]:
+                if "CLOCK" in key:
+                    assert key == "NS#DEMO#CLOCK"
+
+
 def test_the_shareable_read_grant_does_not_reintroduce_a_model_or_ses_path(
     compiler: Template,
 ) -> None:

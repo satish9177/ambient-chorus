@@ -86,6 +86,7 @@ def _compiler_settings(
 ) -> CompilerSettings:
     return CompilerSettings(
         region="us-east-1",
+        namespace="DEMO",
         core_table="chorus-core-demo",
         shareable_table="chorus-shareable-demo",
         audit_table="chorus-audit-demo",

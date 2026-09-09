@@ -113,6 +113,12 @@ def build_app() -> App:
         ),
         scheduler_group_name=watcher.schedule_group_name,
         scheduler_role_arn=watcher.scheduler_role_arn_literal,
+        # The API's one synchronous downstream invocation, and the reason it needs a grant at
+        # all: ``POST /v1/demo/clock/advance`` returns the watcher's outcome, so the request
+        # path invokes the watcher's ``live`` alias and parses its answer (deployment contract
+        # SS 8.1). The literal comes from the watcher stack, which is built above -- the same
+        # shape every other cross-stack name here uses, and no cycle either way.
+        watcher_alias_arn=watcher.watcher_alias_arn_literal,
     )
     # Synthesized in Phase 8 so the ADR-024 negative-capability sweep has a policy to read.
     # The sender is the principal whose documented boundary was, until now, a sentence beside

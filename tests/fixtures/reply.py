@@ -310,6 +310,11 @@ class ReplyHarness:
             unit_of_work=self.send.action.unit_of_work,  # type: ignore[arg-type]
             scheduler=self.scheduler,
             clock=self.send.action.compile.clock,
+            # P1/P2-2: the fixture's own commands never set ``logical_now`` on
+            # ``CreateDueScheduleCommand``, so ``demo_schedule_instant`` -- the only caller of
+            # ``wall_clock`` -- is never exercised here; the same fixed test clock is reused
+            # rather than a second one, since nothing in this suite reads it.
+            wall_clock=self.send.action.compile.clock,
             ids=Uuid4Generator(),
             scheduler_environment=SCHEDULER_ENVIRONMENT,
         )

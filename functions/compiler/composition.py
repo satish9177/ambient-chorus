@@ -59,6 +59,10 @@ class CompilerSettings:
     """Everything the composition root needs, and nothing it could decide policy from."""
 
     region: str
+    namespace: str
+    """Deployment configuration, not a caller field. The demo clock's partition is the exact
+    literal ``NS#{namespace}#CLOCK``, and the compiler's read grant names that literal -- so a
+    namespace an invocation could choose would be a partition the policy never authorized."""
     core_table: str
     shareable_table: str
     audit_table: str
@@ -81,22 +85,15 @@ class CompilerSettings:
     dynamodb_endpoint: str | None = None
 
 
-def build_compile_view(
-    settings: CompilerSettings,
-    *,
-    clock: Clock,
-    ids: IdGenerator | None = None,
-    reviews: EvidenceReviewRegistryPort | None = None,
-) -> CompileView:
-    """Construct the compile use case over deployed adapters.
+def build_compiler_driver(settings: CompilerSettings) -> DynamoDbStorageDriver:
+    """The compiler's one storage handle, over all three tables.
 
-    The identifier generator defaults to UUIDv4 because a view is an ordinary entity, not one of
-    the ADR-011 replay identities. Determinism of the *view hash* comes from the inputs being
-    fixed, which is why the golden tests inject a deterministic generator rather than this
-    function producing one.
+    Shared by the two use cases this function serves -- the compile itself and the send-fence
+    authority the sender invokes -- so a deployed compiler holds exactly one client and one
+    table map rather than one per entry point.
     """
 
-    driver = DynamoDbStorageDriver(
+    return DynamoDbStorageDriver(
         client=create_dynamodb_client(
             region_name=settings.region, endpoint_url=settings.dynamodb_endpoint
         ),
@@ -106,6 +103,25 @@ def build_compile_view(
             TableName.AUDIT: settings.audit_table,
         },
     )
+
+
+def build_compile_view(
+    settings: CompilerSettings,
+    *,
+    clock: Clock,
+    ids: IdGenerator | None = None,
+    reviews: EvidenceReviewRegistryPort | None = None,
+    driver: DynamoDbStorageDriver | None = None,
+) -> CompileView:
+    """Construct the compile use case over deployed adapters.
+
+    The identifier generator defaults to UUIDv4 because a view is an ordinary entity, not one of
+    the ADR-011 replay identities. Determinism of the *view hash* comes from the inputs being
+    fixed, which is why the golden tests inject a deterministic generator rather than this
+    function producing one.
+    """
+
+    driver = driver or build_compiler_driver(settings)
     cursors = SignedCursorCodec(secret=settings.cursor_secret)
     private_key_arn = settings.private_evidence_key_arn
     export_key_arn = settings.export_evidence_key_arn

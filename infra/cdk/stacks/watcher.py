@@ -48,7 +48,18 @@ from constructs import Construct
 from infra.cdk.config import CdkBuildConfig
 
 CASE_KEY_PREFIX = "NS#*#CASE#*"
-"""The watcher's complete Shareable data-plane authority, as a key prefix."""
+"""The watcher's complete Shareable **write** authority, as a key prefix."""
+
+DEMO_CLOCK_PARTITION = "NS#DEMO#CLOCK"
+"""The **exact literal** partition of the deployed demo clock (ADR-029 § 1-2).
+
+Not a pattern, and deliberately not ``NS#*#CLOCK*``: ``DEMO`` is the only namespace a deployed
+clock exists in, and a wildcard would authorize a clock in a namespace no deployment has. A
+policy containing one fails review, and a template test asserts its absence.
+"""
+
+DEMO_CLOCK_READ_ACTION = "dynamodb:GetItem"
+"""One item, one direct read. The watcher never queries or scans the clock partition."""
 
 FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#ACTION#*",
@@ -57,6 +68,7 @@ FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#OUTBOUND_MESSAGE#*",
     "NS#*#VIEW#*",
     "NS#*#VIEW_CURRENT#*",
+    DEMO_CLOCK_PARTITION,
 )
 """Every Shareable prefix the watcher must never write, denied by ``ForAnyValue``.
 
@@ -279,6 +291,25 @@ class ChorusWatcherStack(Stack):
                 actions=list(READ_ACTIONS),
                 resources=[tables.shareable.table_arn],
                 conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": [CASE_KEY_PREFIX]}},
+            )
+        )
+        # ADR-029 § 2. The watcher reads the one authoritative logical clock and it reads
+        # nothing else outside its case partitions. Without this the deployed watcher could not
+        # perform step 4 of its own frozen order at all: its Core deny is total, so the demo
+        # manifest is unreachable, and a process-local clock in a separate Lambda is a
+        # *different* clock from the one the API advanced.
+        #
+        # In environments with no clock row the grant simply finds nothing to read, which is
+        # correct -- a grant describes an authority, not an expectation (ADR-029 § 6).
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadDemoClockItemOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[DEMO_CLOCK_READ_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
+                },
             )
         )
         self.role.add_to_policy(

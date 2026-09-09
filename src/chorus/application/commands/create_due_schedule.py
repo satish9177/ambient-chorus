@@ -94,13 +94,26 @@ class CreateDueScheduleResult:
 
 @dataclass(slots=True)
 class CreateDueSchedule:
-    """Ask the scheduler once, reconcile a lost answer by name, and record the outcome."""
+    """Ask the scheduler once, reconcile a lost answer by name, and record the outcome.
+
+    Two clocks, and they answer different questions (P1/P2-2, Phase 11 batch 4 repair).
+    ``clock`` is the authoritative **logical** clock -- the same one the commitment, the
+    projection, and every audit event in this command are stamped with. ``wall_clock`` answers
+    a completely different question: "what real instant should EventBridge Scheduler fire at?"
+    A real one-time schedule is a wall-clock resource regardless of what the demo's logical
+    clock reads, and confusing the two is exactly the defect this split repairs -- a worker
+    running on a logical clock that reads 2030 must not compute ``actual_now`` from that clock,
+    or the schedule it asks EventBridge Scheduler to create lands in 2030 real time and never
+    fires. ``wall_clock`` is never used for anything the commitment, the projection, or an
+    audit row remembers; it exists for exactly one arithmetic step, below.
+    """
 
     shareable: ShareableRepositoryPort
     audit: AuditRepositoryPort
     unit_of_work: UnitOfWork
     scheduler: DeadlineSchedulerPort
     clock: Clock
+    wall_clock: Clock
     ids: IdGenerator
     scheduler_environment: str
 
@@ -121,7 +134,10 @@ class CreateDueSchedule:
                 failure_code=None,
             )
 
-        actual_now = self.clock.now()
+        # ``actual_now``: real wall-clock time, and only ever wall-clock time. This is the one
+        # place ``wall_clock`` is read, and the one place it may be -- everywhere else in this
+        # command, ``self.clock`` (the logical clock) is authoritative (P1/P2-2).
+        actual_now = self.wall_clock.now()
         at_utc = (
             commitment.due_at
             if command.logical_now is None
@@ -134,6 +150,7 @@ class CreateDueSchedule:
         request = due_schedule_request(
             environment=self.scheduler_environment,
             namespace=command.namespace,
+            community_id=command.community_id,
             case_id=commitment.case_id,
             commitment_id=commitment.commitment_id,
             generation=commitment.schedule_generation,

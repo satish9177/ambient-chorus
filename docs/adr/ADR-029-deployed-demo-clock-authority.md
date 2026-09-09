@@ -1,6 +1,9 @@
 # ADR-029: The deployed demo clock — one authoritative logical time the watcher can actually read
 
-**Status:** Accepted
+**Status:** Accepted — amended below ("Accepted Phase 11 batch 4 amendment") for the worker,
+compiler, and sender rows of § 2's principal table. The amendment is itself Accepted and is the
+effective principal table for deployed Phase 11 composition; § 2's original table is preserved
+above it as the historical record of what was decided on 2026-09-08 and why.
 **Date:** 2026-09-08
 **Deciders:** Ambient CHORUS maintainers and product owner
 **Amends:** [02-trust-iam-deployment-configuration.md](../architecture/02-trust-iam-deployment-configuration.md) § IAM notation and resources, § Principal-specific constraints; [06-persistence-and-evidence.md](../architecture/06-persistence-and-evidence.md) § Core table mapping, § Shareable table mapping
@@ -201,3 +204,72 @@ not mean while it lived in a Python object.
   performs steps 1–5 of § 3 as part of the bounded `DEMO` purge.
 - Deployed watcher decisions become reproducible across process restarts, which is what makes the
   demo's 4:30–5:00 segment provable rather than incidental.
+
+## Accepted Phase 11 batch 4 amendment
+
+**This section supersedes § 2's principal-authority table for the worker, compiler, and sender
+rows.** It does not touch § 1, § 3, § 4, § 5, or § 6, and the API, watcher, and reset-principal
+rows of § 2 are unchanged and remain exactly as decided above. Where the two tables would
+otherwise disagree for the affected rows, **this section is authoritative** — not the deployment
+contract, which may describe and cross-reference this amendment but which [docs/README.md](../README.md)'s
+own precedence order ranks below an accepted ADR. An amendment recorded only in a plan document
+could never actually override the table above; this one, recorded here, does.
+
+### Why the original table proved undeployable for three more principals
+
+Building the compiler and sender Lambda handlers surfaced the same defect § 2 already fixed for
+the watcher, twice more, plus one adjacent one in the worker:
+
+- **The compiler** stamped a compiled view's `generated_at`/`expires_at` with `SystemClock`,
+  because § 2 gave it no clock authority of any kind. A view's own timestamps and the case-world
+  logical clock a freshness check later compares them against were then two different clocks by
+  construction — exactly the domain mismatch § 2 exists to prevent, just for the compiler
+  instead of the watcher.
+- **The sender** had the identical problem for the same reason.
+- **The worker**, which § 2 already grants logical-clock read authority for `EXTRACT_COMMITMENT`'s
+  `logical_now`, separately used that same logical reading to compute the *real* instant
+  `CreateDueSchedule` asks EventBridge Scheduler to fire at. A logical clock advanced into the
+  demo's own future (2030) then anchored a genuine AWS resource to 2030 real time, which never
+  fires. This is not a clock-authority gap — the worker already had the read § 2 grants — it is
+  the same reading being asked to answer two questions that must have different answers.
+
+### Effective principal table (supersedes § 2 for the three rows below)
+
+| Principal | Logical clock read | Logical clock write | Wall/system clock |
+|---|---|---|---|
+| API (presenter path) | strongly consistent | the guarded forward-only CAS of § 3, behind `POST /v1/demo/clock/advance` | never, for any clock-domain decision |
+| **Worker** | strongly consistent (unchanged from § 2) | **none** | `SystemClock`, and **only** for the one real-AWS-scheduling arithmetic step in `CreateDueSchedule` (the instant it asks EventBridge Scheduler to fire at) — never for `logical_now`, never for anything the case world reads back |
+| Commitment watcher | strongly consistent (unchanged from § 2) | **none** | never |
+| **Compiler** (new authority) | strongly consistent | **none** | never |
+| **Sender** (new authority) | strongly consistent, for case-world business timestamps and freshness | **none** | never |
+| AgentCore runtimes (Monitor, Investigator, Action) | none | none | never — no clock authority of any kind |
+| Demo reset principal | strongly consistent | read/write, the sole reset/reseed exception (§ 3) | never — and its implementation remains deferred to the dedicated reset tooling work, not part of this amendment |
+
+The compiler's and sender's grants are read-only, on the exact literal partition `NS#DEMO#CLOCK`,
+by the identical `ForAllValues:StringLike dynamodb:LeadingKeys` mechanism § 2 already uses for
+the watcher and the worker — **no wildcard clock grant exists anywhere, for any principal, as a
+result of this amendment**, the same invariant § 2 froze. The sender's row costs no new IAM
+statement: its existing unrestricted Shareable read already reaches the clock partition, so only
+its write-side deny gains the partition by name, the same shape the worker's deny already has.
+
+### The logical/wall-clock distinction is now frozen, system-wide
+
+**Logical clock:** the authoritative case-world/business time. Every fact the case world reasons
+about — a compiled view's `generated_at`/`expires_at`, a proposal or approval's freshness, a
+commitment's due-date semantics, a sender's execution timestamps — is a logical-clock reading,
+always, with no exception.
+
+**System/wall clock:** operational infrastructure timing only. Its **one and only** legitimate
+use in this system is computing the real instant a real AWS resource must fire at — concretely,
+`CreateDueSchedule`'s `actual_now` — because EventBridge Scheduler is a real service running in
+real time and cannot be told to fire against the demo's logical clock.
+
+The wall clock **MUST NOT** be used for any of:
+
+- a compiled view's `generated_at` or `expires_at`;
+- a proposal's or an approval's freshness comparison;
+- any sender case-world timestamp;
+- commitment due-date, fulfillment, or missed-deadline semantics.
+
+A component that reads wall time for any of the above is repeating the exact defect this
+amendment and § 2 both exist to close, regardless of which principal it happens to run as.

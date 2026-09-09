@@ -126,6 +126,12 @@ class SenderSettings:
     """Everything the composition root needs, and nothing it could decide policy from."""
 
     region: str
+    namespace: str
+    """Deployment configuration, not a caller field. The demo clock's partition is the exact
+    literal ``NS#{namespace}#CLOCK``, so a namespace an invocation could choose would be a
+    partition the sender's ``ReadShareable`` grant reaches only by accident of being
+    unrestricted -- the clock adapter still names the deployment's own namespace, never one a
+    request supplies."""
     core_table: str
     shareable_table: str
     audit_table: str
@@ -220,6 +226,26 @@ def build_send_authorization(
     return CompilerSendAuthorization(invoker=invoker)
 
 
+def build_sender_driver(settings: SenderSettings) -> DynamoDbStorageDriver:
+    """The sender's one storage handle, over all three tables.
+
+    Factored out so a deployed composition can share it with a second use of the same tables
+    -- the read-only demo-clock store (P1) -- rather than opening a second boto3 client for the
+    identical grant.
+    """
+
+    return DynamoDbStorageDriver(
+        client=create_dynamodb_client(
+            region_name=settings.region, endpoint_url=settings.dynamodb_endpoint
+        ),
+        table_names={
+            TableName.CORE: settings.core_table,
+            TableName.SHAREABLE: settings.shareable_table,
+            TableName.AUDIT: settings.audit_table,
+        },
+    )
+
+
 def build_send_action(
     settings: SenderSettings,
     *,
@@ -230,6 +256,7 @@ def build_send_action(
     core: CoreRepositoryPort | None = None,
     shareable: ShareableRepositoryPort | None = None,
     invoker: CompilerInvokerPort | None = None,
+    driver: DynamoDbStorageDriver | None = None,
 ) -> SendAction:
     """Construct the send use case over deployed adapters.
 
@@ -240,16 +267,7 @@ def build_send_action(
     with Core genuinely unreachable.
     """
 
-    driver = DynamoDbStorageDriver(
-        client=create_dynamodb_client(
-            region_name=settings.region, endpoint_url=settings.dynamodb_endpoint
-        ),
-        table_names={
-            TableName.CORE: settings.core_table,
-            TableName.SHAREABLE: settings.shareable_table,
-            TableName.AUDIT: settings.audit_table,
-        },
-    )
+    driver = driver or build_sender_driver(settings)
     cursors = SignedCursorCodec(secret=settings.cursor_secret)
     shareable_repository = shareable or ShareableRepository(driver=driver, cursors=cursors)
     # Constructed **only** on the local branch. On the deployed one there is deliberately no
@@ -290,4 +308,5 @@ __all__ = [
     "build_email_sender",
     "build_send_action",
     "build_send_authorization",
+    "build_sender_driver",
 ]

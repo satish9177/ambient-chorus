@@ -53,6 +53,20 @@ from infra.cdk.config import CdkBuildConfig
 EXECUTION_KEY_PREFIX = "NS#*#EXECUTION#*"
 """The execution's own partition, and the only Shareable prefix this role may write."""
 
+DEMO_CLOCK_PARTITION = "NS#DEMO#CLOCK"
+"""The **exact literal** partition of the deployed demo clock (ADR-029 § 1-2, amended § 2 P1).
+
+Not a pattern, and deliberately not ``NS#*#CLOCK*``: ``DEMO`` is the only namespace a deployed
+clock exists in, and a wildcard would authorize a clock in a namespace no deployment has.
+
+The sender needs no *new read grant* for it: ``ReadShareable`` below is already an unrestricted
+read of the whole Shareable table, so it already reaches this one item -- reading the same
+authoritative clock the compiled view, the proposal, the approval, and the execution are all
+stamped against, so a send's own business timestamps and freshness comparisons (``_expired``
+against the fence's ``expires_at``) agree with the rest of the case timeline (P1). What is new
+is the explicit write refusal below.
+"""
+
 FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#ACTION#*",
     "NS#*#ACTION_CURRENT#*",
@@ -60,6 +74,7 @@ FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#VIEW#*",
     "NS#*#VIEW_CURRENT#*",
     "NS#*#CASE#*",
+    DEMO_CLOCK_PARTITION,
 )
 """Every Shareable prefix the sender must never write, denied by ``ForAnyValue``.
 
@@ -72,6 +87,11 @@ acceptable.
 of the action case *projection*, which the application worker runs -- the sender's send-outcome
 transaction never writes one. A sender that could write a locator could point a reply at an
 execution it chose (ADR-026 § 3).
+
+``NS#DEMO#CLOCK`` joins the list in the Phase 11 batch 4 repair (P1). The sender reads the demo
+clock through the unrestricted ``ReadShareable`` grant it already holds; this is the positive
+half's explicit negative -- a sender that could move logical time could make its own fence and
+freshness checks pass.
 """
 
 READ_ACTIONS = ("dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query")

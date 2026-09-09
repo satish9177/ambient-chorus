@@ -198,6 +198,43 @@ DENIED_PASS_ROLE_ACTIONS = ("iam:PassRole",)
 """Denied on the **API** role. Only the worker passes the scheduler execution role, and only
 that one role (deployment contract § 8.1, § 14)."""
 
+DEMO_CLOCK_PARTITION = "NS#DEMO#CLOCK"
+"""The **exact literal** partition of the deployed demo clock (ADR-029 § 1-2).
+
+Not a pattern, not a family, and deliberately not ``NS#*#CLOCK*``. ``DEMO`` is the only
+namespace a deployed clock exists in -- ``Settings.validate_environment_contract`` already
+refuses any other in the ``demo`` environment -- and a wildcard here would authorize a clock in
+a namespace no deployment has, which is the shape of permission that is correct on the day it
+is written and wrong after the next namespace exists. A policy containing one fails review, and
+a template test asserts its absence.
+"""
+
+DEMO_CLOCK_READ_ACTION = "dynamodb:GetItem"
+"""One item, one direct read. There is no query and no scan of the clock partition."""
+
+DEMO_CLOCK_WRITE_ACTION = "dynamodb:PutItem"
+"""The whole of the API's clock write authority, and it is a *conditional* whole-item put.
+
+``PutItem`` rather than ``UpdateItem`` because the storage driver has no attribute-level update
+path by design (:mod:`chorus.ports.storage`), and because the guarded forward CAS of ADR-029 § 3
+is expressible as three condition expressions on a whole-item put -- the version, the reset
+generation, and the strictly-earlier stored reading. Keeping it to ``PutItem`` also leaves the
+"no ``dynamodb:UpdateItem`` anywhere" invariant of § 8.8 untouched.
+"""
+
+DENIED_CLOCK_WRITE_ACTIONS = (
+    "dynamodb:PutItem",
+    "dynamodb:UpdateItem",
+    "dynamodb:DeleteItem",
+    "dynamodb:ConditionCheckItem",
+)
+"""Every form of write the worker must not hold on the clock prefix (ADR-029 § 2).
+
+Denied rather than merely ungranted, so a later widening of the worker's Shareable write
+statement still fails closed. ``ConditionCheckItem`` is in the list because a transactional
+condition on the clock is still a transaction the clock participates in.
+"""
+
 DENIED_SECRET_READ_ACTIONS = ("secretsmanager:GetSecretValue",)
 """Denied on the **worker** role, table-wide. The worker reads no secret: the demo bearer token
 is the API's, and the destination registry is the sender's. A single role holding both the
@@ -243,7 +280,8 @@ class ChorusApplicationStack(Stack):
     - Shareable view prefixes: ``ConditionCheck`` only, on both.
     - Audit: append, on both. Private S3 + private KMS: yes, on both. Export S3: GetObject +
       Decrypt, on both.
-    - Secrets Manager: API reads the demo bearer-token secret; worker holds an explicit deny.
+    - Secrets Manager: API reads the demo bearer-token secret and the pagination
+      cursor-signing key; worker holds an explicit deny.
     - Lambda invoke: API -> operation worker + compiler; worker -> compiler + sender.
     - AgentCore: API denied; worker invokes the Monitor / Investigator / Action runtimes.
     - Scheduler: API denied outright, including ``iam:PassRole``; worker holds
@@ -266,7 +304,9 @@ class ChorusApplicationStack(Stack):
         worker_function_arn: str | None = None,
         compiler_function_arn: str | None = None,
         sender_function_arn: str | None = None,
+        watcher_alias_arn: str | None = None,
         demo_access_secret_arn: str | None = None,
+        cursor_signing_secret_arn: str | None = None,
         destination_registry_secret_arn: str | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
@@ -318,7 +358,9 @@ class ChorusApplicationStack(Stack):
             tables=tables,
             worker_function_arn=worker_function_arn,
             compiler_function_arn=compiler_function_arn,
+            watcher_alias_arn=watcher_alias_arn,
             demo_access_secret_arn=demo_access_secret_arn,
+            cursor_signing_secret_arn=cursor_signing_secret_arn,
             destination_registry_secret_arn=destination_registry_secret_arn,
         )
         self._grant_worker_boundary(
@@ -453,7 +495,9 @@ class ChorusApplicationStack(Stack):
         tables: ApplicationTables,
         worker_function_arn: str | None,
         compiler_function_arn: str | None,
+        watcher_alias_arn: str | None,
         demo_access_secret_arn: str | None,
+        cursor_signing_secret_arn: str | None,
         destination_registry_secret_arn: str | None,
     ) -> None:
         """The request path's own capabilities and the denies that keep it a front end.
@@ -461,9 +505,11 @@ class ChorusApplicationStack(Stack):
         It writes the action and case prefixes the human decisions move -- and **not**
         ``OUTBOUND_MESSAGE#``, which only the worker's ``SENT`` projection writes. It invokes
         the operation worker and (synchronously, for the compile route) the compiler, and
-        nothing else. It reads the demo bearer-token secret and no other. It holds no scheduler
-        capability, no ``iam:PassRole``, and no agent-runtime invocation: every agent-invoking
-        route dispatches to the worker and returns 202.
+        nothing else. It reads the demo bearer-token secret and the pagination cursor-signing
+        key, and no other secret (Phase 11 batch 4 repair, P2-5 -- the two are purpose-separated
+        identities, so this is two statements naming two exact ARNs, never a shared one). It
+        holds no scheduler capability, no ``iam:PassRole``, and no agent-runtime invocation:
+        every agent-invoking route dispatches to the worker and returns 202.
         """
 
         self.api_role.add_to_policy(
@@ -504,6 +550,47 @@ class ChorusApplicationStack(Stack):
                     resources=invoke_targets,
                 )
             )
+        if watcher_alias_arn is not None:
+            # ADR-028 § 5 and deployment contract § 8.1. ``POST /v1/demo/clock/advance`` promises
+            # the watcher's outcome in its response body, so the request path advances the
+            # durable clock and then invokes the watcher **synchronously**. Routing it through
+            # the asynchronous worker to avoid this one grant would silently change a frozen
+            # endpoint from "here is what the watcher decided" to "a decision was scheduled".
+            #
+            # The resource is the qualified **``:live`` alias** ARN and nothing else: no
+            # unqualified function, no numeric version, no wildcard. Rollback repoints the alias
+            # at a published version and this statement does not change (deployment contract
+            # § 20). It is a second, separate statement rather than an extra resource on
+            # ``InvokeOperationWorkerAndCompilerOnly`` so a template test can assert the watcher
+            # authority exactly, and so widening one does not silently widen the other.
+            self.api_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="InvokeCommitmentWatcherLiveAliasOnly",
+                    effect=iam.Effect.ALLOW,
+                    actions=["lambda:InvokeFunction"],
+                    resources=[watcher_alias_arn],
+                )
+            )
+        # ADR-029 § 2. The request path is the **only** principal that may move logical time, and
+        # it may do so only through the guarded forward compare-and-swap of § 3. The grant is one
+        # action on one exact literal partition; the three fences that make it forward-only are
+        # condition expressions the table evaluates, not checks this process performs.
+        #
+        # ``PutItem`` alone: the storage driver has no attribute-level update path, so the CAS is
+        # a conditional whole-item put -- which also leaves § 8.8's "no ``dynamodb:UpdateItem``
+        # anywhere" invariant untouched. Reads of the clock are already covered by the
+        # table-wide ``ReadShareable`` statement both principals hold.
+        self.api_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="AdvanceDemoClockItemOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[DEMO_CLOCK_WRITE_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
+                },
+            )
+        )
         if demo_access_secret_arn is not None:
             self.api_role.add_to_policy(
                 iam.PolicyStatement(
@@ -511,6 +598,20 @@ class ChorusApplicationStack(Stack):
                     effect=iam.Effect.ALLOW,
                     actions=["secretsmanager:GetSecretValue"],
                     resources=[demo_access_secret_arn],
+                )
+            )
+        if cursor_signing_secret_arn is not None:
+            # P2-5: its own exact secret identity, never folded into the demo access secret
+            # above -- the two have unrelated blast radii and unrelated rotation schedules
+            # (`chorus.infrastructure.secrets.cursor_signing`). A separate statement so a
+            # template test can assert this one grant exactly, and so widening one secret's
+            # resource can never silently widen the other's.
+            self.api_role.add_to_policy(
+                iam.PolicyStatement(
+                    sid="ReadCursorSigningKeySecretOnly",
+                    effect=iam.Effect.ALLOW,
+                    actions=["secretsmanager:GetSecretValue"],
+                    resources=[cursor_signing_secret_arn],
                 )
             )
         if destination_registry_secret_arn is not None:
@@ -578,6 +679,44 @@ class ChorusApplicationStack(Stack):
                     "ForAllValues:StringLike": {
                         "dynamodb:LeadingKeys": list(WORKER_SHAREABLE_WRITE_PREFIXES)
                     }
+                },
+            )
+        )
+        # ADR-029, resolved in Phase 11 batch 4. ``EXTRACT_COMMITMENT`` runs on this principal
+        # and supplies ``clock.now()`` as the ``logical_now`` of its ``CreateDueSchedule``
+        # request, where the demo mapping ``actual_now + max(10 minutes, logical_due -
+        # logical_now)`` turns a logical deadline into a real one-time schedule. Wall time in
+        # that slot schedules a thirty-day deadline thirty days out, so the worker genuinely
+        # requires authoritative logical time.
+        #
+        # It gets a **read and only a read**, on one action and one exact literal partition. The
+        # table-wide ``ReadShareable`` statement above already reached this row; this statement
+        # exists so the authority is *stated and assertable* rather than incidental, and so the
+        # deny below has something specific to sit beside.
+        self.worker_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadDemoClockItemOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[DEMO_CLOCK_READ_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
+                },
+            )
+        )
+        # The negative half, and the reason the read above is safe to state. The worker's
+        # ``LeadingKeys`` write grant never named the clock prefix, but "not granted" and
+        # "denied" are different guarantees, and an explicit deny cannot be overridden by a
+        # later allow. ``ForAnyValue``: a transaction naming the clock alongside legitimate
+        # action items is refused whole.
+        self.worker_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyWorkerDemoClockWrites",
+                effect=iam.Effect.DENY,
+                actions=list(DENIED_CLOCK_WRITE_ACTIONS),
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAnyValue:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
                 },
             )
         )

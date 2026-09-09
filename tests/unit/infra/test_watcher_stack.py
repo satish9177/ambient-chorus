@@ -27,6 +27,7 @@ from infra.cdk.config import CdkBuildConfig
 from infra.cdk.stacks import ChorusDataStack, ChorusWatcherStack, WatcherBuckets, WatcherTables
 from infra.cdk.stacks.watcher import (
     CASE_KEY_PREFIX,
+    DEMO_CLOCK_PARTITION,
     DLQ_DEPTH_ALARM_THRESHOLD,
     FORBIDDEN_WRITE_PREFIXES,
 )
@@ -402,3 +403,59 @@ def test_the_api_role_holds_no_scheduler_authority_and_no_pass_role() -> None:
 
     assert not any(a.startswith("scheduler:") for a in api_allows)
     assert "iam:PassRole" not in api_allows
+
+
+# -- ADR-029: the watcher reads one clock and can never move it ------------------------
+
+
+def test_the_watcher_may_strongly_read_the_demo_clock_item() -> None:
+    """Without this the deployed watcher cannot perform step 4 of its own frozen order.
+
+    Its Core deny is total, so the demo manifest is unreachable; and a process-local clock in a
+    separate Lambda is a *different* clock from the one the API advanced. One read grant, on one
+    exact literal partition, is what makes "exactly one clock" true across processes.
+    """
+
+    grant = statement("ReadDemoClockItemOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"dynamodb:GetItem"}
+    assert grant["Condition"]["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == [
+        DEMO_CLOCK_PARTITION
+    ]
+
+
+def test_the_watcher_holds_no_write_of_any_form_on_the_clock() -> None:
+    """ADR-029 § 2: no ``PutItem``, ``UpdateItem``, ``DeleteItem``, or ``ConditionCheckItem``.
+
+    A watcher that could move logical time could make its own early-firing check pass, so the
+    absence is backed by the explicit deny rather than left to the grant's narrowness.
+    """
+
+    deny = statement("DenyNonCasePartitionWrites")
+    assert deny["Effect"] == "Deny"
+    assert (
+        DEMO_CLOCK_PARTITION in deny["Condition"]["ForAnyValue:StringLike"]["dynamodb:LeadingKeys"]
+    )
+
+    for item in statements():
+        if item["Effect"] != "Allow":
+            continue
+        condition = item.get("Condition", {}).get("ForAllValues:StringLike", {})
+        keys = condition.get("dynamodb:LeadingKeys", [])
+        if DEMO_CLOCK_PARTITION in keys:
+            assert actions_of(item) == {"dynamodb:GetItem"}
+
+
+def test_no_clock_grant_anywhere_is_a_wildcard() -> None:
+    """ADR-029 § 2: there is no ``NS#*#CLOCK*``, and a policy containing one fails review."""
+
+    for item in statements():
+        for block in ("ForAllValues:StringLike", "ForAnyValue:StringLike"):
+            keys = item.get("Condition", {}).get(block, {}).get("dynamodb:LeadingKeys", [])
+            for key in keys if isinstance(keys, list) else [keys]:
+                if "CLOCK" in key:
+                    assert key == DEMO_CLOCK_PARTITION
+
+
+def test_the_clock_partition_is_the_exact_deployed_literal() -> None:
+    assert DEMO_CLOCK_PARTITION == "NS#DEMO#CLOCK"

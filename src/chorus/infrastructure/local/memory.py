@@ -38,6 +38,7 @@ from chorus.ports.storage import (
     AttributeAtMostNumber,
     AttributeEqualsNumber,
     AttributeEqualsString,
+    AttributeLessThanNumber,
     CheckItem,
     DeleteItem,
     ItemCondition,
@@ -98,6 +99,11 @@ def _evaluate(condition: ItemCondition, item: StoredItem | None) -> bool:
                 return False
             stored = item.get(name)
             return isinstance(stored, int) and not isinstance(stored, bool) and stored <= value
+        case AttributeLessThanNumber(name=name, value=value):
+            if item is None:
+                return False
+            stored = item.get(name)
+            return isinstance(stored, int) and not isinstance(stored, bool) and stored < value
         case AllOf(conditions):
             return all(_evaluate(inner, item) for inner in conditions)
         case AnyOf(conditions):

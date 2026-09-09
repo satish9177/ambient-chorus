@@ -21,6 +21,7 @@ than verifying a signature over values the row already holds (ADR-028 SS 2).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -93,22 +94,35 @@ class CommitmentDueEvent:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DueScheduleRequest:
-    """``{schedule_name, client_token, at_utc, payload}`` and nothing else.
+    """``{schedule_name, client_token, at_utc, payload, target_input}`` and nothing else.
 
-    All four are derived by :mod:`chorus.application.services.commitment_schedule` from the
+    All five are derived by :mod:`chorus.application.services.commitment_schedule` from the
     commitment row. A caller that could name its own schedule would be a caller that could
     move a deadline.
+
+    ``target_input`` is the **exact** JSON object EventBridge Scheduler's ``Target.Input`` must
+    carry (Phase 11 batch 4 repair, P2-1). It is not ``payload`` -- ``payload`` is the frozen
+    ``commitment-due/v1`` event this port has always carried, and it stays exactly that. But
+    what EventBridge Scheduler actually delivers to a Lambda target *is* ``Target.Input``
+    verbatim as the invocation event, and the watcher's production entry point expects the full
+    operation-wrapped ``commitment-watcher-request/v1`` envelope -- the same one
+    ``POST /v1/demo/clock/advance`` sends synchronously -- not the bare event. ``target_input``
+    is that envelope, pre-built by the application layer that already knows its shape, so this
+    port and its adapter stay opaque to it: they carry a mapping, they do not construct one.
     """
 
     schedule_name: str
     client_token: UUID
     at_utc: datetime
     payload: CommitmentDueEvent
+    target_input: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.schedule_name) <= MAX_SCHEDULE_NAME_LENGTH:
             raise ValueError("schedule name length is invalid")
         require_utc(self.at_utc)
+        if not self.target_input:
+            raise ValueError("a schedule request carries a non-empty target input")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

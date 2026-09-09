@@ -76,6 +76,26 @@ The prefixes are distinct literals: ``NS#*#VIEW#*`` matches neither ``VIEW_CURRE
 CASE_KEY_PREFIX = "NS#*#CASE#*"
 """Case partitions. The compiler reads these and condition-checks them; it never writes one."""
 
+DEMO_CLOCK_PARTITION = "NS#DEMO#CLOCK"
+"""The **exact literal** partition of the deployed demo clock (ADR-029 § 1-2, amended § 2 P1).
+
+Not a pattern, and deliberately not ``NS#*#CLOCK*``: ``DEMO`` is the only namespace a deployed
+clock exists in, and a wildcard would authorize a clock in a namespace no deployment has. A
+policy containing one fails review, and a template test asserts its absence.
+
+The compiler is the deterministic authority over a view's ``generated_at``, ``expires_at``, and
+every freshness comparison the send fence makes against a view, an approval, or a mandate --
+all case-world facts, stamped and judged against the **same** authoritative clock the rest of
+the case timeline uses (P1). A compiler running on wall-clock time would stamp a view with an
+instant the rest of the system's business timestamps disagree with by however far the demo
+clock has been advanced.
+"""
+
+DEMO_CLOCK_READ_ACTION = "dynamodb:GetItem"
+"""One item, one direct read. The compiler never queries or scans the clock partition, and it
+is denied every write on it (ADR-029 § 2): no ``PutItem``, no ``UpdateItem``, no ``DeleteItem``,
+no ``advance``, no reset, no reseed."""
+
 FENCE_KEY_PREFIX = "NS#*#FENCE#*"
 """The send fence's own partition.
 
@@ -301,6 +321,22 @@ class ChorusCompilerStack(Stack):
                 },
             )
         )
+        # P1 (Phase 11 batch 4 repair). A strongly consistent read, and only that, of the one
+        # authoritative logical clock -- so a compiled view's ``generated_at``/``expires_at``
+        # and every freshness comparison the send fence makes are stamped against the same
+        # case-world timeline as the proposal, the approval, and the execution. No write of any
+        # form: the deny below backs this with an explicit refusal rather than mere absence.
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadDemoClockItemOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[DEMO_CLOCK_READ_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
+                },
+            )
+        )
         self.role.add_to_policy(
             iam.PolicyStatement(
                 sid="AppendAudit",
@@ -361,6 +397,22 @@ class ChorusCompilerStack(Stack):
                 actions=list(DENIED_CASE_WRITE_ACTIONS),
                 resources=[tables.core.table_arn],
                 conditions={"ForAnyValue:StringLike": {"dynamodb:LeadingKeys": [CASE_KEY_PREFIX]}},
+            )
+        )
+        # P1. The read grant above is the compiler's entire clock authority. Denied rather than
+        # merely ungranted, so a later widening of a Shareable write statement still fails
+        # closed -- and because "the compiler cannot mutate the clock" is exactly the kind of
+        # sentence an explicit deny, not an absent grant, is what makes provable from the
+        # template (ADR-029 § 2).
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyCompilerDemoClockWrites",
+                effect=iam.Effect.DENY,
+                actions=[*DENIED_CASE_WRITE_ACTIONS, CONDITION_CHECK_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAnyValue:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
+                },
             )
         )
         self.role.add_to_policy(

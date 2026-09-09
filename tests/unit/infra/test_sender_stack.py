@@ -131,6 +131,38 @@ def test_the_forbidden_prefixes_are_denied_by_for_any_value(
     assert any(operator.startswith("ForAnyValue") for operator in deny["Condition"])
 
 
+# -- P1 (Phase 11 batch 4 repair): the sender reads the same clock, and cannot move it -------
+
+
+def test_the_demo_clock_partition_is_explicitly_denied_to_the_sender(
+    sender: assertions.Template,
+) -> None:
+    """No new *read* grant: ``ReadShareable`` is already unrestricted over the whole table, so
+    it already reaches ``NS#DEMO#CLOCK``. What is new is the explicit write refusal."""
+
+    deny = statement(sender, "DenyProposalApprovalViewAndCaseWrites")
+    assert "NS#DEMO#CLOCK" in leading_keys(deny)
+
+
+def test_the_sender_read_shareable_grant_is_unrestricted_and_needed_no_new_statement(
+    sender: assertions.Template,
+) -> None:
+    read = statement(sender, "ReadShareable")
+    assert read["Effect"] == "Allow"
+    assert "Condition" not in read, "an unrestricted read must carry no LeadingKeys narrowing"
+
+
+def test_no_clock_grant_on_the_sender_is_a_wildcard(sender: assertions.Template) -> None:
+    """ADR-029 § 2: there is no ``NS#*#CLOCK*``, and a policy containing one fails review."""
+
+    for item in statements(sender):
+        for block in ("ForAllValues:StringLike", "ForAnyValue:StringLike"):
+            keys = item.get("Condition", {}).get(block, {}).get("dynamodb:LeadingKeys", [])
+            for key in keys if isinstance(keys, list) else [keys]:
+                if "CLOCK" in key:
+                    assert key == "NS#DEMO#CLOCK"
+
+
 def test_the_sender_holds_no_update_item_and_no_blanket_transaction_action(
     sender: assertions.Template,
 ) -> None:

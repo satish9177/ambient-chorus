@@ -19,9 +19,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from hashlib import sha256
+from typing import Any
 from uuid import UUID, uuid5
 
-from chorus.domain.ids import CaseId, CommitmentId, Namespace
+from chorus.application.commands.record_commitment_due import (
+    TRIGGER_SCHEDULE,
+    RecordCommitmentDueCommand,
+)
+from chorus.application.watcher_contract import WATCHER_OPERATION, encode_watcher_request
+from chorus.domain.ids import CaseId, CommitmentId, CommunityId, Namespace, Sha256Digest
 from chorus.domain.time import require_utc
 from chorus.ports.scheduler import (
     MAX_SCHEDULE_NAME_LENGTH,
@@ -31,11 +37,31 @@ from chorus.ports.scheduler import (
 
 SCHEDULE_TOKEN_NAMESPACE = UUID("2b0f6a2e-6a1b-5a52-9f6f-1f1a2c4d6e80")
 DUE_EVENT_NAMESPACE = UUID("9c3d5f11-4b28-5c73-8a10-7d5e2f9b4c31")
-"""Two fixed UUIDv5 namespaces, distinct so one derivation can never produce the other.
+SCHEDULE_CORRELATION_NAMESPACE = UUID("6f2a8c19-3e77-5b04-9c1e-8a5d2f7b3c94")
+"""Three fixed UUIDv5 namespaces, distinct so one derivation can never produce another.
 
 They are constants in source rather than configuration for the reason every derived identity in
 this system is: a value an operator could change is a value that makes yesterday's schedule name
 and today's disagree about the same commitment.
+
+``SCHEDULE_CORRELATION_NAMESPACE`` joins the other two in the Phase 11 batch 4 repair (P2-1):
+the watcher's audit ``correlation_id`` has to be a **deterministic** function of
+``{commitment_id, generation}`` exactly like the schedule name and the client token, because it
+is embedded in ``Target.Input`` and a retried ``CreateSchedule`` call must submit byte-identical
+input under its client token -- a fresh ``uuid4()`` on every attempt would make two retries of
+the same request look like two different ones.
+"""
+
+SCHEDULER_ACTOR_ID_HASH = Sha256Digest(
+    f"sha256:{sha256(b'chorus-commitment-scheduler').hexdigest()}"
+)
+"""The watcher audit actor for a Scheduler-triggered ``commitment.due`` event.
+
+There is no persona and no request behind a real one-time schedule firing -- the actor is the
+transport that authenticated it (``ActorType.AWS_SERVICE``), exactly as the inbound-mail
+transport is its own audited actor rather than a borrowed persona. Fixed rather than derived
+from anything per-invocation, which is also what keeps ``Target.Input`` deterministic across a
+retried ``CreateSchedule`` call under the same client token (P2-1).
 """
 
 NAMESPACE_HASH_LENGTH = 8
@@ -121,6 +147,20 @@ def due_event_id(*, commitment_id: CommitmentId, generation: int) -> UUID:
     return uuid5(DUE_EVENT_NAMESPACE, f"{commitment_id}|{generation}")
 
 
+def schedule_correlation_id(*, commitment_id: CommitmentId, generation: int) -> UUID:
+    """``uuidv5(SCHEDULE_CORRELATION_NAMESPACE, commitment_id | generation)``.
+
+    The watcher audit ``correlation_id`` a real ``CreateSchedule``'s ``Target.Input`` carries.
+    Deterministic for the same reason the schedule name and the client token are: it is
+    embedded in ``Target.Input``, and a retry under the same client token has to submit
+    byte-identical input (P2-1).
+    """
+
+    if generation < 1:
+        raise ValueError("schedule generation must be positive")
+    return uuid5(SCHEDULE_CORRELATION_NAMESPACE, f"{commitment_id}|{generation}")
+
+
 def due_event(
     *,
     namespace: Namespace,
@@ -157,21 +197,64 @@ def demo_schedule_instant(
     return actual_now + max(DEMO_MINIMUM_DELAY, logical_due_at - logical_now)
 
 
+def scheduled_watcher_invocation(
+    *,
+    namespace: Namespace,
+    community_id: CommunityId,
+    case_id: CaseId,
+    commitment_id: CommitmentId,
+    generation: int,
+    due_at: datetime,
+) -> dict[str, Any]:
+    """The exact ``Target.Input`` a real ``CreateSchedule`` for this commitment must carry.
+
+    Operation-wrapped and payload-shaped exactly as
+    :class:`~chorus.infrastructure.lambdas.invoker.SynchronousLambdaInvoker` builds every other
+    internal invocation, and exactly as ``POST /v1/demo/clock/advance`` sends the watcher
+    synchronously (P2-1) -- because what EventBridge Scheduler delivers to a Lambda target *is*
+    ``Target.Input`` verbatim as the invocation event, and the production
+    ``functions.commitment_watcher.handler`` entry point understands only this one envelope.
+
+    ``community_id`` is deployment context passed in by the caller, exactly as it is on the
+    demo-clock route -- never derived from the event, because the event names a namespace and a
+    case and the watcher reads a Shareable case partition, so a community the event could choose
+    would be a scope the event could choose. ``actor_id_hash`` and ``correlation_id`` are both
+    **deterministic** functions of ``{commitment_id, generation}`` (never a fresh UUID), which is
+    what keeps a retried ``CreateSchedule`` call's input byte-identical to the first attempt
+    under the same client token.
+    """
+
+    event = due_event(
+        namespace=namespace,
+        case_id=case_id,
+        commitment_id=commitment_id,
+        generation=generation,
+        due_at=due_at,
+    )
+    command = RecordCommitmentDueCommand(
+        event=event,
+        community_id=community_id,
+        actor_id_hash=SCHEDULER_ACTOR_ID_HASH,
+        correlation_id=schedule_correlation_id(commitment_id=commitment_id, generation=generation),
+        trigger=TRIGGER_SCHEDULE,
+    )
+    return {"operation": WATCHER_OPERATION, "payload": encode_watcher_request(command)}
+
+
 def due_schedule_request(
     *,
     environment: str,
     namespace: Namespace,
+    community_id: CommunityId,
     case_id: CaseId,
     commitment_id: CommitmentId,
     generation: int,
     due_at: datetime,
     at_utc: datetime,
 ) -> DueScheduleRequest:
-    """Assemble the whole request from derived values. Nothing here is passed in by a caller.
-
-    ``at_utc`` is the only argument that is not a pure function of the commitment, because it is
-    the demo mapping's output or ``due_at`` itself -- which deployment decides, and this module
-    does not.
+    """Assemble the whole request from derived values. Nothing here is passed in by a caller
+    except ``community_id`` (deployment context) and ``at_utc`` (the deployment's wall-clock
+    mapping).
     """
 
     return DueScheduleRequest(
@@ -183,6 +266,14 @@ def due_schedule_request(
         ),
         client_token=schedule_client_token(commitment_id=commitment_id, generation=generation),
         at_utc=at_utc,
+        target_input=scheduled_watcher_invocation(
+            namespace=namespace,
+            community_id=community_id,
+            case_id=case_id,
+            commitment_id=commitment_id,
+            generation=generation,
+            due_at=due_at,
+        ),
         payload=due_event(
             namespace=namespace,
             case_id=case_id,
@@ -197,6 +288,8 @@ __all__ = [
     "DEMO_MINIMUM_DELAY",
     "DUE_EVENT_NAMESPACE",
     "NAMESPACE_HASH_LENGTH",
+    "SCHEDULER_ACTOR_ID_HASH",
+    "SCHEDULE_CORRELATION_NAMESPACE",
     "SCHEDULE_TOKEN_NAMESPACE",
     "demo_schedule_instant",
     "due_event",
@@ -204,5 +297,7 @@ __all__ = [
     "due_schedule_request",
     "namespace_hash8",
     "schedule_client_token",
+    "schedule_correlation_id",
     "schedule_name",
+    "scheduled_watcher_invocation",
 ]

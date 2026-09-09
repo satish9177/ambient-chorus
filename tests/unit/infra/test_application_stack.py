@@ -16,6 +16,7 @@ repository can be changed by anyone, and a policy is what AWS actually enforces.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -32,6 +33,8 @@ from infra.cdk.stacks import (
 from infra.cdk.stacks.application import (
     APPLICATION_SHAREABLE_PREFIXES,
     CONDITION_CHECK_ACTION,
+    DEMO_CLOCK_PARTITION,
+    DENIED_CLOCK_WRITE_ACTIONS,
     DENIED_MODEL_ACTIONS,
     DENIED_SEND_ACTIONS,
     DENIED_VIEW_WRITE_ACTIONS,
@@ -289,8 +292,10 @@ RUNTIME_ARNS = (
     "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_action-ghi",
 )
 DEMO_SECRET = "arn:aws:secretsmanager:us-east-1:111122223333:secret:chorus-demo-access-AbCdEf"
+CURSOR_SECRET = "arn:aws:secretsmanager:us-east-1:111122223333:secret:chorus-cursor-signing-QrS"
 DEST_SECRET = "arn:aws:secretsmanager:us-east-1:111122223333:secret:chorus-demo-destination-XyZ"
 SCHEDULER_ROLE_ARN = "arn:aws:iam::111122223333:role/chorus-scheduler-demo"
+WATCHER_ALIAS = "arn:aws:lambda:us-east-1:111122223333:function:chorus-commitment-watcher-demo:live"
 
 
 def _split_template() -> assertions.Template:
@@ -301,7 +306,9 @@ def _split_template() -> assertions.Template:
         worker_function_arn=WORKER_FN,
         compiler_function_arn=COMPILER_FN,
         sender_function_arn=SENDER_FN,
+        watcher_alias_arn=WATCHER_ALIAS,
         demo_access_secret_arn=DEMO_SECRET,
+        cursor_signing_secret_arn=CURSOR_SECRET,
         destination_registry_secret_arn=DEST_SECRET,
     )
 
@@ -381,6 +388,17 @@ def test_api_reads_the_demo_access_token_secret_only() -> None:
     assert grant["Effect"] == "Allow"
     assert actions_of(grant) == {"secretsmanager:GetSecretValue"}
     assert grant["Resource"] == DEMO_SECRET
+
+
+def test_api_reads_the_cursor_signing_key_secret_only() -> None:
+    """P2-5: its own exact secret identity -- a separate statement from the demo access token
+    grant above, naming a different ARN, so widening one can never silently widen the other."""
+
+    grant = _find(_api(_split_template()), "ReadCursorSigningKeySecretOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"secretsmanager:GetSecretValue"}
+    assert grant["Resource"] == CURSOR_SECRET
+    assert grant["Resource"] != DEMO_SECRET
 
 
 # -- API: DENY / no grant of the worker-only capabilities ------------------------------
@@ -505,3 +523,96 @@ def test_offline_synth_grants_no_lambda_invoke_or_secret_read() -> None:
         allowed = _allowed_actions(items)
         assert "lambda:InvokeFunction" not in allowed
         assert "secretsmanager:GetSecretValue" not in allowed
+
+
+# -- Phase 11 batch 4: the API -> watcher resolution ----------------------------------
+
+
+def test_the_api_may_invoke_the_watcher_live_alias_and_only_that() -> None:
+    """The exact resolution of the ``POST /v1/demo/clock/advance`` contradiction.
+
+    That endpoint's frozen response carries ``watcher_outcome`` and ``commitment_status``, so it
+    promises the watcher's *decision* rather than that one was scheduled. Serving that promise
+    means one synchronous invocation, which needs one grant -- and this asserts it is exactly
+    one, on exactly the ``:live`` alias.
+    """
+
+    grant = _find(_api(_split_template()), "InvokeCommitmentWatcherLiveAliasOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"lambda:InvokeFunction"}
+    assert grant["Resource"] == WATCHER_ALIAS
+
+
+def test_the_watcher_grant_names_the_alias_and_never_the_bare_function() -> None:
+    """Rollback repoints the alias at a published version; no policy statement changes.
+
+    An unqualified function ARN or a numeric version would both break that, so the assertion is
+    on the literal rather than on "it mentions the watcher somewhere".
+    """
+
+    resources: list[str] = []
+    for item in _api(_split_template()):
+        if item["Effect"] != "Allow" or "lambda:InvokeFunction" not in actions_of(item):
+            continue
+        resource = item["Resource"]
+        resources.extend(resource if isinstance(resource, list) else [resource])
+
+    watcher = [value for value in resources if "commitment-watcher" in value]
+    assert watcher == [WATCHER_ALIAS]
+    assert all(not value.endswith(":1") for value in watcher)
+    assert all("*" not in value for value in watcher)
+
+
+def test_the_worker_may_not_invoke_the_watcher() -> None:
+    """The demo-clock route is the request path's, and the schedule is the scheduler role's."""
+
+    for item in _worker(_split_template()):
+        if item["Effect"] != "Allow" or "lambda:InvokeFunction" not in actions_of(item):
+            continue
+        resource = item["Resource"]
+        values = resource if isinstance(resource, list) else [resource]
+        assert all("commitment-watcher" not in value for value in values)
+
+
+# -- Phase 11 batch 4: the demo clock (ADR-029) ---------------------------------------
+
+
+def test_only_the_api_may_move_the_demo_clock() -> None:
+    """One action, one exact literal partition, and the forward rule is a stored condition."""
+
+    grant = _find(_api(_split_template()), "AdvanceDemoClockItemOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"dynamodb:PutItem"}
+    assert leading_keys(grant) == [DEMO_CLOCK_PARTITION]
+    assert SHAREABLE_REFERENCE in json.dumps(grant["Resource"])
+
+
+def test_the_worker_reads_the_demo_clock_and_can_never_write_it() -> None:
+    """The § 14 resolution: ``EXTRACT_COMMITMENT`` needs authoritative logical time, read-only."""
+
+    worker = _worker(_split_template())
+    read = _find(worker, "ReadDemoClockItemOnly")
+    assert read["Effect"] == "Allow"
+    assert actions_of(read) == {"dynamodb:GetItem"}
+    assert leading_keys(read) == [DEMO_CLOCK_PARTITION]
+
+    deny = _find(worker, "DenyWorkerDemoClockWrites")
+    assert deny["Effect"] == "Deny"
+    assert actions_of(deny) == set(DENIED_CLOCK_WRITE_ACTIONS)
+    assert deny["Condition"]["ForAnyValue:StringLike"]["dynamodb:LeadingKeys"] == [
+        DEMO_CLOCK_PARTITION
+    ]
+
+
+def test_no_role_holds_a_wildcard_clock_grant() -> None:
+    """ADR-029 § 2: there is no ``NS#*#CLOCK*`` anywhere, and a policy with one fails review."""
+
+    for items in (_api(_split_template()), _worker(_split_template())):
+        for item in items:
+            for key in leading_keys(item):
+                if "CLOCK" in key:
+                    assert key == DEMO_CLOCK_PARTITION
+
+
+def test_the_demo_clock_partition_is_the_exact_deployed_literal() -> None:
+    assert DEMO_CLOCK_PARTITION == "NS#DEMO#CLOCK"

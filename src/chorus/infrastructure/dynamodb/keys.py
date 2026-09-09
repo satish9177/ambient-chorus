@@ -427,3 +427,27 @@ def verification_request_sort_key(commitment_id: CommitmentId, generation: int) 
 
 COMMITMENT_SCHEDULE_SORT_KEY_PREFIX = "COMMITMENT_SCHEDULE#"
 VERIFICATION_REQUEST_SORT_KEY_PREFIX = "VERIFICATION_REQUEST#"
+
+
+def demo_clock_partition(namespace: Namespace) -> str:
+    """``NS#{namespace}#CLOCK`` -- the deployed logical clock's own Shareable partition.
+
+    A partition of its own rather than an item inside ``NS#{namespace}``, and that is a
+    permission fact rather than a filing choice
+    ([ADR-029](../../../../docs/adr/ADR-029-deployed-demo-clock-authority.md) SS 1).
+    ``dynamodb:LeadingKeys`` constrains the partition key and nothing constrains the sort key,
+    so a grant on the demo manifest partition would also be a grant on the reset lock and on
+    every future item filed beside it -- the identical defect ADR-019 found for the send fence.
+
+    Deployed, the only value this ever takes is the exact literal ``NS#DEMO#CLOCK``:
+    ``Settings.validate_environment_contract`` already refuses any namespace but ``DEMO`` in the
+    ``demo`` environment, and **no grant in this system authorizes an arbitrary namespace's
+    clock**. The builder still takes the namespace, because a key that hard-coded one would be
+    the only key in the grammar that could not be read back from its own partition.
+    """
+
+    return _join("NS", namespace.value, "CLOCK")
+
+
+DEMO_CLOCK_SORT_KEY = "DEMO_CLOCK"
+"""The single item in the clock partition. There is exactly one, forever."""

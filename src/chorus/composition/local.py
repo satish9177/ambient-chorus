@@ -95,6 +95,7 @@ from chorus.domain.ids import (
     Uuid4Generator,
     Uuid5Generator,
 )
+from chorus.domain.time import SystemClock
 from chorus.infrastructure.dynamodb.audit import AuditRepository
 from chorus.infrastructure.dynamodb.core import CoreRepository
 from chorus.infrastructure.dynamodb.cursor import SignedCursorCodec
@@ -405,6 +406,7 @@ def build_local(settings: Settings, *, storage: StorageDriver | None = None) -> 
     sender_worker = SendActionOperationWorker(
         operations=operations,
         send_action=send_action,
+        shareable=shareable,
         project=project_outcome,
         reconcile=reconcile_outcome,
     )
@@ -465,6 +467,13 @@ def build_local(settings: Settings, *, storage: StorageDriver | None = None) -> 
         unit_of_work=unit_of_work,
         scheduler=scheduler,
         clock=demo_clock,
+        # P1/P2-2: real wall-clock time for the one arithmetic step that computes when a real
+        # EventBridge Scheduler resource should fire -- never ``demo_clock``, which is what the
+        # deployed composition also does (``functions/worker/composition.py``). The in-memory
+        # scheduler does not care what instant it is handed, but this keeps local and deployed
+        # composition expressing the identical split rather than one being a coincidence of
+        # ``demo_clock`` also being reachable here.
+        wall_clock=SystemClock(),
         ids=Uuid4Generator(),
         scheduler_environment=settings.scheduler_environment,
     )

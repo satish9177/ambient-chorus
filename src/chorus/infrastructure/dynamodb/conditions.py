@@ -17,6 +17,7 @@ from chorus.ports.storage import (
     AttributeAtMostNumber,
     AttributeEqualsNumber,
     AttributeEqualsString,
+    AttributeLessThanNumber,
     ItemCondition,
     KeyAbsent,
     KeyPresent,
@@ -71,6 +72,8 @@ class _Renderer:
                 return f"{self.name(name)} = {self.value(value)}"
             case AttributeAtMostNumber(name=name, value=value):
                 return f"{self.name(name)} <= {self.value(value)}"
+            case AttributeLessThanNumber(name=name, value=value):
+                return f"{self.name(name)} < {self.value(value)}"
             case AllOf(conditions):
                 return " AND ".join(f"({self.render(inner)})" for inner in conditions)
             case AnyOf(conditions):
