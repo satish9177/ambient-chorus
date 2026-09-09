@@ -212,6 +212,7 @@ NON_KEY_CONSTANTS = frozenset(
     {
         "SECRETS_SERVICE_NAME",
         "DEMO_ACCESS_SECRET_SCHEMA",
+        "CURSOR_SIGNING_SECRET_SCHEMA",
     }
 )
 """Assignments the "no literal on a secret line" scan below is allowed to skip.
