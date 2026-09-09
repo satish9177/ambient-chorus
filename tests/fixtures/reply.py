@@ -123,9 +123,7 @@ class ReplyHarness:
                 source_arn=INBOUND_SOURCE_ARN,
             )
         if self.extractor is None:
-            self.extractor = LiteralSpanCommitmentExtractor(
-                destination_label=self.destination_label
-            )
+            self.extractor = LiteralSpanCommitmentExtractor()
 
     # -- setup -----------------------------------------------------------------------------
 
@@ -302,6 +300,7 @@ class ReplyHarness:
             apply=self.apply_commitment(),
             clock=self.send.action.compile.clock,
             policy_version="policy/v1",
+            destination_label=self.destination_label,
         )
 
     def create_schedule(self) -> CreateDueSchedule:

@@ -468,15 +468,14 @@ def build_local(settings: Settings, *, storage: StorageDriver | None = None) -> 
         ids=Uuid4Generator(),
         scheduler_environment=settings.scheduler_environment,
     )
-    commitment_extractor = LiteralSpanCommitmentExtractor(
-        destination_label=destination.display_label
-    )
+    commitment_extractor = LiteralSpanCommitmentExtractor()
     extract_commitment = ExtractCommitment(
         core=core,
         agent=commitment_extractor,
         apply=apply_commitment,
         clock=demo_clock,
         policy_version=settings.policy_version,
+        destination_label=destination.display_label,
         schedule=create_due_schedule,
         schedule_commitments=shareable,
     )

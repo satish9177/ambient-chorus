@@ -256,9 +256,7 @@ async def test_a_rejection_proof_for_different_content_is_never_reused(
     first = await reply_harness.extract().execute(first_job)
     assert first.commitment_id is None
 
-    reply_harness.extractor = LiteralSpanCommitmentExtractor(
-        destination_label=reply_harness.destination_label
-    )
+    reply_harness.extractor = LiteralSpanCommitmentExtractor()
     second_ingested = await reply_harness.ingest_reply(received_at=_near(reply_harness))
     second_job = await reply_harness.extraction_job(
         second_ingested, invocation_id=shared_invocation_id

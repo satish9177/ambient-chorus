@@ -99,20 +99,64 @@ def test_the_output_names_exactly_one_source_evidence_id() -> None:
 
 
 def test_the_input_carries_the_reply_text_and_nothing_else_about_the_case() -> None:
-    """Not the case, not other evidence, not facts, not mandates, not contributor data."""
+    """Not the case, not other evidence, not facts, not mandates, not contributor data.
+
+    ``destination_display_label`` is the one addition, and it is the opposite of a leak: it is
+    the safe organization label the deployment already publishes as a non-secret environment
+    variable, and it exists here because check 4 compares the model's ``obligor`` with it. A
+    model that was never shown it could satisfy that check only by accident. It names no
+    mailbox, carries no address, and grants nothing -- deterministic validation still decides.
+    """
 
     assert set(CommitmentExtractionInput.model_fields) == {
         "schema_version",
         "case_id",
         "source_evidence_id",
+        "destination_display_label",
         "reply_text",
     }
+
+
+def test_the_input_still_carries_no_private_or_secret_destination_field() -> None:
+    """The safe label is admitted; the things it is adjacent to are not."""
+
+    fields = set(CommitmentExtractionInput.model_fields)
+    assert not fields & {
+        "destination_address",
+        "destination_address_digest",
+        "destination_registry_secret_arn",
+        "destination_routing_token",
+        "from_identity_id",
+        "reply_to",
+        "correspondent_mailbox",
+    }
+
+
+def test_a_blank_destination_label_is_refused_before_a_model_is_reached() -> None:
+    """A deployment with no configured correspondent fails at payload construction.
+
+    Not at check 4, and not after a model pass over a stranger's email: the field is bounded
+    ``1..120`` so the invocation cannot be built at all.
+    """
+
+    with pytest.raises(ValidationError):
+        CommitmentExtractionInput(
+            case_id=uuid4(),
+            source_evidence_id=uuid4(),
+            destination_display_label="",
+            reply_text="We will repair elevator B by 2030-09-10.",
+        )
 
 
 def test_the_input_admits_an_empty_reply_text() -> None:
     """A reply that was only our own quoted message leaves nothing, and still has an artifact."""
 
-    payload = CommitmentExtractionInput(case_id=uuid4(), source_evidence_id=uuid4(), reply_text="")
+    payload = CommitmentExtractionInput(
+        case_id=uuid4(),
+        source_evidence_id=uuid4(),
+        destination_display_label="Property Management",
+        reply_text="",
+    )
 
     assert payload.reply_text == ""
 

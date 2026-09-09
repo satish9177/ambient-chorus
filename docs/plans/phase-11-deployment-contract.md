@@ -46,8 +46,9 @@ retries 3, DLQ target, and classified-never-raised outcomes), `Boto3AgentCoreInv
 `CompilerSendAuthorization`, and the full inbound attester/verifier. Phase 11 does not write
 adapters. It writes the six things that bind them to AWS:
 
-1. **the AgentCore HTTP server binding** — all three `runtime.toml` declare
-   `server_binding = "NOT_IMPLEMENTED"`; `bedrock-agentcore` is not a dependency;
+1. ~~**the AgentCore HTTP server binding**~~ — **done** (§ 5). All three `runtime.toml` now
+   declare `server_binding = "IMPLEMENTED"`, bound to a bare ASGI application on the already-locked
+   `uvicorn`; `bedrock-agentcore` is still not a dependency and the binding does not import it;
 2. **Lambda handlers** — `functions/*` contains composition roots and **no `handler`**; there is
    no ASGI adapter (`mangum` is absent) and no Secrets Manager client anywhere in the repository;
 3. **a deployed composition root** — `build_local` constructs `InMemoryStorageDriver` itself and
@@ -197,8 +198,9 @@ Verified against the installed **`aws-cdk-lib 2.267.0`**:
   it is the runtime-environment class supplying `PYTHON_3_10 … PYTHON_3_14 | NODE_22`. The earlier
   draft named it as the construct and was wrong.
 - Artifact: `AgentRuntimeArtifact.from_s3(s3.Location(bucket_name=…, object_key=…),
-  AgentCoreRuntime.PYTHON_3_12, ["opentelemetry-instrument", "main.py"])`. Direct-code Python 3.12
-  from an S3 zip; **no ECR image required**.
+  AgentCoreRuntime.PYTHON_3_12, ["python", "main.py"])`. Direct-code Python 3.12 from an S3 zip;
+  **no ECR image required**. The command is the frozen minimum start command below, not the OTEL
+  wrapper this line used to show.
 - Authorizer: `RuntimeAuthorizerConfiguration.using_iam()` (Python snake_case for `usingIAM`);
   it is also the default.
 - Network: `RuntimeNetworkConfiguration.using_vpc(scope, vpc=…, security_groups=…, vpc_subnets=…)`.
@@ -232,12 +234,53 @@ IAM role names keep their hyphens — the constraint is on the runtime resource 
 `main.py` binds `/invocations` to the existing `handle(raw: bytes) -> bytes` and nothing else.
 It is a transport adapter: no branching on payload content, no state between calls, no second
 place where a contract is enforced. `handle` remains the only entry point, so every existing
-boundary test still covers the deployed path. Entrypoint command is
-`["opentelemetry-instrument", "main.py"]`, matching the artifact declaration.
+boundary test still covers the deployed path.
+
+**The binding is implemented.** All three `runtime.toml` now declare `server_binding =
+"IMPLEMENTED"`, backed by a test that imports the entrypoint they name and asserts it is bound to
+that runtime's own handler. It is a bare ASGI application (`runtimes/server.py`) served by
+`uvicorn`, chosen because `uvicorn` is **already inside the artifact's locked dependency
+closure** — `strands-agents → mcp → sse-starlette → uvicorn` — so two routes cost fifty lines and
+no wheel. `bedrock-agentcore` is not a dependency and the binding does not import it.
+
+**Entrypoint command: `["python", "main.py"]`.** Corrected from
+`["opentelemetry-instrument", "main.py"]`. `uv pip install --target` resolves *wheels* for the
+declared platform but generates console-script launchers for the **build host**, so a Windows
+build writes `bin/opentelemetry-instrument.exe` — unusable on Linux/ARM64, and `bin/` is not on
+the runtime's path in any case. The build strips those launchers and the artifact inspection
+refuses them. `CHORUS_OTEL_ENABLED` stays `false` for the minimum launch (§ 19 already omits the
+X-Ray endpoint by default), and the OTEL auto-instrumentation wrapper is revisited only if live
+wiring proves a Linux-compatible form of the command. `opentelemetry-instrumentation` still ships
+*as a package* inside the artifact, by way of `strands-agents`.
 
 **Import layout.** The zip is rooted so `runtimes.<agent>` and `chorus.contracts` resolve exactly
 as they do in the repository — the manifest's `[artifact].include` allowlist is a set of
 repo-relative paths and is preserved verbatim in the archive. `main.py` sits at the archive root.
+
+That layout has one consequence the allowlist does not state, and it is fatal if missed: the
+shared package lands at `src/chorus/...` while `python main.py` puts only the archive **root** on
+`sys.path`, so a runtime that imported nothing else would fail at cold start with
+`ModuleNotFoundError: No module named 'chorus'`. The repository never sees it, because the
+editable install already exposes `src`. `main.py` therefore calls
+`runtimes.bootstrap.ensure_shared_package_importable` **before** any other import: it puts the
+archive's own `src` at the front of `sys.path` and refuses to start if `chorus` is still not
+importable. The allowlists carry `src/chorus/__init__.py` (and `src/chorus/domain/__init__.py`
+where the domain ships) so the archive's package structure is the repository's rather than a
+namespace-package approximation of it. An isolated-startup test extracts each real zip outside
+the repository, with no site-packages and no `PYTHONPATH`, and proves `chorus` resolves out of
+the archive and from nowhere else.
+
+**Artifact secret gate.** `tools/check_secrets.py` ignores `build/`, because the artifact build
+unpacks third-party wheels whose *documentation* is credential-shaped (`boto3`'s CloudFront
+example, `botocore`'s IAM and STS example documents, `cryptography`'s SSH parser). That exemption
+is correct for the repository scan and must never be what makes an artifact publishable, so the
+build carries its own gate, applying the repository's own patterns twice: once over the
+first-party files it just staged, and once over the finished zip. **First-party entries get no
+content exception at any path.** Vendored entries are checked for credential filenames and
+private-key material with exactly the four documented path exceptions above; private keys are
+detected by content rather than by extension, so `certifi/cacert.pem` — public CA certificates
+every TLS call depends on — is not refused. The build manifest records `security_scan`, which a
+publish step reads to know a scan ran and never instead of re-scanning the zip.
 
 **Packaging must be Linux-compatible.** The build runs on Windows. `pydantic-core` ships compiled
 wheels, so dependencies are resolved with an explicit target rather than the host platform:
@@ -714,24 +757,60 @@ event carrying a closed reason code and no content.
 
 [ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 38 assigns
 `EXTRACT_COMMITMENT` to the **Investigator** runtime under its own prompt version
-`commitment-extraction/v1`. Today the deployed Investigator artifact cannot serve it: its
-entrypoint binds one `handle` to `INVESTIGATOR_PROMPT_VERSION` only, and its
-`[artifact].include` allowlist does not carry `src/chorus/contracts/commitment.py`. The local
-composition uses `LiteralSpanCommitmentExtractor`, a stand-in. Without this work the demo's
-3:45–4:30 segment cannot run against a real model.
+`commitment-extraction/v1`. The deployed Investigator artifact now serves it: `handle`
+dispatches on a declared operation, and the allowlist carries the extraction contract and its
+reviewed prompt. The local composition still uses `LiteralSpanCommitmentExtractor` — a stand-in,
+not a fallback — because the deployed composition root is I2 and is not yet written.
 
 **Frozen: a second bounded operation in the same Investigator runtime. No fourth agent.**
 
 | | Value |
 |---|---|
-| Discriminator | the request envelope's existing operation kind: `INVESTIGATE` \| `EXTRACT_COMMITMENT` |
+| Wire contract | `investigator-request/v1` — `{schema_version, operation, invocation}`, Investigator-only |
+| Discriminator | the envelope's **explicit** `operation` field: `INVESTIGATE` \| `EXTRACT_COMMITMENT` |
 | Contracts | `CommitmentExtractionInput` / `CommitmentExtractionOutput`, `commitment-extraction/v1` — already written and tested |
 | Prompt version | `commitment-extraction/v1`, pinned in the artifact beside `investigator/v1` |
 | Dispatch | one branch in `handle`, on the declared kind only, selecting prompt + output model. No branch on payload content |
-| Artifact | `[artifact].include` gains `src/chorus/contracts/commitment.py`; boundary tests extend to it |
+| Artifact | `[artifact].include` gains `src/chorus/contracts/commitment.py` and `src/chorus/contracts/agentcore.py`; boundary tests extend to both |
 | IAM | **unchanged** — the Investigator role, the Investigator profile, the Investigator log group |
 | Limits | the extraction path uses the Investigator's existing budget/timeout rungs |
-| Live evaluation | its own gated scenarios, run before acceptance (§ 20) |
+| Live evaluation | its own gated scenarios, run before acceptance (§ 20) — still `NOT_RUN` |
+
+**Correction — the discriminator did not exist and had to be added.** The earlier draft named
+"the request envelope's existing operation kind", but `AgentInputEnvelope` has no operation field
+and `ApplicationOperationKind` never crosses the port. The discriminator is therefore a new
+Investigator-only wrapper, `chorus.contracts.agentcore.InvestigatorRequest`, parsed as a Pydantic
+**tagged union**: the tag is read first, exactly one member is selected, and an unrecognised or
+absent tag is refused before either payload model is tried and before any model is reached. A
+commitment payload declared as `INVESTIGATE` is refused rather than rerouted to the arm that
+happens to fit. The Monitor and the Action runtime keep their bare `AgentInputEnvelope` bodies —
+one operation each, so a discriminator there would be a constant a caller could only get wrong.
+
+**The envelope guard is per-operation.** An investigation names one version of one case and its
+envelope must carry both. An extraction is bound to one immutable inbound artifact, and the
+application deliberately sends `case_id=None` / `case_version=None` for it (ADR-027 § 1) — the
+case identifier it is about lives in the *payload*, where the output must echo it back. A single
+stricter guard would reject the only extraction envelope the system ever sends.
+
+**Amendment — live extraction receives the safe destination display label.**
+`CommitmentExtractionInput` gains `destination_display_label`. ADR-027 § 3 check 4 requires
+`normalize(obligor)` to equal the normalized safe `display_label` of the correlated destination,
+and the frozen demo reply ("we will restore elevator b to service by 2030-01-14.") contains no
+organization name at all — so a model given only the reply could satisfy check 4 only by
+accident, and live extraction would fail on correct answers. The label is already classified a
+**safe, non-secret environment variable** by § 13, beside the registry version and the routing
+token; it names no mailbox and carries no address, token, or registry record. The local
+`LiteralSpanCommitmentExtractor` had it out-of-band, which is exactly why the gap was invisible
+locally.
+
+*Supplying it does not move authority.* Check 4 still compares the model's restatement against
+the value deterministic code holds, so the model can only agree with a fact the correlation
+already established or be rejected; the prompt requires `obligor_span` to keep citing the reply's
+own words for the speaker, so the proposal stays checkable against the reply as well as against
+who wrote it. The label is rendered **outside** the untrusted-data fence, because it is
+configuration rather than something the reply said. It is absorbed into `extraction_input_hash`,
+so an extraction produced under one correspondent is not recovery proof for another: a replay
+whose label has changed re-runs instead of replaying an answer that would now fail check 4.
 
 Two prompts in one runtime is not two agents: one identity, one role, one profile, one log group,
 one deployment. Validation, grounding, the nine deterministic checks, and the span-cited
@@ -1080,7 +1159,7 @@ presentation, submission, and cost cleanup.
 
 | | Item |
 |---|---|
-| **I1** | AgentCore server binding: `bedrock-agentcore` dependency, `main.py` with `/ping` + `/invocations`, per-runtime, plus `deployed_name` and the corrected `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` names (§ 5) |
+| ~~**I1**~~ | **Done.** AgentCore server binding: a bare ASGI application on the already-locked `uvicorn` rather than a `bedrock-agentcore` dependency, `main.py` with `/ping` + `/invocations` per runtime, the archive import bootstrap, `deployed_name`, and the corrected `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` names (§ 5). Live evaluation remains `NOT_RUN`. |
 | **I2** | Six Lambda entry points; ASGI adapter; Secrets Manager client; durable async dispatcher; deployed composition root (§ 14) |
 | **I3** | `InboundMailTransportAuthenticator` and `SesEventTransportAuthenticator` |
 | **I4** | Agent IAM: discovered inference-profile ARNs + conditioned foundation-model ARNs (§ 4) |
@@ -1090,11 +1169,11 @@ presentation, submission, and cost cleanup.
 | **I8** | **AgentCore artifact deny split** — without it no runtime cold-starts (§ 6) |
 | **I9** | SES receipt decoder corrections per [ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md) — single S3 action + `TopicArn`, `receipt.action.type == "S3"`, one bounded pinned read reused everywhere, `mail.headers` with pinned-bytes fallback, `From` mailbox, `receipt.recipients` — with golden tests over **captured real** payloads. *Awaits ADR-030 acceptance.* |
 | **I10** | Inbound bucket/key policy carve-out (six statements, nine proved cases) and ingress-object accounting (§ 10.3). *Awaits ADR-030 acceptance.* |
-| **I11** | Live commitment extraction in the Investigator runtime (§ 11) |
+| ~~**I11**~~ | **Done offline.** Live commitment extraction in the Investigator runtime (§ 11): `investigator-request/v1`, the `commitment-extraction/v1` prompt, and the safe destination label the deterministic obligor check needs. Not yet run against a real model. |
 | **I12** | Durable demo clock with `reset_generation` fencing per accepted [ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md) (§ 9, § 12). |
 | **I13** | Reset authority: function, narrow role, bounded purge (§ 12) |
 | **I14** | Scheduler execution role policies (§ 8.5); Lambda VPC ENI grants (§ 8.6) |
-| **I15** | Artifact build/publish pipeline with Linux-targeted packaging; deploy CLI with the § 2 identity refusal; AZ-ID resolution (§ 6) |
+| **I15** | Artifact **build** done — lock-based, `aarch64-manylinux2014`/3.12, ELF-verified, with its own secret gate (§ 5). Still owed: artifact **publish**, the deploy CLI with the § 2 identity refusal, and AZ-ID resolution (§ 6). |
 | **I16** | Network, Inbound, Reset, and Observability stacks; `.env.example` refresh |
 
 **I6, I7, and I8 are the three that make an otherwise complete deployment fail at runtime**, each
