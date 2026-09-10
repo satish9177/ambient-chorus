@@ -29,7 +29,7 @@ from infra.cdk.stacks.compiler import (
 
 @pytest.fixture(scope="module")
 def app() -> App:
-    return build_app()
+    return build_app(offline=True)
 
 
 @pytest.fixture(scope="module")
@@ -77,10 +77,27 @@ def actions(item: dict[str, Any]) -> set[str]:
 # -- the compiler's grants ----------------------------------------------------------------
 
 
-def test_the_compiler_deploys_no_function_resource(compiler: Template) -> None:
-    """Phase 6 synthesizes the identity; Phase 11 deploys the thing that assumes it."""
+def test_the_compiler_deploys_exactly_one_function_under_its_own_role(
+    compiler: Template,
+) -> None:
+    """Phase 11 batch 5 adds the compiler Lambda beside the identity Phase 6 synthesized.
 
-    assert compiler.find_resources("AWS::Lambda::Function") == {}
+    One ``Function``, Python 3.12 / x86_64, running the already-implemented production handler,
+    and referencing the **pre-existing** compiler role rather than a CDK-generated default
+    (deployment contract SS 14, SS 42). It invokes no Lambda and creates no default log group.
+    """
+
+    functions = compiler.find_resources("AWS::Lambda::Function")
+    assert len(functions) == 1
+    props = next(iter(functions.values()))["Properties"]
+    assert props["Runtime"] == "python3.12"
+    assert props["Architectures"] == ["x86_64"]
+    assert props["Handler"] == "functions.compiler.handler.handler"
+    assert props["FunctionName"] == "chorus-compiler-development"
+    assert props["Role"]["Fn::GetAtt"][0].startswith("CompilerRole")
+    assert props["LoggingConfig"]["LogGroup"]["Ref"].startswith("CompilerLogGroup")
+    # exactly one role in the stack -- no second default execution role
+    assert len(compiler.find_resources("AWS::IAM::Role")) == 1
 
 
 def core_statements(template: Template) -> list[dict[str, Any]]:

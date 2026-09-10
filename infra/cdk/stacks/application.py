@@ -44,15 +44,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import RemovalPolicy, Stack, Tags
+from aws_cdk import CfnOutput, Environment, RemovalPolicy, Stack, Tags
+from aws_cdk import aws_apigatewayv2 as apigwv2
+from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
+from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from constructs import Construct
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import CdkBuildConfig, DeploymentIdentities
+from infra.cdk.lambda_support import (
+    ResourceNames,
+    api_environment,
+    chorus_lambda,
+    load_lambda_manifest,
+    worker_environment,
+)
 
 VIEW_KEY_PREFIXES = ("NS#*#VIEW#*", "NS#*#VIEW_CURRENT#*")
 """The compiler-owned Shareable partitions. The application reads and condition-checks these
@@ -301,19 +311,54 @@ class ChorusApplicationStack(Stack):
         agent_runtime_arns: tuple[str, ...] = (),
         scheduler_group_name: str | None = None,
         scheduler_role_arn: str | None = None,
-        worker_function_arn: str | None = None,
         compiler_function_arn: str | None = None,
         sender_function_arn: str | None = None,
         watcher_alias_arn: str | None = None,
         demo_access_secret_arn: str | None = None,
         cursor_signing_secret_arn: str | None = None,
         destination_registry_secret_arn: str | None = None,
+        identities: DeploymentIdentities | None = None,
+        offline_synth: bool = True,
+        env: Environment | None = None,
     ) -> None:
-        super().__init__(scope, construct_id)
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)
         Tags.of(self).add("DataClass", "PRIVATE")
+
+        # Deployment identities (secret ARNs, AgentCore runtime targets) come from context; an
+        # explicit argument still wins, which is what the split-role template tests inject. The
+        # ``worker_function_arn`` is deliberately no longer an argument: the worker Lambda is
+        # created **in this stack** below, so the API's grant and environment bind to the
+        # created resource directly rather than to a hand-built external ARN (deployment
+        # contract SS 15, SS 30).
+        identities = identities or DeploymentIdentities(environment=config.environment)
+        agent_runtime_arns = agent_runtime_arns or identities.agent_runtime_arns
+        demo_access_secret_arn = demo_access_secret_arn or identities.demo_access_secret_arn
+        cursor_signing_secret_arn = (
+            cursor_signing_secret_arn or identities.cursor_signing_secret_arn
+        )
+        destination_registry_secret_arn = (
+            destination_registry_secret_arn or identities.destination_registry_secret_arn
+        )
+        # The compiler / sender / watcher-alias ARNs are the **actual resource** references the
+        # sibling stacks pass in via ``app.py`` (review P2-2); the deterministic literals here
+        # are only the fallback an isolated single-stack synthesis uses.
+        region = config.aws_region
+        compiler_function_arn = compiler_function_arn or (
+            f"arn:aws:lambda:{region}:{self.account}:function:chorus-compiler-{config.environment}"
+        )
+        sender_function_arn = sender_function_arn or (
+            f"arn:aws:lambda:{region}:{self.account}:function:chorus-sender-{config.environment}"
+        )
+        watcher_alias_arn = watcher_alias_arn or (
+            f"arn:aws:lambda:{region}:{self.account}:function:"
+            f"chorus-commitment-watcher-{config.environment}:live"
+        )
+        scheduler_role_arn = scheduler_role_arn or (
+            f"arn:aws:iam::{self.account}:role/chorus-scheduler-{config.environment}"
+        )
 
         self.scheduler_group_name = scheduler_group_name or f"chorus-{config.environment}"
         self.scheduler_role_arn = scheduler_role_arn
@@ -354,9 +399,54 @@ class ChorusApplicationStack(Stack):
         for role in (self.api_role, self.worker_role):
             self._grant_shared_data_plane(role, tables=tables, buckets=buckets)
 
+        names = ResourceNames.for_config(config)
+
+        # I2 -> compute (deployment contract SS 14). The worker first, so the API's grant and
+        # environment below bind to the created resource. Under the pre-existing worker role and
+        # worker log group; no secret ARN in its environment (SS 40).
+        self.worker_function_name = f"chorus-worker-{config.environment}"
+        self.worker_function = chorus_lambda(
+            self,
+            "WorkerFunction",
+            config=config,
+            manifest=load_lambda_manifest("worker"),
+            role=self.worker_role,
+            environment=worker_environment(
+                config=config,
+                identities=identities,
+                names=names,
+                compiler_function_arn=compiler_function_arn,
+                sender_function_arn=sender_function_arn,
+                watcher_alias_arn=watcher_alias_arn,
+                scheduler_role_arn=scheduler_role_arn,
+            ),
+            log_group=self.worker_log_group,
+            offline_synth=offline_synth,
+        )
+
+        self.api_function_name = f"chorus-api-{config.environment}"
+        self.api_function = chorus_lambda(
+            self,
+            "ApiFunction",
+            config=config,
+            manifest=load_lambda_manifest("api"),
+            role=self.api_role,
+            environment=api_environment(
+                config=config,
+                names=names,
+                worker_function_arn=self.worker_function.function_arn,
+                compiler_function_arn=compiler_function_arn,
+                watcher_alias_arn=watcher_alias_arn,
+                demo_access_secret_arn=demo_access_secret_arn,
+                cursor_signing_secret_arn=cursor_signing_secret_arn,
+            ),
+            log_group=self.api_log_group,
+            offline_synth=offline_synth,
+        )
+
         self._grant_api_boundary(
             tables=tables,
-            worker_function_arn=worker_function_arn,
+            worker_function=self.worker_function,
             compiler_function_arn=compiler_function_arn,
             watcher_alias_arn=watcher_alias_arn,
             demo_access_secret_arn=demo_access_secret_arn,
@@ -369,6 +459,9 @@ class ChorusApplicationStack(Stack):
             compiler_function_arn=compiler_function_arn,
             sender_function_arn=sender_function_arn,
         )
+
+        self._create_http_api()
+        self._declare_outputs(watcher_alias_arn=watcher_alias_arn)
 
     # -- shared boundary ---------------------------------------------------------------------
 
@@ -493,12 +586,12 @@ class ChorusApplicationStack(Stack):
         self,
         *,
         tables: ApplicationTables,
-        worker_function_arn: str | None,
-        compiler_function_arn: str | None,
-        watcher_alias_arn: str | None,
-        demo_access_secret_arn: str | None,
-        cursor_signing_secret_arn: str | None,
-        destination_registry_secret_arn: str | None,
+        worker_function: lambda_.IFunction,
+        compiler_function_arn: str,
+        watcher_alias_arn: str,
+        demo_access_secret_arn: str,
+        cursor_signing_secret_arn: str,
+        destination_registry_secret_arn: str,
     ) -> None:
         """The request path's own capabilities and the denies that keep it a front end.
 
@@ -536,20 +629,21 @@ class ChorusApplicationStack(Stack):
                 ],
             )
         )
-        invoke_targets = [
-            arn for arn in (worker_function_arn, compiler_function_arn) if arn is not None
-        ]
-        if invoke_targets:
-            # The worker for every asynchronous operation; the compiler synchronously for the
-            # one deterministic compile route. No sender, no watcher, no runtime.
-            self.api_role.add_to_policy(
-                iam.PolicyStatement(
-                    sid="InvokeOperationWorkerAndCompilerOnly",
-                    effect=iam.Effect.ALLOW,
-                    actions=["lambda:InvokeFunction"],
-                    resources=invoke_targets,
-                )
+        # The worker for every asynchronous operation; the compiler synchronously for the one
+        # deterministic compile route. No sender, no watcher, no runtime. The worker resource is
+        # the one **created in this stack**, so the grant and the function are provably the same
+        # object (deployment contract SS 15) -- not a hand-built ARN a caller could aim
+        # elsewhere. The compiler ARN is the deterministic literal the compiler stack also
+        # produces, so all three of its uses (this grant, the worker's grant, the two function
+        # environments) name one string (SS 17).
+        self.api_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="InvokeOperationWorkerAndCompilerOnly",
+                effect=iam.Effect.ALLOW,
+                actions=["lambda:InvokeFunction"],
+                resources=[worker_function.function_arn, compiler_function_arn],
             )
+        )
         if watcher_alias_arn is not None:
             # ADR-028 § 5 and deployment contract § 8.1. ``POST /v1/demo/clock/advance`` promises
             # the watcher's outcome in its response body, so the request path advances the
@@ -799,3 +893,58 @@ class ChorusApplicationStack(Stack):
                 resources=["*"],
             )
         )
+
+    # -- the frozen ingress: API Gateway HTTP API, payload format 2.0 ----------------------
+
+    def _create_http_api(self) -> None:
+        """The one ingress (deployment contract SS 14, SS 24-27).
+
+        An API Gateway v2 **HTTP API** with a single catch-all ``$default`` route wired to the
+        API Lambda through a proxy integration whose payload format version is **explicitly
+        2.0** -- the production handler is Mangum payload-v2 and depends on nothing implicit. One
+        integration, not one CDK route per FastAPI route: FastAPI stays the route authority.
+
+        The Lambda invoke permission API Gateway needs is added by ``HttpLambdaIntegration``,
+        scoped by CDK to this API's own source ARN -- so only this HTTP API may invoke the API
+        Lambda, and no API Gateway permission touches the worker, compiler, sender, or watcher
+        (SS 25).
+
+        **CORS is deferred, deliberately (SS 26).** The deployed browser origin is unknown until
+        the hackathon frontend-hosting decision (P4); rather than invent
+        ``Access-Control-Allow-Origin: *``, no ``cors_preflight`` is configured here and the
+        frozen origin policy is applied when P4 resolves.
+
+        No Lambda Function URL is created -- the frozen ingress is this HTTP API (SS 27).
+        """
+
+        integration = apigwv2_integrations.HttpLambdaIntegration(
+            "ApiLambdaProxyIntegration",
+            self.api_function,
+            payload_format_version=apigwv2.PayloadFormatVersion.VERSION_2_0,
+        )
+        self.http_api = apigwv2.HttpApi(
+            self,
+            "HttpApi",
+            api_name=f"chorus-{self._environment_token()}",
+            description="Ambient CHORUS demo API (FastAPI on Lambda, payload format 2.0).",
+            default_integration=integration,
+            create_default_stage=True,
+        )
+
+    def _environment_token(self) -> str:
+        """The ``{env}`` segment recovered from the API role name (``chorus-api-{env}``)."""
+
+        return self.api_role_name.removeprefix("chorus-api-")
+
+    # -- outputs: only what a later deploy/canary step needs (deployment contract SS 31) ---
+
+    def _declare_outputs(self, *, watcher_alias_arn: str) -> None:
+        """Safe deployment outputs. No secret value, no address, no token, no credential."""
+
+        CfnOutput(self, "HttpApiEndpoint", value=self.http_api.api_endpoint)
+        CfnOutput(self, "HttpApiId", value=self.http_api.http_api_id)
+        CfnOutput(self, "ApiFunctionName", value=self.api_function.function_name)
+        CfnOutput(self, "ApiFunctionArn", value=self.api_function.function_arn)
+        CfnOutput(self, "WorkerFunctionName", value=self.worker_function.function_name)
+        CfnOutput(self, "WorkerFunctionArn", value=self.worker_function.function_arn)
+        CfnOutput(self, "WatcherLiveAliasArn", value=watcher_alias_arn)

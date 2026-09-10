@@ -10,7 +10,8 @@
     "test": "npm run test --workspace @ambient-chorus/web",
     "build": "npm run build --workspace @ambient-chorus/web",
     "e2e:list": "npm run e2e:list --workspace @ambient-chorus/web",
-    "cdk:synth": "cdk --app \"uv run python -m infra.cdk.app\" synth"
+    "cdk:synth": "cdk --app \"uv run python -m infra.cdk.app\" synth",
+    "cdk:synth:offline": "cdk --app \"uv run python -m infra.cdk.app\" --context offline_synth=true synth"
   },
   "devDependencies": {
     "aws-cdk": "^2.1030.0"

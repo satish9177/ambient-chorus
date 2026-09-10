@@ -67,7 +67,16 @@ class Settings(BaseSettings):
     environments Phase 9 ships, where the in-memory object store is used and no bucket policy is
     evaluated.
     """
-    dynamodb_endpoint: AnyHttpUrl | None = AnyHttpUrl("http://localhost:8000")
+    dynamodb_endpoint: AnyHttpUrl | None = None
+    """A local DynamoDB endpoint, or ``None`` to reach the real service.
+
+    The default is ``None`` because that is what a **deployed** composition requires: every
+    function that touches DynamoDB passes this straight through as ``endpoint_url`` and a
+    deployed API refuses to construct when it is set at all (deployment contract SS 14). Local
+    development against DynamoDB Local sets ``CHORUS_DYNAMODB_ENDPOINT=http://localhost:8000``
+    explicitly in ``.env`` (see ``.env.example``); the in-memory local composition never reads
+    this field.
+    """
     local_data_dir: Path = Path(".local")
 
     agent_mode: AgentMode = AgentMode.FAKE
@@ -166,24 +175,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_environment_contract(self) -> Settings:
-        """Reject environment combinations that would create an unsafe fallback."""
+        """Reject environment combinations that would create an unsafe fallback.
+
+        This is the **global** contract every deployed process shares -- ``demo`` runs in the
+        ``DEMO`` namespace under ``agentcore`` mode, and nothing else. *Which* AgentCore
+        runtime, model-profile, secret, or function ARNs a given process actually needs is a
+        property of its **composition**, so those requirements moved into the per-function
+        settings mappers (``worker_settings``, ``api_settings``, and friends) -- the API, the
+        compiler, the sender, and the watcher never invoke an agent and no longer have to carry
+        six ARNs to satisfy a validator (review P2-8). ``build_worker`` still refuses a missing
+        runtime endpoint ARN, so "the worker cannot start without its agents" is unchanged.
+        """
 
         if self.environment is Environment.DEMO:
             if self.namespace != "DEMO":
                 raise ValueError("demo environment requires the DEMO namespace")
             if self.agent_mode is not AgentMode.AGENTCORE:
                 raise ValueError("demo environment requires agentcore mode")
-        if self.agent_mode is AgentMode.AGENTCORE:
-            required = (
-                self.monitor_runtime_arn,
-                self.investigator_runtime_arn,
-                self.action_runtime_arn,
-                self.monitor_model_profile_arn,
-                self.investigator_model_profile_arn,
-                self.action_model_profile_arn,
-            )
-            if any(value is None or value == "" for value in required):
-                raise ValueError("agentcore mode requires all runtime and model profile ARNs")
         return self
 
     @classmethod

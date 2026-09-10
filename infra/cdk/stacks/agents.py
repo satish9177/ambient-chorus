@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import Stack, Tags
+from aws_cdk import Environment, Stack, Tags
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
 from constructs import Construct
@@ -244,8 +244,9 @@ class ChorusAgentStack(Stack):
         investigator_model_profile_arn: str | None = None,
         action_model_profile_arn: str | None = None,
         artifact_bucket_arn: str | None = None,
+        env: Environment | None = None,
     ) -> None:
-        super().__init__(scope, construct_id)
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)

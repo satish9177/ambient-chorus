@@ -240,15 +240,21 @@ def load_manifest(agent: str, *, root: Path = RUNTIMES_ROOT) -> RuntimeManifest:
     )
 
 
-def export_command(output: Path) -> list[str]:
-    """The lock-respecting export. ``--frozen`` is what makes it lock-respecting."""
+def export_command(output: Path, *, only_group: str | None = DEPENDENCY_GROUP) -> list[str]:
+    """The lock-respecting export. ``--frozen`` is what makes it lock-respecting.
 
-    return [
-        "uv",
-        "export",
-        "--frozen",
-        "--only-group",
-        DEPENDENCY_GROUP,
+    ``only_group`` selects one locked dependency group -- ``agents`` for the AgentCore artifacts,
+    its default. Pass ``None`` to export the project's **base** requirements instead, with every
+    default group (``dev``/``test``/``agents``/``infra``) excluded: that is what the first-party
+    Lambda artifacts need, since they ship ``boto3``/``fastapi``/``mangum`` and never Strands.
+    """
+
+    command = ["uv", "export", "--frozen"]
+    if only_group is not None:
+        command += ["--only-group", only_group]
+    else:
+        command += ["--no-default-groups"]
+    command += [
         "--no-emit-project",
         "--no-hashes",
         "--no-annotate",
@@ -256,6 +262,7 @@ def export_command(output: Path) -> list[str]:
         "--output-file",
         str(output),
     ]
+    return command
 
 
 def install_command(manifest: RuntimeManifest, *, requirements: Path, target: Path) -> list[str]:
@@ -335,7 +342,15 @@ def file_digest(path: Path) -> str:
 
 ELF_MAGIC: Final = b"\x7fELF"
 ELF_MACHINE_OFFSET: Final = 18
-ELF_MACHINE_BY_PLATFORM: Final = {"aarch64-manylinux2014": 0xB7, "x86_64-manylinux2014": 0x3E}
+ELF_MACHINE_BY_PLATFORM: Final = {
+    "aarch64-manylinux2014": 0xB7,
+    "x86_64-manylinux2014": 0x3E,
+    # The first-party Lambda artifacts target a newer glibc floor (``manylinux_2_28``) because
+    # Pillow 12 no longer ships ``manylinux2014`` wheels, and the Lambda Python 3.12 runtime
+    # (Amazon Linux 2023, glibc 2.34) satisfies it. Same processors, same ``e_machine`` values.
+    "aarch64-manylinux_2_28": 0xB7,
+    "x86_64-manylinux_2_28": 0x3E,
+}
 """The ``e_machine`` value each supported target's compiled extensions must carry.
 
 The strongest check available offline, and the one that would actually have caught a silently
@@ -479,6 +494,23 @@ def decode_first_party(name: str, data: bytes) -> str:
         raise UndecodableFirstPartyError(name) from error
 
 
+def scan_secret_matches(text: str) -> list[tuple[str, str]]:
+    """Every credential-shaped match in ``text`` as ``(kind, matched_text)``.
+
+    ``kind`` is ``"private-key"`` or ``"pattern-<index>"``. Used where a caller needs to reason
+    about *which specific match* it is looking at -- e.g. to suppress one known third-party
+    false positive by its exact substring while every other finding still fails (review P2-7).
+    """
+
+    out: list[tuple[str, str]] = []
+    for match in PRIVATE_KEY_PATTERN.finditer(text):
+        out.append(("private-key", match.group(0)))
+    for index, pattern in enumerate(SECRET_PATTERNS):
+        for match in pattern.finditer(text):
+            out.append((f"pattern-{index}", match.group(0)))
+    return out
+
+
 def secret_content_problem(name: str, data: bytes, *, first_party: bool) -> str | None:
     """Refuse a file whose *content* is credential-shaped.
 
@@ -565,6 +597,15 @@ def scan_staged_first_party(staging: Path, relative_paths: Iterable[str]) -> lis
     return problems
 
 
+SHARED_OBJECT_RE: Final = re.compile(r"\.so(\.\d+)*$")
+"""A compiled shared object -- ``_mod.cpython-312-x86_64-linux-gnu.so`` **and** versioned
+libraries like ``libjpeg-*.so.62`` that a plain ``endswith('.so')`` would miss (review P2-7)."""
+
+
+def is_shared_object(name: str) -> bool:
+    return bool(SHARED_OBJECT_RE.search(name))
+
+
 def _native_module_problems(
     archive: zipfile.ZipFile, names: list[str], target_platform: str | None
 ) -> list[str]:
@@ -576,7 +617,7 @@ def _native_module_problems(
     if expected is None:
         return [f"no ELF machine is recorded for target platform {target_platform}"]
     problems: list[str] = []
-    for name in sorted(name for name in names if name.endswith(".so")):
+    for name in sorted(name for name in names if is_shared_object(name)):
         header = archive.read(name)[: ELF_MACHINE_OFFSET + 2]
         if header[:4] != ELF_MAGIC:
             problems.append(f"{name} is not an ELF object")

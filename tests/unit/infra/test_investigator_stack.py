@@ -56,7 +56,7 @@ def template(*, artifact_bucket_arn: str | None = None) -> assertions.Template:
         "TestAgents",
         config=CdkBuildConfig(),
         artifact_bucket_arn=artifact_bucket_arn,
-        **PROFILE_ARNS,
+        **PROFILE_ARNS,  # type: ignore[arg-type]
     )
     return assertions.Template.from_stack(stack)
 

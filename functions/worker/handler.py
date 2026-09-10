@@ -86,12 +86,26 @@ class OperationRunner(Protocol):
         """Return the operation as it now stands."""
 
 
+def _require(value: str | None, what: str) -> str:
+    """Refuse a missing worker deployment value at the mapper, not deep in a claimed operation.
+
+    The worker is the one function that genuinely invokes agents (review P2-8), so *its*
+    settings mapper is where "no runtime endpoint ARN" fails -- ``build_worker`` still re-checks,
+    but the earliest, clearest failure is here.
+    """
+
+    if not value:
+        raise ValueError(f"a deployed worker needs {what}")
+    return value
+
+
 def worker_settings(settings: Settings) -> WorkerSettings:
     """Map process configuration onto the worker's own settings, and nothing wider.
 
-    The destination is assembled from the **non-secret** deployment values. The worker holds no
-    Secrets Manager grant at all -- it is denied by name -- so there is no address here and no
-    way to obtain one.
+    Requires exactly what the worker's object graph consumes: the three AgentCore **runtime
+    endpoint** ARNs (no model-profile ARN -- no worker adapter reads one), the compiler and
+    sender function ARNs, the watcher ``:live`` alias, and the scheduler identity. No secret ARN
+    of any kind -- the worker holds no Secrets Manager grant.
     """
 
     return WorkerSettings(
@@ -100,15 +114,19 @@ def worker_settings(settings: Settings) -> WorkerSettings:
         core_table=settings.core_table,
         shareable_table=settings.shareable_table,
         audit_table=settings.audit_table,
-        monitor_runtime_arn=settings.monitor_runtime_arn or "",
-        investigator_runtime_arn=settings.investigator_runtime_arn or "",
-        action_runtime_arn=settings.action_runtime_arn or "",
+        monitor_runtime_arn=_require(settings.monitor_runtime_arn, "the Monitor runtime ARN"),
+        investigator_runtime_arn=_require(
+            settings.investigator_runtime_arn, "the Investigator runtime ARN"
+        ),
+        action_runtime_arn=_require(settings.action_runtime_arn, "the Action runtime ARN"),
         agent_timeout_seconds=settings.agent_timeout_seconds,
-        sender_function_arn=settings.sender_function_arn or "",
+        sender_function_arn=_require(settings.sender_function_arn, "the sender function ARN"),
         scheduler_group=settings.scheduler_group,
         scheduler_environment=settings.scheduler_environment,
-        scheduler_role_arn=settings.scheduler_role_arn or "",
-        watcher_function_arn=settings.watcher_function_arn or "",
+        scheduler_role_arn=_require(
+            settings.scheduler_role_arn, "the scheduler execution role ARN"
+        ),
+        watcher_function_arn=_require(settings.watcher_function_arn, "the watcher live alias ARN"),
         destination=StoredSafeDestination(
             destination_id=DestinationId(settings.destination_id),
             kind=DestinationKind.PROPERTY_MANAGER,

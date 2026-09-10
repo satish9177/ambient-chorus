@@ -39,7 +39,7 @@ is the reason the SES grant is deliberately **not** narrowed by ``ses:Recipients
 
 @pytest.fixture(scope="module")
 def app() -> App:
-    return build_app()
+    return build_app(offline=True)
 
 
 def _stack(app: App, name: str) -> Stack:

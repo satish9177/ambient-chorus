@@ -272,7 +272,7 @@ def test_no_allow_statement_grants_a_wildcard_resource() -> None:
 
 
 def test_the_application_stack_is_part_of_the_synthesized_app() -> None:
-    assembly = build_app().synth()
+    assembly = build_app(offline=True).synth()
 
     assert "AmbientChorusApplication" in [stack.stack_name for stack in assembly.stacks]
 
@@ -299,11 +299,12 @@ WATCHER_ALIAS = "arn:aws:lambda:us-east-1:111122223333:function:chorus-commitmen
 
 
 def _split_template() -> assertions.Template:
+    # ``worker_function_arn`` is no longer an argument: the worker Lambda is created inside this
+    # stack, so the API binds to the created resource directly (deployment contract SS 15).
     return _template(
         agent_runtime_arns=RUNTIME_ARNS,
         scheduler_group_name="chorus-demo",
         scheduler_role_arn=SCHEDULER_ROLE_ARN,
-        worker_function_arn=WORKER_FN,
         compiler_function_arn=COMPILER_FN,
         sender_function_arn=SENDER_FN,
         watcher_alias_arn=WATCHER_ALIAS,
@@ -311,6 +312,13 @@ def _split_template() -> assertions.Template:
         cursor_signing_secret_arn=CURSOR_SECRET,
         destination_registry_secret_arn=DEST_SECRET,
     )
+
+
+def _worker_function_logical_id(built: assertions.Template) -> str:
+    for logical_id, resource in built.find_resources("AWS::Lambda::Function").items():
+        if "chorus-worker" in str(resource["Properties"].get("FunctionName", "")):
+            return logical_id
+    raise AssertionError("no worker function in the Application stack")
 
 
 def _role_statements(built: assertions.Template, logical_prefix: str) -> list[Mapping[str, Any]]:
@@ -377,10 +385,31 @@ def test_api_writes_the_action_and_case_prefixes_but_not_outbound_message() -> N
 
 
 def test_api_invokes_the_worker_and_the_compiler_and_nothing_else() -> None:
-    grant = _find(_api(_split_template()), "InvokeOperationWorkerAndCompilerOnly")
+    built = _split_template()
+    grant = _find(_api(built), "InvokeOperationWorkerAndCompilerOnly")
     assert actions_of(grant) == {"lambda:InvokeFunction"}
-    assert set(grant["Resource"]) == {WORKER_FN, COMPILER_FN}
-    assert SENDER_FN not in grant["Resource"]
+    # the compiler by its deterministic literal; the worker by a GetAtt of the in-stack resource
+    worker_logical = _worker_function_logical_id(built)
+    assert grant["Resource"] == [
+        {"Fn::GetAtt": [worker_logical, "Arn"]},
+        COMPILER_FN,
+    ]
+    assert SENDER_FN not in json.dumps(grant["Resource"])
+
+
+def test_the_api_and_the_worker_grant_name_the_same_in_stack_worker_function() -> None:
+    """SS 15: no hand-built external worker ARN. The API's invoke grant and the created worker
+    ``Function`` are provably one object."""
+
+    built = _split_template()
+    worker_logical = _worker_function_logical_id(built)
+    grant = _find(_api(built), "InvokeOperationWorkerAndCompilerOnly")
+    assert {"Fn::GetAtt": [worker_logical, "Arn"]} in grant["Resource"]
+    # the worker's own environment names the same function's ARN
+    env = built.find_resources("AWS::Lambda::Function")[worker_logical]["Properties"][
+        "Environment"
+    ]["Variables"]
+    assert "CHORUS_WORKER_FUNCTION_ARN" not in env  # the worker does not invoke itself
 
 
 def test_api_reads_the_demo_access_token_secret_only() -> None:
@@ -514,15 +543,27 @@ def test_neither_role_can_write_a_view_prefix(collect: object) -> None:
         assert not (set(leading_keys(item)) & set(VIEW_KEY_PREFIXES)), item.get("Sid")
 
 
-def test_offline_synth_grants_no_lambda_invoke_or_secret_read() -> None:
-    """With no function or secret ARNs supplied (the state ``app.py`` synthesizes today),
-    neither conditional grant appears -- the split is asserted, deployed by nobody."""
+def test_offline_synth_wires_the_cross_function_arns_and_secret_identities() -> None:
+    """Phase 11 batch 5 (SS 30): the offline synth wires the **actual** resources rather than
+    omitting optional arguments. With no explicit ARNs, the stack falls back to placeholder
+    deployment identities -- so both conditional grants now appear on each role, on concrete
+    ARNs, never a wildcard.
+    """
 
     built = _template()
-    for items in (_api(built), _worker(built)):
-        allowed = _allowed_actions(items)
-        assert "lambda:InvokeFunction" not in allowed
-        assert "secretsmanager:GetSecretValue" not in allowed
+
+    api = _api(built)
+    assert "lambda:InvokeFunction" in _allowed_actions(api)
+    assert "secretsmanager:GetSecretValue" in _allowed_actions(api)
+    demo = _find(api, "ReadDemoAccessTokenSecretOnly")
+    assert demo["Resource"] != "*" and "secret" in json.dumps(demo["Resource"])
+    cursor = _find(api, "ReadCursorSigningKeySecretOnly")
+    assert cursor["Resource"] != demo["Resource"]
+
+    worker = _worker(built)
+    assert "lambda:InvokeFunction" in _allowed_actions(worker)
+    # the worker still reads no secret
+    assert not any(a.startswith("secretsmanager:") for a in _allowed_actions(worker))
 
 
 # -- Phase 11 batch 4: the API -> watcher resolution ----------------------------------

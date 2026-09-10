@@ -23,20 +23,68 @@ Phase 11 is the **static-now / live-in-Phase-11** split cashed out. Phases 5–1
 artifact, its role, its policy, its log group, and its static template assertion, and deployed
 none of them.
 
-**What is synthesized today** (verified by running the CDK app locally): 7 stacks, **39
-resources, all identity / data / log / queue**.
+**Identity / data / log / queue resources** (Phases 5–10): 7 stacks, ~39 resources — 3 tables,
+2 evidence buckets, 2 KMS keys, 8 IAM roles, 6 log groups, the schedule group, the DLQ + its
+key, the DLQ alarm, and the SES configuration set. Zero AgentCore runtime, zero SES identity,
+zero web.
 
-| Stack | Resources | What they are |
-|---|---:|---|
-| `AmbientChorusFoundation` | 0 | resource-free proof stack; superseded by the network stack |
-| `AmbientChorusData` | 11 | 3 tables, 2 buckets, 2 KMS keys |
-| `AmbientChorusAgents` | 9 | 3 roles + 3 log groups — **no runtime, no profile** |
-| `AmbientChorusCompiler` | 3 | role + log group |
-| `AmbientChorusApplication` | 3 | one role + log group |
-| `AmbientChorusSender` | 4 | role, log group, SES configuration set |
-| `AmbientChorusWatcher` | 9 | watcher role, scheduler role, schedule group, DLQ + key, alarm |
+**Phase 11 batch 5 (offline) adds compute and the ingress**, and after the review repair the
+synthesized offline app is **7 stacks, ~55 resources**. The five production Lambdas synthesize
+under their **pre-existing** execution roles and dedicated log groups — `chorus-api-{env}`,
+`chorus-worker-{env}` and the HTTP API in `AmbientChorusApplication`; `chorus-compiler-{env}`,
+`chorus-sender-{env}`, and `chorus-commitment-watcher-{env}` in their own stacks — Python 3.12,
+x86-64 (no Lambda architecture is frozen; x86-64 is the least-risky choice for the existing
+dependency closure, and AgentCore's ARM64 decision is untouched), each with a physical name
+taken directly from the configured environment string. Every deployment stack is created for the
+frozen region `us-east-1` (`Environment(region=…)`; `CdkBuildConfig` rejects any other region).
+The watcher gains a published `Version` and an `Alias` named exactly `live`; the API Gateway v2
+**HTTP API** gains one `$default` proxy integration at **payload format version 2.0** and its
+`$default` stage with auto-deploy. The compiler / sender / watcher-alias are named by their
+**actual resource ARNs** (cross-stack `Fn::ImportValue`), not independently constructed
+literals; the demo-access / cursor-signing / destination-registry **secret identities** (ARNs
+only — no value synthesized) and the scheduler identity are wired by `infra/cdk/app.py`.
 
-Zero compute, zero network, zero AgentCore runtime, zero SES identity, zero API, zero web.
+Only the **worker** carries the three AgentCore runtime-endpoint ARNs — it is the only function
+that invokes an agent. The API, compiler, sender, and watcher carry `agent_mode=agentcore` (a
+demo-wide invariant) and nothing else AgentCore: the "and all six runtime/profile ARNs" clause
+moved out of the global `Settings` validator into the worker's own settings mapper. No batch-5
+component consumes a model-profile ARN.
+
+**Two synthesis modes, chosen explicitly.** Deployment-capable mode (the default for
+`python infra/cdk/app.py` / `build_app()`) refuses a missing Lambda ZIP and a synthetic /
+malformed / account-zero / wrong-service / wrong-region deployment identity — **including an
+ARN whose *resource portion* is the wrong shape**, a Secrets Manager ARN that does not name a
+`secret:` resource or an AgentCore ARN that stops at `runtime/<id>` with no
+`/runtime-endpoint/<id>` — **before synth**, with no silent placeholder fallback. Offline-review
+mode is `build_app(offline=True)`, `-c offline_synth=true`, or `CHORUS_CDK_OFFLINE_SYNTH=1`, and
+uses the clearly-named `_lambda_placeholder` code and synthetic identity fixtures; its asset
+identity differs from any real ZIP's. CI runs `npm run cdk:synth:offline` (a dedicated script
+that sets `-c offline_synth=true`); the plain `npm run cdk:synth` remains deployment-capable and
+fails closed.
+
+**Deployment artifacts** are built by `tools/build_lambda_artifacts.py` from `uv.lock`
+(`--no-default-groups`, `--python-platform x86_64-manylinux_2_28`, `--only-binary :all:`) and
+gated: the repository's own credential patterns over the first-party files (zero exceptions) and
+over the final ZIP, an ELF `e_machine` check over every shared object including versioned
+libraries (`libjpeg-*.so.62`), and a narrow per-match suppression for exactly one pinned
+`PIL/ImageFont.py` false positive. A clean-checkout release gate (session fixture; run for real
+on the CI Linux/Python-3.12 runner) builds all five ZIPs into a temp directory and scans the
+finished ZIPs on every platform. On **Linux/x86-64** it additionally unpacks each ZIP and runs
+a fresh `python -S -E` whose `sys.path` is rebuilt to **only** the extracted archive plus the
+interpreter's own standard-library directories (discovered via `sysconfig` — `stdlib`,
+`platstdlib`, `lib-dynload`): the handler, `chorus`, `pydantic_core` and its compiled
+`_pydantic_core`, and `PIL` for the compiler then resolve from the **archive** while
+`importlib` / `json` / `pathlib` resolve from **Python itself**, with the repository checkout,
+`.venv`, host site-packages, user site, `PYTHONPATH`, and all network access excluded. On any
+other platform (the developer's Windows machine) that last step is a documented `sys.platform`
+skip; this repair was **verified for structure, ELF, secret scan, and determinism on Windows
+and has not been executed on the Windows machine's Linux probe.**
+
+**Still absent:** VPC/network attachment, VPC endpoints, the three AgentCore Runtime resources
+and their inference profiles, the artifact **upload**, the inbound-mail Lambda and the ADR-030
+SES receipt path, the reset principal, live alarms/canaries, and any live deployment. **The
+compute resources exist only in an offline synthesis; deployment remains blocked** by the
+network/AgentCore/inbound/reset stacks and the user prerequisites in § 21.
 
 **What already exists in code and must be credited rather than rebuilt.** The AWS adapters are
 written, typed, and tested: `DynamoDbStorageDriver` and the three repositories, `S3ObjectStore`,
@@ -1362,10 +1410,10 @@ presentation, submission, and cost cleanup.
 | | Item |
 |---|---|
 | ~~**I1**~~ | **Done.** AgentCore server binding: a bare ASGI application on the already-locked `uvicorn` rather than a `bedrock-agentcore` dependency, `main.py` with `/ping` + `/invocations` per runtime, the archive import bootstrap, `deployed_name`, and the corrected `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` names (§ 5). Live evaluation remains `NOT_RUN`. |
-| **I2** | **Five of six done** (§ 14): API (Mangum, payload v2, bearer-token middleware, per-request logical time), operation worker, compiler, sender, and commitment watcher — handlers, composition roots, the `worker-job/v1` async boundary, and the synchronous compile/fence/send/watcher contracts. **Still owed:** the inbound-mail entry point (I9/I10, awaiting ADR-030), and the `Function`/alias/API-Gateway **resources** themselves, which belong to the resource-wiring batch. |
+| **I2** | **Handlers: five of six done** (§ 14): API (Mangum, payload v2, bearer-token middleware, per-request logical time), operation worker, compiler, sender, and commitment watcher — handlers, composition roots, the `worker-job/v1` async boundary, and the synchronous compile/fence/send/watcher contracts. **Resources: done offline (batch 5).** The five `Function` resources under the pre-existing roles/log groups; the watcher published `Version` + `live` `Alias`; the API Gateway HTTP API with a `$default` payload-v2 proxy integration and a Lambda invoke permission scoped to that API and the API function alone; every cross-function ARN, the two API secret identities and the sender's, and the scheduler identity wired in `app.py`; the deterministic lock-based Lambda packaging (`tools/build_lambda_artifacts.py`) with its first-party secret gate, ELF check, and isolated-artifact import proof. **Still owed:** the inbound-mail entry point (I9/I10, awaiting ADR-030), and VPC attachment (I16). |
 | **I3** | `InboundMailTransportAuthenticator` and `SesEventTransportAuthenticator` |
 | **I4** | Agent IAM: discovered inference-profile ARNs + conditioned foundation-model ARNs (§ 4) |
-| **I5** | Split API and worker roles; add the missing `lambda:InvokeFunction` and `secretsmanager:GetSecretValue` grants (§ 8.1) |
+| **I5** | Split API and worker roles; add the missing `lambda:InvokeFunction` and `secretsmanager:GetSecretValue` grants (§ 8.1). **Roles split in batch 4; batch 5 wires the conditional grants unconditionally** from the created worker resource, the compiler / sender / watcher-alias **actual resource ARNs** (cross-stack `Fn::ImportValue`), and the configured secret identities — a template test proves each function's environment identity and the matching IAM resource are one ARN. |
 | **I6** | **Compiler Shareable read** — without it no send is possible (§ 8.2) |
 | **I7** | **S3 `SSEKMSKeyId`** — without it no object write succeeds (§ 9) |
 | **I8** | **AgentCore artifact deny split** — without it no runtime cold-starts (§ 6) |
@@ -1375,8 +1423,8 @@ presentation, submission, and cost cleanup.
 | **I12** | **Adapter done.** `DynamoDbDemoClockStore` at the exact literal `NS#DEMO#CLOCK`: strongly consistent read, and one guarded forward compare-and-swap whose `version`, `reset_generation`, and strictly-earlier-`logical_time` fences are all condition expressions the table evaluates. Missing, corrupt, and unreachable each fail closed and typed, with no fallback to a process-local clock, to `SystemClock`, or to an event's timestamp. The normal adapter exposes **no reset and no reseed** — asserted by absence. **Still owed:** the reset principal that seeds and reseeds the row (I13, § 12). |
 | **I13** | Reset authority: function, narrow role, bounded purge (§ 12) |
 | **I14** | Scheduler execution role policies (§ 8.5); Lambda VPC ENI grants (§ 8.6) |
-| **I15** | Artifact **build** done — lock-based, `aarch64-manylinux2014`/3.12, ELF-verified, with its own secret gate (§ 5). Still owed: artifact **publish**, the deploy CLI with the § 2 identity refusal, and AZ-ID resolution (§ 6). |
-| **I16** | Network, Inbound, Reset, and Observability stacks; `.env.example` refresh |
+| **I15** | AgentCore artifact **build** done — lock-based, `aarch64-manylinux2014`/3.12, ELF-verified, with its own secret gate (§ 5). The **Lambda** artifact build is done too (batch 5): `tools/build_lambda_artifacts.py`, one zip per production function, `x86_64-manylinux_2_28`/3.12, first-party trees re-rooted so the deployed import path matches the repository, ELF-verified, first-party secret gate, and an isolated unpacked-archive import test. Still owed: artifact **publish** (both), the deploy CLI with the § 2 identity refusal, and AZ-ID resolution (§ 6). |
+| **I16** | Network, Inbound, Reset, and Observability stacks. `.env.example` **partially refreshed** (batch 5): the two evidence-key ARNs, `CHORUS_SCHEDULER_ENVIRONMENT`, and `CHORUS_CURSOR_SIGNING_SECRET_ARN` added with safe placeholders; the inbound (`CHORUS_INBOUND_*`) and digest variables still await ADR-030. |
 
 **I6, I7, and I8 are the three that make an otherwise complete deployment fail at runtime**, each
 in a way that reads as an unrelated error: no send, no object write, no agent cold start.

@@ -173,10 +173,42 @@ def test_one_dropped_due_event_alarms() -> None:
     )
 
 
-def test_no_lambda_function_is_created() -> None:
-    """Phase 9 owns the identity and deploys nothing. The function is Phase 11's."""
+def test_the_watcher_function_version_and_live_alias_exist() -> None:
+    """Phase 11 batch 5: the watcher Lambda, a published Version, and an Alias named ``live``
+    (deployment contract SS 21-23, SS 46). Under the pre-existing watcher role and log group.
+    """
 
-    assert watcher_template().find_resources("AWS::Lambda::Function") == {}
+    built = watcher_template()
+    functions = built.find_resources("AWS::Lambda::Function")
+    assert len(functions) == 1
+    props = next(iter(functions.values()))["Properties"]
+    assert props["Runtime"] == "python3.12"
+    assert props["Architectures"] == ["x86_64"]
+    assert props["Handler"] == "functions.commitment_watcher.handler.handler"
+    assert props["FunctionName"] == "chorus-commitment-watcher-development"
+    assert props["Role"]["Fn::GetAtt"][0].startswith("WatcherRole")
+    assert props["LoggingConfig"]["LogGroup"]["Ref"].startswith("WatcherLogGroup")
+
+    built.resource_count_is("AWS::Lambda::Version", 1)
+    aliases = built.find_resources("AWS::Lambda::Alias")
+    assert len(aliases) == 1
+    alias = next(iter(aliases.values()))["Properties"]
+    assert alias["Name"] == "live"
+    version_logical = alias["FunctionVersion"]["Fn::GetAtt"][0]
+    function_logical = next(iter(functions))
+    assert alias["FunctionName"]["Ref"] == function_logical
+    version = built.find_resources("AWS::Lambda::Version")[version_logical]
+    assert version["Properties"]["FunctionName"]["Ref"] == function_logical
+
+
+def test_the_scheduler_invoke_and_the_alias_are_one_resource() -> None:
+    """SS 46: the scheduler role's ``lambda:InvokeFunction`` Resource is a ``Ref`` to the
+    actual ``Alias`` resource, not a re-typed lookalike ARN string."""
+
+    built = watcher_template()
+    alias_logical = next(iter(built.find_resources("AWS::Lambda::Alias")))
+    grant = _scheduler_statement("InvokeCommitmentWatcherLiveAliasOnly")
+    assert grant["Resource"] == {"Ref": alias_logical}
 
 
 # ------------------------------------------------------------------------------------------
@@ -186,7 +218,9 @@ def test_no_lambda_function_is_created() -> None:
 
 @cache
 def application_statements() -> list[dict[str, Any]]:
-    template = build_app().synth().get_stack_by_name("AmbientChorusApplication").template
+    template = (
+        build_app(offline=True).synth().get_stack_by_name("AmbientChorusApplication").template
+    )
     found: list[dict[str, Any]] = []
     for resource in template["Resources"].values():
         if resource["Type"] == POLICY_TYPE:
@@ -246,7 +280,7 @@ def test_the_application_may_write_the_outbound_message_locator_prefix() -> None
 def test_the_sender_is_denied_the_outbound_message_locator_prefix() -> None:
     """A sender that could write a locator could point a reply at an execution it chose."""
 
-    template = build_app().synth().get_stack_by_name("AmbientChorusSender").template
+    template = build_app(offline=True).synth().get_stack_by_name("AmbientChorusSender").template
     denies = [
         item
         for resource in template["Resources"].values()
@@ -310,29 +344,32 @@ def test_the_scheduler_role_trust_is_scoped_to_account_and_the_schedule_group_ar
 
 
 def test_the_scheduler_role_invokes_the_watcher_live_alias_only() -> None:
-    """P2-1: the invoke resource is the qualified ``:live`` alias ARN, so rollback repoints the
-    alias with no schedule or IAM edit. Never the unqualified function, ``$LATEST``, or a
-    bare version."""
+    """P2-1 / SS 46: the invoke resource is a ``Ref`` to the actual ``AWS::Lambda::Alias``
+    named ``live``, so rollback repoints that alias with no schedule or IAM edit. Never the
+    unqualified function, ``$LATEST``, or a bare version -- and never a re-typed lookalike ARN.
+    """
+
+    built = watcher_template()
+    alias_logical, alias = next(iter(built.find_resources("AWS::Lambda::Alias").items()))
+    assert alias["Properties"]["Name"] == "live"
 
     grant = _scheduler_statement("InvokeCommitmentWatcherLiveAliasOnly")
-
     assert grant["Effect"] == "Allow"
     assert actions_of(grant) == {"lambda:InvokeFunction"}
-    resource = json.dumps(grant["Resource"])
-    # The alias qualifier is part of one joined literal: `:function:<name>:live`.
-    assert "function:chorus-commitment-watcher-development:live" in resource
-    assert "$LATEST" not in resource
-    assert grant["Resource"] != "*"
+    assert grant["Resource"] == {"Ref": alias_logical}
 
 
 def test_the_scheduler_role_grants_no_unqualified_or_versioned_watcher_invoke() -> None:
+    built = watcher_template()
+    alias_logical = next(iter(built.find_resources("AWS::Lambda::Alias")))
     for item in _scheduler_role_statements():
         if item["Effect"] != "Allow" or "lambda:InvokeFunction" not in actions_of(item):
             continue
+        # the alias resource, and only the alias resource -- never a joined function ARN, a
+        # numeric version, or ``$LATEST``
+        assert item["Resource"] == {"Ref": alias_logical}
         resource = json.dumps(item["Resource"])
-        assert "chorus-commitment-watcher-development:live" in resource
-        # never the unqualified function tail or a numeric version qualifier
-        assert '-watcher-development"' not in resource
+        assert "$LATEST" not in resource
         assert not re.search(r"-watcher-development:\d", resource)
 
 
@@ -390,7 +427,9 @@ def test_the_worker_pass_role_condition_binds_the_scheduler_service() -> None:
 
 
 def test_the_api_role_holds_no_scheduler_authority_and_no_pass_role() -> None:
-    template = build_app().synth().get_stack_by_name("AmbientChorusApplication").template
+    template = (
+        build_app(offline=True).synth().get_stack_by_name("AmbientChorusApplication").template
+    )
     api_allows: set[str] = set()
     for logical_id, resource in template["Resources"].items():
         if resource["Type"] != POLICY_TYPE or not logical_id.startswith("ApiRole"):

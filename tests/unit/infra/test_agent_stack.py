@@ -492,6 +492,6 @@ def test_the_runtime_log_group_is_dedicated_to_the_monitor() -> None:
 
 
 def test_the_application_synthesizes_the_agent_stack() -> None:
-    assembly = build_app().synth()
+    assembly = build_app(offline=True).synth()
 
     assert "AmbientChorusAgents" in [stack.stack_name for stack in assembly.stacks]

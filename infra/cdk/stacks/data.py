@@ -11,7 +11,7 @@ introduced, so no authorization decision can ever read a stale projection.
 
 from __future__ import annotations
 
-from aws_cdk import Duration, RemovalPolicy, Stack, Tags
+from aws_cdk import Duration, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
@@ -38,8 +38,15 @@ that could fail (ADR-018).
 class ChorusDataStack(Stack):
     """Creates the Core, Shareable, and Audit tables for one environment."""
 
-    def __init__(self, scope: Construct, construct_id: str, *, config: CdkBuildConfig) -> None:
-        super().__init__(scope, construct_id)
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        config: CdkBuildConfig,
+        env: Environment | None = None,
+    ) -> None:
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)

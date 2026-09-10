@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import RemovalPolicy, Stack, Tags
+from aws_cdk import CfnOutput, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
@@ -42,7 +42,13 @@ from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from constructs import Construct
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import CdkBuildConfig, DeploymentIdentities
+from infra.cdk.lambda_support import (
+    ResourceNames,
+    chorus_lambda,
+    compiler_environment,
+    load_lambda_manifest,
+)
 
 VIEW_KEY_PREFIXES = ("NS#*#VIEW#*", "NS#*#VIEW_CURRENT#*")
 """The only Shareable partitions the compiler may write.
@@ -205,8 +211,11 @@ class ChorusCompilerStack(Stack):
         config: CdkBuildConfig,
         tables: CompilerTables,
         buckets: CompilerBuckets,
+        identities: DeploymentIdentities | None = None,
+        offline_synth: bool = True,
+        env: Environment | None = None,
     ) -> None:
-        super().__init__(scope, construct_id)
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)
@@ -233,6 +242,36 @@ class ChorusCompilerStack(Stack):
         # depends on it -- and the buckets must exist before the principal that writes them.
         self.role_arn_literal = f"arn:aws:iam::{self.account}:role/{self.role_name}"
         self._grant_boundary(tables=tables, buckets=buckets)
+
+        # I2 -> compute (deployment contract SS 14, SS 16 stage 6). The deterministic compiler
+        # Lambda, under the pre-existing role above and logging to the pre-existing group. Its
+        # environment carries the two evidence KMS key ARNs it needs for ``SSEKMSKeyId`` (SS 9)
+        # and nothing secret. ``function.function_arn`` is the actual resource ARN a consumer
+        # stack should name (review P2-2); ``function_arn_literal`` remains only as the
+        # deterministic fallback an isolated single-stack synthesis uses.
+        _ = identities  # the compiler carries no AgentCore identity (review P2-8)
+        self.function_name = f"chorus-compiler-{config.environment}"
+        self.function_arn_literal = (
+            f"arn:aws:lambda:{config.aws_region}:{self.account}:function:{self.function_name}"
+        )
+        self.function = chorus_lambda(
+            self,
+            "CompilerFunction",
+            config=config,
+            manifest=load_lambda_manifest("compiler"),
+            role=self.role,
+            environment=compiler_environment(
+                config=config,
+                names=ResourceNames.for_config(config),
+                private_evidence_key_arn=buckets.private_key.key_arn,
+                export_evidence_key_arn=buckets.export_key.key_arn,
+            ),
+            log_group=self.log_group,
+            offline_synth=offline_synth,
+        )
+        self.function_arn = self.function.function_arn
+        CfnOutput(self, "CompilerFunctionName", value=self.function.function_name)
+        CfnOutput(self, "CompilerFunctionArn", value=self.function.function_arn)
 
     def _grant_boundary(self, *, tables: CompilerTables, buckets: CompilerBuckets) -> None:
         """Attach the complete allow list and the three explicit denies, in one place.

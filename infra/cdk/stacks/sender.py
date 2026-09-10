@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import RemovalPolicy, Stack, Tags
+from aws_cdk import CfnOutput, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
@@ -48,7 +48,13 @@ from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_ses as ses
 from constructs import Construct
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import CdkBuildConfig, DeploymentIdentities
+from infra.cdk.lambda_support import (
+    ResourceNames,
+    chorus_lambda,
+    load_lambda_manifest,
+    sender_environment,
+)
 
 EXECUTION_KEY_PREFIX = "NS#*#EXECUTION#*"
 """The execution's own partition, and the only Shareable prefix this role may write."""
@@ -157,8 +163,11 @@ class ChorusSenderStack(Stack):
         compiler_function_arn: str | None = None,
         destination_registry_secret_arn: str | None = None,
         ses_identity_arn: str | None = None,
+        identities: DeploymentIdentities | None = None,
+        offline_synth: bool = True,
+        env: Environment | None = None,
     ) -> None:
-        super().__init__(scope, construct_id)
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)
@@ -194,6 +203,21 @@ class ChorusSenderStack(Stack):
             description="External sender: one approved message, one deliberate SES attempt.",
         )
         self.role_arn_literal = f"arn:aws:iam::{self.account}:role/{self.role_name}"
+
+        identities = identities or DeploymentIdentities(environment=config.environment)
+        # Batch 5 always wires the destination-registry secret identity (deployment contract
+        # SS 19): the same ARN feeds both the sender function's environment and the sender role's
+        # exact ``GetSecretValue`` grant. An explicit constructor argument still wins.
+        destination_registry_secret_arn = (
+            destination_registry_secret_arn or identities.destination_registry_secret_arn
+        )
+        # The compiler ARN the sender invokes for both halves of the fence. The **actual**
+        # compiler ``Function`` ARN when the Compiler stack passed one (review P2-2); the
+        # deterministic literal only as an isolated-synthesis fallback.
+        compiler_function_arn = compiler_function_arn or (
+            f"arn:aws:lambda:{config.aws_region}:{self.account}:function:"
+            f"chorus-compiler-{config.environment}"
+        )
         self._grant_boundary(
             tables=tables,
             buckets=buckets,
@@ -202,6 +226,33 @@ class ChorusSenderStack(Stack):
             destination_registry_secret_arn=destination_registry_secret_arn,
             ses_identity_arn=ses_identity_arn,
         )
+
+        # I2 -> compute (deployment contract SS 14, SS 18). The sender Lambda under the
+        # pre-existing role and log group. Its environment carries the destination-registry
+        # **secret identity** (an ARN, never the address or the registry contents) and the
+        # compiler ARN it invokes for the fence; no model, no scheduler, no SES address.
+        self.function_name = f"chorus-sender-{config.environment}"
+        self.function_arn_literal = (
+            f"arn:aws:lambda:{config.aws_region}:{self.account}:function:{self.function_name}"
+        )
+        self.function = chorus_lambda(
+            self,
+            "SenderFunction",
+            config=config,
+            manifest=load_lambda_manifest("sender"),
+            role=self.role,
+            environment=sender_environment(
+                config=config,
+                names=ResourceNames.for_config(config),
+                compiler_function_arn=compiler_function_arn,
+                destination_registry_secret_arn=destination_registry_secret_arn,
+            ),
+            log_group=self.log_group,
+            offline_synth=offline_synth,
+        )
+        self.function_arn = self.function.function_arn
+        CfnOutput(self, "SenderFunctionName", value=self.function.function_name)
+        CfnOutput(self, "SenderFunctionArn", value=self.function.function_arn)
 
     def _grant_boundary(
         self,

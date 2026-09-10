@@ -88,6 +88,10 @@ from chorus.infrastructure.lambdas.invoker import (
     SynchronousLambdaInvoker,
     create_lambda_client,
 )
+from chorus.infrastructure.lambdas.transport_budgets import (
+    WORKER_SENDER_CONNECT_TIMEOUT_SECONDS,
+    WORKER_SENDER_READ_TIMEOUT_SECONDS,
+)
 from chorus.infrastructure.persistent_clock import ScopedLogicalClock
 from chorus.infrastructure.scheduler.client import create_scheduler_client
 from chorus.infrastructure.scheduler.eventbridge import EventBridgeDeadlineScheduler
@@ -322,7 +326,15 @@ def build_worker(settings: WorkerSettings, *, ids: IdGenerator | None = None) ->
         operations=operations,
         send_action=RemoteSendAction(
             invoker=SynchronousLambdaInvoker(
-                client=create_lambda_client(region_name=settings.region),
+                # The sender may legitimately run its full fence life plus one SES attempt, so
+                # this client out-waits the sender's 90 s Lambda timeout and stays under the
+                # worker's own 120 s -- a slow-but-successful send is never clipped into an
+                # artificial client timeout (review P2-9).
+                client=create_lambda_client(
+                    region_name=settings.region,
+                    connect_timeout=WORKER_SENDER_CONNECT_TIMEOUT_SECONDS,
+                    read_timeout=WORKER_SENDER_READ_TIMEOUT_SECONDS,
+                ),
                 function_name=_require(settings.sender_function_arn, "the sender function ARN"),
             )
         ),

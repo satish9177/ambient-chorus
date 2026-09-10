@@ -34,18 +34,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import Duration, RemovalPolicy, Stack, Tags
+from aws_cdk import CfnOutput, Duration, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
+from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_scheduler as scheduler
 from aws_cdk import aws_sqs as sqs
 from constructs import Construct
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import CdkBuildConfig, DeploymentIdentities
+from infra.cdk.lambda_support import (
+    ResourceNames,
+    chorus_lambda,
+    load_lambda_manifest,
+    watcher_environment,
+)
 
 CASE_KEY_PREFIX = "NS#*#CASE#*"
 """The watcher's complete Shareable **write** authority, as a key prefix."""
@@ -163,8 +170,11 @@ class ChorusWatcherStack(Stack):
         config: CdkBuildConfig,
         tables: WatcherTables,
         buckets: WatcherBuckets,
+        identities: DeploymentIdentities | None = None,
+        offline_synth: bool = True,
+        env: Environment | None = None,
     ) -> None:
-        super().__init__(scope, construct_id)
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)
@@ -279,6 +289,50 @@ class ChorusWatcherStack(Stack):
             f"arn:aws:iam::{self.account}:role/{self.scheduler_role_name}"
         )
         self._grant_boundary(tables=tables, buckets=buckets)
+
+        # I2 -> compute (deployment contract SS 14, SS 21-23). The watcher Lambda under the
+        # pre-existing role and log group, then a published Version and an Alias named exactly
+        # ``live``. The frozen physical name ``chorus-commitment-watcher-{env}`` is not
+        # negotiable: its ``:live`` alias ARN is already named by the API role, the scheduler
+        # execution role, and ``CHORUS_WATCHER_FUNCTION_ARN`` semantics.
+        _ = identities  # the watcher carries no AgentCore identity (review P2-8)
+        version_removal = RemovalPolicy.DESTROY if config.is_disposable else RemovalPolicy.RETAIN
+        self.function = chorus_lambda(
+            self,
+            "WatcherFunction",
+            config=config,
+            manifest=load_lambda_manifest("commitment_watcher"),
+            role=self.role,
+            environment=watcher_environment(
+                config=config,
+                names=ResourceNames.for_config(config),
+            ),
+            log_group=self.log_group,
+            offline_synth=offline_synth,
+            # SS 23: the published version must change when deployment-relevant watcher code or
+            # config changes. ``current_version`` hashes exactly that, so rollback has a stable
+            # previous version to repoint ``live`` at -- retained, not swept, outside a
+            # disposable environment.
+            current_version_options=lambda_.VersionOptions(removal_policy=version_removal),
+        )
+        self.version = self.function.current_version
+        self.alias = lambda_.Alias(
+            self,
+            "WatcherLiveAlias",
+            alias_name=self.watcher_alias_name,
+            version=self.version,
+        )
+        # The one identity every ``:live`` consumer binds to (deployment contract SS 46): the
+        # actual ``Alias`` resource's ARN, not a re-typed lookalike string. The scheduler
+        # execution role (below) and the API role (in the Application stack, via ``app.py``)
+        # both point their ``lambda:InvokeFunction`` grant at exactly this. It resolves to
+        # ``watcher_alias_arn_literal`` -- the alias's physical name is deterministic -- but a
+        # template test compares the *resources*, not the strings.
+        self.watcher_alias_arn = self.alias.function_arn
+        CfnOutput(self, "WatcherFunctionName", value=self.function.function_name)
+        CfnOutput(self, "WatcherLiveAliasArn", value=self.alias.function_arn)
+        CfnOutput(self, "WatcherPublishedVersion", value=self.version.version)
+
         self._grant_scheduler_execution_boundary()
 
     def _grant_boundary(self, *, tables: WatcherTables, buckets: WatcherBuckets) -> None:
@@ -419,7 +473,7 @@ class ChorusWatcherStack(Stack):
                 sid="InvokeCommitmentWatcherLiveAliasOnly",
                 effect=iam.Effect.ALLOW,
                 actions=[SCHEDULER_INVOKE_ACTION],
-                resources=[self.watcher_alias_arn_literal],
+                resources=[self.alias.function_arn],
             )
         )
         self.scheduler_role.add_to_policy(

@@ -66,6 +66,10 @@ from chorus.infrastructure.dynamodb.driver import DynamoDbStorageDriver
 from chorus.infrastructure.dynamodb.idempotency import IdempotencyRepository
 from chorus.infrastructure.dynamodb.shareable import ShareableRepository
 from chorus.infrastructure.dynamodb.unit_of_work import StorageUnitOfWork
+from chorus.infrastructure.lambdas.transport_budgets import (
+    SENDER_COMPILER_CONNECT_TIMEOUT_SECONDS,
+    SENDER_COMPILER_READ_TIMEOUT_SECONDS,
+)
 from chorus.infrastructure.local.sender import FilesystemOutboxSender
 from chorus.infrastructure.ses.sender import SESV2_SERVICE_NAME, SesV2EmailSender
 from chorus.ports.clock import Clock
@@ -218,8 +222,13 @@ def build_send_authorization(
             # than at the first send.
             raise ValueError("a deployed sender needs the compiler function ARN")
         invoker = LambdaCompilerInvoker(
+            # A fence acquire/release is a couple of DynamoDB writes; this client fails fast if
+            # the compiler is unreachable and stays well inside the sender's SES budget (P2-9).
             client=create_lambda_client(
-                region_name=settings.region, endpoint_url=settings.lambda_endpoint
+                region_name=settings.region,
+                endpoint_url=settings.lambda_endpoint,
+                connect_timeout=SENDER_COMPILER_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=SENDER_COMPILER_READ_TIMEOUT_SECONDS,
             ),
             function_name=settings.compiler_function_arn,
         )

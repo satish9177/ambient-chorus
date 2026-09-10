@@ -30,9 +30,12 @@ variable, a log line, or a response.
 
 Two things fail closed at construction rather than at first use
 ----------------------------------------------------------------
-``CHORUS_DYNAMODB_ENDPOINT`` must be **absent** in a deployed composition -- a local endpoint
-default in an account is a request path silently pointed at nothing -- and the demo access
-secret ARN must be present. Both are asserted here (deployment contract § 14).
+``CHORUS_DYNAMODB_ENDPOINT`` must be unset in a deployed composition. The setting's own default
+is now ``None`` (the deployed value); ``api_settings`` still refuses to construct if a
+deployment *does* set it, because a local DynamoDB endpoint in an account is a request path
+pointed at nothing. The demo access secret ARN, the cursor-signing secret ARN, and the worker /
+compiler / watcher function ARNs must all be present. All are asserted here (deployment
+contract § 14).
 """
 
 from __future__ import annotations
@@ -81,6 +84,10 @@ from chorus.infrastructure.lambdas.invoker import (
     SynchronousLambdaInvoker,
     create_lambda_client,
 )
+from chorus.infrastructure.lambdas.transport_budgets import (
+    API_DOWNSTREAM_CONNECT_TIMEOUT_SECONDS,
+    API_DOWNSTREAM_READ_TIMEOUT_SECONDS,
+)
 from chorus.infrastructure.persistent_clock import PersistentDemoClock, ScopedLogicalClock
 from chorus.infrastructure.secrets.cursor_signing import load_cursor_signing_key
 from chorus.infrastructure.secrets.demo_access import (
@@ -127,9 +134,9 @@ class ApiSettings:
 def api_settings(settings: Settings) -> ApiSettings:
     """Map process configuration onto the request path's settings, refusing what is unsafe.
 
-    ``CHORUS_DYNAMODB_ENDPOINT`` is asserted absent rather than trusted to default. The setting
-    defaults to ``http://localhost:8000`` for local development, and a deployed request path
-    that inherited that default would answer every read from nothing at all.
+    ``CHORUS_DYNAMODB_ENDPOINT`` is asserted unset. Its default is ``None`` (the deployed
+    value); a deployment that *sets* it -- pointing the request path at a local endpoint -- is
+    refused here rather than at the first read.
     """
 
     if settings.dynamodb_endpoint is not None:
@@ -201,7 +208,15 @@ def build_api_container(settings: ApiSettings, *, ids: IdGenerator | None = None
     unit_of_work = StorageUnitOfWork(driver=driver)
     adapter = SyntheticAmbientAdapter()
 
-    lambda_client = create_lambda_client(region_name=settings.region)
+    # One client for every downstream invoke on the request path (compiler compile, watcher
+    # clock-advance, and the async worker dispatch), pinned to the API's caller-specific
+    # transport budget so a slow compiler or watcher raises a typed dependency failure well
+    # before API Gateway's 30 s ceiling terminates this Lambda (review P2-9).
+    lambda_client = create_lambda_client(
+        region_name=settings.region,
+        connect_timeout=API_DOWNSTREAM_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=API_DOWNSTREAM_READ_TIMEOUT_SECONDS,
+    )
     clock_store = DynamoDbDemoClockStore(driver=driver, namespace=namespace)
 
     return ApiContainer(
