@@ -42,6 +42,7 @@ from dataclasses import dataclass
 
 from aws_cdk import CfnOutput, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_dynamodb as dynamodb
+from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
@@ -55,6 +56,7 @@ from infra.cdk.lambda_support import (
     load_lambda_manifest,
     sender_environment,
 )
+from infra.cdk.network_support import vpc_eni_policy_statements
 
 EXECUTION_KEY_PREFIX = "NS#*#EXECUTION#*"
 """The execution's own partition, and the only Shareable prefix this role may write."""
@@ -165,6 +167,10 @@ class ChorusSenderStack(Stack):
         ses_identity_arn: str | None = None,
         identities: DeploymentIdentities | None = None,
         offline_synth: bool = True,
+        vpc: ec2.IVpc | None = None,
+        vpc_subnets: ec2.SubnetSelection | None = None,
+        vpc_subnet_arns: list[str] | None = None,
+        security_group: ec2.ISecurityGroup | None = None,
         env: Environment | None = None,
     ) -> None:
         super().__init__(scope, construct_id, env=env)
@@ -249,8 +255,26 @@ class ChorusSenderStack(Stack):
             ),
             log_group=self.log_group,
             offline_synth=offline_synth,
+            vpc=vpc,
+            vpc_subnets=vpc_subnets,
+            security_groups=[security_group] if security_group is not None else None,
         )
         self.function_arn = self.function.function_arn
+
+        # I16 -> VPC attachment (deployment contract §§ 2, 14-17). The sender goes inside the
+        # isolated network: it holds the destination secret and the only SES send grant. No
+        # ``AWSLambdaVPCAccessExecutionRole`` (explicit ``role=``); the exact ENI permissions
+        # are the two inline statements below, bound to this function's ARN and the two
+        # isolated subnets.
+        # The ENI grant names the sender's **deterministic function ARN literal**, not the
+        # ``Fn::GetAtt`` on the resource -- routing the role's policy through the function it is
+        # attached to would be a ``role -> function -> role`` cycle.
+        if vpc is not None and vpc_subnet_arns is not None:
+            for eni_statement in vpc_eni_policy_statements(
+                function_arn=self.function_arn_literal, subnet_arns=vpc_subnet_arns
+            ):
+                self.role.add_to_policy(eni_statement)
+
         CfnOutput(self, "SenderFunctionName", value=self.function.function_name)
         CfnOutput(self, "SenderFunctionArn", value=self.function.function_arn)
 
@@ -369,10 +393,13 @@ class ChorusSenderStack(Stack):
             iam.PolicyStatement(
                 sid="DenyAllCoreAccess",
                 effect=iam.Effect.DENY,
-                actions=["dynamodb:*"],
+                not_actions=["dynamodb:ConditionCheckItem"],
                 resources=[tables.core.table_arn, f"{tables.core.table_arn}/*"],
             )
         )
+        from infra.cdk.reset_support import grant_demo_reset_condition
+
+        grant_demo_reset_condition(self.role, tables.core.table_arn, deny_other_conditions=True)
         self.role.add_to_policy(
             iam.PolicyStatement(
                 sid="DenyEvidenceObjects",

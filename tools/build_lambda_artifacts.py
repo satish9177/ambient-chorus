@@ -86,8 +86,19 @@ REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[1]
 FUNCTIONS_ROOT: Final = REPOSITORY_ROOT / "functions"
 DEFAULT_OUTPUT_ROOT: Final = REPOSITORY_ROOT / "build" / "lambda"
 
-FUNCTION_DIRS: Final = ("api", "worker", "compiler", "sender", "commitment_watcher")
-"""The five production function packages, by directory name under ``functions/``."""
+FUNCTION_DIRS: Final = (
+    "api",
+    "worker",
+    "compiler",
+    "sender",
+    "commitment_watcher",
+    "demo_reset",
+)
+"""The production function packages, by directory name under ``functions/``.
+
+The dedicated demo reset function (``demo_reset``) is packaged with the same lock-based,
+deterministic, secret-gated, ELF-verified, isolated-import-proven pipeline as the five
+request-path functions -- it is Macro A compute and gets no artifact exemption."""
 
 PLATFORM_BY_ARCHITECTURE: Final = {
     "x86_64": "x86_64-manylinux_2_28",
@@ -249,6 +260,8 @@ class BuiltLambdaArtifact:
 def remap_archive_path(relative: str) -> str:
     """Strip a known source-root prefix so the archive path is the deployed import path."""
 
+    if relative.startswith("demo/fixtures/"):
+        return "chorus/infrastructure/fixtures/data/" + relative.removeprefix("demo/fixtures/")
     for prefix in SOURCE_ROOT_PREFIXES:
         if relative.startswith(prefix):
             return relative[len(prefix) :]
@@ -444,8 +457,8 @@ def _secret_problems(
 def scan_staged_first_party(staging: Path, relative_paths: frozenset[str]) -> list[str]:
     """Scan the repository files this build copied, before anything is packaged.
 
-    No exception list: every path here was staged by this build, from this repository. A file
-    that cannot be decoded is a finding, never a file quietly passed over.
+    Every path uses the shared first-party scanner. Its independently pinned synthetic binary
+    resource is byte-scanned; an unrecognized undecodable file is a finding, never skipped.
     """
 
     problems: list[str] = []

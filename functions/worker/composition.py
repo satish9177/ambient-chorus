@@ -79,6 +79,7 @@ from chorus.infrastructure.dynamodb.client import create_dynamodb_client
 from chorus.infrastructure.dynamodb.core import CoreRepository
 from chorus.infrastructure.dynamodb.cursor import SignedCursorCodec
 from chorus.infrastructure.dynamodb.demo_clock import DynamoDbDemoClockStore
+from chorus.infrastructure.dynamodb.demo_reset_store import DynamoDbDemoManifestRegistrar
 from chorus.infrastructure.dynamodb.driver import DynamoDbStorageDriver
 from chorus.infrastructure.dynamodb.idempotency import IdempotencyRepository
 from chorus.infrastructure.dynamodb.shareable import ShareableRepository
@@ -194,12 +195,21 @@ def build_worker(settings: WorkerSettings, *, ids: IdGenerator | None = None) ->
     invoker = create_agentcore_invoker(
         region_name=settings.region, timeout_seconds=settings.agent_timeout_seconds
     )
+    # Deployed demo only: every new OPERATION partition is recorded in the reset inventory in
+    # the same transaction as its first row (review completion A1) -- a crash can never leave
+    # an OPERATION partition durable and unregistered. ``None`` in every other namespace.
+    partition_registrar = (
+        DynamoDbDemoManifestRegistrar(driver=driver, namespace=namespace)
+        if namespace.value == "DEMO"
+        else None
+    )
     operations = ApplicationOperations(
         core=core,
         idempotency=idempotency_core,
         unit_of_work=unit_of_work,
         clock=scope,
         ids=generator,
+        partition_registrar=partition_registrar,
     )
 
     monitor = MonitorOperationWorker(
@@ -295,6 +305,7 @@ def build_worker(settings: WorkerSettings, *, ids: IdGenerator | None = None) ->
             policy_version=settings.policy_version,
             destination_label=settings.destination.display_label,
             schedule=CreateDueSchedule(
+                idempotency=idempotency_shareable,
                 shareable=shareable,
                 audit=audit,
                 unit_of_work=unit_of_work,

@@ -88,6 +88,7 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-028](adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) | The deadline watcher: an unsigned event, a re-checked commitment, and the schedule the demo does not fake |
 | [ADR-029](adr/ADR-029-deployed-demo-clock-authority.md) | The deployed demo clock: one authoritative logical time the watcher can actually read |
 | [ADR-030](adr/ADR-030-live-ses-receipt-decoding.md) | Decoding a real SES receipt: thread references, correspondent identity, and recipient authority |
+| [ADR-031](adr/ADR-031-demo-reset-mutation-interlock.md) | Atomic DEMO reset interlock and existing side-effect reservations |
 
 ## Implementation control
 

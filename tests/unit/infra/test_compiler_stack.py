@@ -446,6 +446,7 @@ def test_the_shareable_read_grant_adds_no_core_authority(compiler: Template) -> 
         "ReadPrivateCore",
         "ConditionCheckCaseVersion",
         "ConditionCheckSendFence",
+        "ConditionCheckDemoResetLock",
         "WriteSendFenceOnly",
     }
 

@@ -157,6 +157,52 @@ class S3ObjectStore:
             raise ExternalDependencyError("PRIVATE_EVIDENCE_OBJECT", retryable=False)
         return bytes(content)
 
+    def purge_namespace(self, namespace: Namespace) -> int:
+        """Not used deployed: the demo reset purges ``ns/DEMO/`` through the dedicated
+        prefix-bounded :class:`~chorus.infrastructure.demo_reset_purge.S3DemoObjectPrefixPurge`,
+        so this adapter never sweeps a namespace. Present only to satisfy the shared
+        ``DemoEvidenceObjects`` shape."""
+
+        raise NotImplementedError(
+            "S3ObjectStore does not purge a namespace; use S3DemoObjectPrefixPurge"
+        )
+
+    def seed_private_evidence(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        evidence_id: EvidenceItemId,
+        content: bytes,
+        media_type: str,
+    ) -> str:
+        """Place one fixture evidence object where ingestion would have written it, SSE-KMS.
+
+        Used only by the deployed demo reset (review R2), to reseed the two frozen fixture
+        evidence objects after the bounded ``ns/DEMO/`` prefix purge. It names the private
+        bucket's exact KMS key ARN as ``SSEKMSKeyId``, exactly like every other write this
+        adapter performs -- the bucket policy denies a write that does not (deployment contract
+        § 9). Overwrites deliberately (no ``IfNoneMatch``): the purge removed the prior object
+        and the content is content-addressed by the fixture digest anyway.
+        """
+
+        key = private_evidence_key(
+            namespace=namespace,
+            community_id=community_id,
+            case_id=case_id,
+            evidence_id=evidence_id,
+        )
+        self.client.put_object(
+            Bucket=self.private_bucket,
+            Key=key,
+            Body=content,
+            ContentType=media_type,
+            ServerSideEncryption="aws:kms",
+            SSEKMSKeyId=self.private_kms_key_id,
+        )
+        return key
+
     async def head_inbound_reply(
         self,
         *,

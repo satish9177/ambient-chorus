@@ -58,6 +58,17 @@ class DemoClockConflictError(DemoClockError):
     """
 
 
+class DemoClockResetConflictError(DemoClockError):
+    """A concurrent reset, or an advance that raced this reseed, moved the row first.
+
+    Reset serialises itself behind ``DEMO_RESET_LOCK`` (ADR-029 § 3 step 1), so this is the
+    narrow window where the lock has been taken but the strongly-read row was already stale --
+    the conditional reseed write is evaluated by the store and refused, and the reset principal
+    re-reads and retries under the same held lock rather than blind-overwriting. It is never a
+    silent overwrite and never a fallback.
+    """
+
+
 class DemoClockNotAdvancedError(DemoClockError):
     """The requested reading is at or before the stored one.
 
@@ -127,12 +138,55 @@ class DemoClockPort(Protocol):
         """Advance by a strictly positive delta and return the new logical reading."""
 
 
+class DemoClockResetStorePort(Protocol):
+    """The **reset principal's** view of the clock row: read it, and reseed it once, fenced.
+
+    Separate from :class:`DemoClockStorePort` on purpose. Restoring the seed instant is the one
+    legitimate backward transition in the system (ADR-029 § 3), and it belongs to the dedicated
+    reset principal alone -- so a type the API or the watcher holds can never reach it, and the
+    normal store's surface is asserted to contain no ``reseed``.
+    """
+
+    async def read(self) -> DemoClockRecord | None:
+        """Strongly read the current clock row, or ``None`` when no row exists.
+
+        Unlike :meth:`DemoClockStorePort.read`, an absent row is **not** a failure here: reset
+        may legitimately run before the first advance, or in a fresh deployment, and creates
+        generation 1 in that case (ADR-029 § 6). A row that is present but *corrupt* still fails
+        closed -- reset never blind-overwrites a row it could not parse.
+        """
+
+    async def reseed(
+        self, *, seed_instant: datetime, current: DemoClockRecord | None
+    ) -> DemoClockRecord:
+        """Apply ADR-029 § 3 steps 2-5 as one conditional write, and return the new row.
+
+        * advance ``reset_generation`` monotonically and **never reuse a value** --
+          ``current.reset_generation + 1``, or ``1`` when ``current`` is ``None``;
+        * restore ``logical_time`` to ``seed_instant`` and zero ``advance_count``;
+        * begin a fresh ``version`` sequence at ``1``.
+
+        The write is conditioned on ``current``'s exact ``version`` and ``reset_generation`` (or
+        on the row's absence), so a concurrent reset or a raced advance loses deterministically
+        with :class:`DemoClockResetConflictError` rather than being overwritten. The caller
+        holds ``DEMO_RESET_LOCK`` for the whole read-then-reseed, so a conflict here is the
+        narrow lock-acquisition-race window, not two resets running in parallel.
+
+        The invariant this buys is the § 3 one, restated: an advance carrying the pre-reset
+        ``reset_generation`` fails against the post-reset row **even if its numeric version
+        coincides** with a live one, because the fresh sequence necessarily revisits low
+        numbers and the generation never repeats.
+        """
+
+
 __all__ = [
     "DemoClockConflictError",
     "DemoClockError",
     "DemoClockNotAdvancedError",
     "DemoClockPort",
     "DemoClockRecord",
+    "DemoClockResetConflictError",
+    "DemoClockResetStorePort",
     "DemoClockStorePort",
     "DemoClockUnavailableError",
 ]

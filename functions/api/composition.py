@@ -74,6 +74,7 @@ from chorus.infrastructure.dynamodb.client import create_dynamodb_client
 from chorus.infrastructure.dynamodb.core import CoreRepository
 from chorus.infrastructure.dynamodb.cursor import SignedCursorCodec
 from chorus.infrastructure.dynamodb.demo_clock import DynamoDbDemoClockStore
+from chorus.infrastructure.dynamodb.demo_reset_store import DynamoDbDemoManifestRegistrar
 from chorus.infrastructure.dynamodb.driver import DynamoDbStorageDriver
 from chorus.infrastructure.dynamodb.idempotency import IdempotencyRepository
 from chorus.infrastructure.dynamodb.shareable import ShareableRepository
@@ -218,6 +219,16 @@ def build_api_container(settings: ApiSettings, *, ids: IdGenerator | None = None
         read_timeout=API_DOWNSTREAM_READ_TIMEOUT_SECONDS,
     )
     clock_store = DynamoDbDemoClockStore(driver=driver, namespace=namespace)
+    # Deployed demo only: the request path is where every OPERATION partition is first created
+    # (``reserve_start`` / ``complete_start`` in the routes), so the reset-inventory marker is
+    # appended to that same ``create-operation`` transaction here -- a crash can never leave an
+    # OPERATION partition durable and unregistered (final completion repair A1). ``None`` in
+    # every other namespace, and the transaction is then byte-for-byte unchanged.
+    partition_registrar = (
+        DynamoDbDemoManifestRegistrar(driver=driver, namespace=namespace)
+        if namespace.value == "DEMO"
+        else None
+    )
 
     return ApiContainer(
         namespace=namespace,
@@ -241,6 +252,7 @@ def build_api_container(settings: ApiSettings, *, ids: IdGenerator | None = None
             unit_of_work=unit_of_work,
             clock=scope,
             ids=generator,
+            partition_registrar=partition_registrar,
         ),
         propose_mandates=ProposeMandates(
             core=core,

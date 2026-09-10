@@ -191,12 +191,20 @@ def test_the_sender_has_no_allow_reaching_the_core_table(sender: assertions.Temp
     """
 
     for item in statements(sender):
-        if item["Effect"] == "Allow":
+        if item["Effect"] == "Allow" and item.get("Sid") != "ConditionCheckDemoResetLock":
             assert not targets(item, "CoreTable"), f"{item.get('Sid')} reaches Core"
 
     deny = statement(sender, "DenyAllCoreAccess")
     assert deny["Effect"] == "Deny"
-    assert actions_of(deny) == {"dynamodb:*"}
+    assert deny["NotAction"] == "dynamodb:ConditionCheckItem"
+    lock = statement(sender, "ConditionCheckDemoResetLock")
+    assert actions_of(lock) == {"dynamodb:ConditionCheckItem"}
+    assert lock["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["NS#DEMO"]}}
+    other = statement(sender, "DenyOtherCoreConditions")
+    assert other["Effect"] == "Deny"
+    assert other["Condition"] == {
+        "ForAnyValue:StringNotEquals": {"dynamodb:LeadingKeys": ["NS#DEMO"]}
+    }
 
 
 def test_the_sender_cannot_invoke_a_model_or_a_scheduler(sender: assertions.Template) -> None:

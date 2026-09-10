@@ -411,10 +411,13 @@ class ChorusWatcherStack(Stack):
             iam.PolicyStatement(
                 sid="DenyAllCoreAccess",
                 effect=iam.Effect.DENY,
-                actions=["dynamodb:*"],
+                not_actions=["dynamodb:ConditionCheckItem"],
                 resources=[tables.core.table_arn, f"{tables.core.table_arn}/*"],
             )
         )
+        from infra.cdk.reset_support import grant_demo_reset_condition
+
+        grant_demo_reset_condition(self.role, tables.core.table_arn, deny_other_conditions=True)
         self.role.add_to_policy(
             iam.PolicyStatement(
                 sid="DenyEvidenceObjects",

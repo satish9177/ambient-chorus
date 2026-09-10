@@ -20,6 +20,7 @@ from chorus.infrastructure.dynamodb import (
     codec_mandate,
     codec_share,
     demo_clock,
+    demo_reset_store,
 )
 from chorus.infrastructure.dynamodb.attributes import decode_item, encode_item
 from chorus.infrastructure.dynamodb.codec import (
@@ -29,6 +30,7 @@ from chorus.infrastructure.dynamodb.codec import (
     ATTR_SCHEMA_VERSION,
 )
 from chorus.ports.demo_clock import DemoClockRecord
+from chorus.ports.demo_reset import DemoManifest, DemoResetLockHandle, DemoResetReceipt
 from chorus.ports.idempotency import (
     IdempotencyRecord,
     IdempotencyStatus,
@@ -296,7 +298,42 @@ def _cases() -> tuple[Case, ...]:
             lambda item: (None, demo_clock.decode_demo_clock(world.namespace, item)),
             _clock_record(),
         ),
+        (
+            "DEMO_MANIFEST",
+            lambda w: demo_reset_store.encode_demo_manifest(w.namespace, _manifest_record()),
+            lambda item: (None, demo_reset_store.decode_demo_manifest(world.namespace, item)),
+            _manifest_record(),
+        ),
+        (
+            "DEMO_RESET_LOCK",
+            lambda w: demo_reset_store.encode_demo_reset_lock(w.namespace, _lock_handle()),
+            lambda item: (None, demo_reset_store.decode_demo_reset_lock(world.namespace, item)),
+            _lock_handle(),
+        ),
+        (
+            "DEMO_RESET_RECEIPT",
+            lambda w: demo_reset_store.encode_demo_reset_receipt(w.namespace, _reset_receipt()),
+            lambda item: (
+                None,
+                demo_reset_store.decode_demo_reset_receipt(world.namespace, item),
+            ),
+            _reset_receipt(),
+        ),
+        (
+            "DEMO_REGISTERED_PARTITION",
+            lambda w: demo_reset_store.encode_demo_registered_partition(
+                w.namespace, _REGISTERED_PARTITION_KEY
+            ),
+            lambda item: (
+                None,
+                demo_reset_store.decode_demo_registered_partition(world.namespace, item),
+            ),
+            _REGISTERED_PARTITION_KEY,
+        ),
     )
+
+
+_REGISTERED_PARTITION_KEY = "NS#DEMO#OPERATION#7f3c1d2e"
 
 
 def _clock_record() -> DemoClockRecord:
@@ -308,6 +345,38 @@ def _clock_record() -> DemoClockRecord:
         reset_generation=1,
         seed_instant=NOW,
         advance_count=0,
+    )
+
+
+def _manifest_record() -> DemoManifest:
+    """The deployed demo reset's runtime inventory row (review R2)."""
+
+    return DemoManifest(
+        seed_version="elevator/v1",
+        created_at=NOW,
+        version=1,
+        partition_keys=("NS#DEMO", "NS#DEMO#COMM#c"),
+        control_sort_prefixes=("DEMO_MANIFEST#", "DEMO_RESET_LOCK", "DEMO_RESET_RECEIPT#"),
+        private_object_prefixes=("ns/DEMO/",),
+        export_object_prefixes=("ns/DEMO/",),
+        schedule_name_prefix="chorus-demo-",
+    )
+
+
+def _lock_handle() -> DemoResetLockHandle:
+    return DemoResetLockHandle(
+        owner_token="reset-owner-0001",
+        acquired_at=NOW,
+        expires_at=NOW.replace(year=NOW.year + 1),
+    )
+
+
+def _reset_receipt() -> DemoResetReceipt:
+    return DemoResetReceipt(
+        idempotency_key="op-0001",
+        request_fingerprint="DEMO\x1fRESET DEMO\x1felevator/v1",
+        recorded_at=NOW,
+        result_json='{"reset_id": "x"}',
     )
 
 

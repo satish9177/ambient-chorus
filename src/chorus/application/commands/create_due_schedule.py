@@ -40,7 +40,11 @@ from chorus.domain.errors import IntegrityError
 from chorus.domain.ids import CommunityId, IdGenerator, Namespace, Sha256Digest
 from chorus.ports.clock import Clock
 from chorus.ports.records import CommitmentScheduleProjection, CommitmentScheduleStatus
-from chorus.ports.repositories import AuditRepositoryPort, ShareableRepositoryPort
+from chorus.ports.repositories import (
+    AuditRepositoryPort,
+    IdempotencyRepositoryPort,
+    ShareableRepositoryPort,
+)
 from chorus.ports.scheduler import (
     DeadlineSchedulerPort,
     ScheduleCreateFailed,
@@ -116,6 +120,7 @@ class CreateDueSchedule:
     wall_clock: Clock
     ids: IdGenerator
     scheduler_environment: str
+    idempotency: IdempotencyRepositoryPort
 
     async def execute(self, command: CreateDueScheduleCommand) -> CreateDueScheduleResult:
         commitment = command.commitment
@@ -162,14 +167,41 @@ class CreateDueSchedule:
             # would create a second schedule for one commitment.
             raise IntegrityError("COMMITMENT_SCHEDULE")
 
-        outcome = await self.scheduler.create_due_schedule(request)
-        if isinstance(outcome, ScheduleCreateFailed):
-            # A lost response is indistinguishable from a failure here, so the exact name is
-            # asked about before anything is recorded -- never a second differently named
-            # schedule.
-            described = await self.scheduler.describe_schedule(request.schedule_name)
-            if described is None:
-                return await self._record_failure(command, projection, outcome.reason_code)
+        from hashlib import sha256
+
+        from chorus.application.services.demo_side_effect import SIDE_EFFECT_ACTOR, demo_side_effect
+        from chorus.ports.idempotency import (
+            IdempotencyKey,
+            IdempotencyPartition,
+            IdempotencyPartitionKind,
+            IdempotentCommand,
+        )
+
+        intent_key = IdempotencyKey(
+            partition=IdempotencyPartition(
+                kind=IdempotencyPartitionKind.CASE,
+                namespace=command.namespace,
+                case_id=commitment.case_id,
+            ),
+            command=IdempotentCommand.CREATE_COMMITMENT,
+            actor_id_hash=SIDE_EFFECT_ACTOR,
+            key_hash=Sha256Digest("sha256:" + sha256(request.schedule_name.encode()).hexdigest()),
+        )
+        async with demo_side_effect(
+            key=intent_key,
+            repository=self.idempotency,
+            unit_of_work=self.unit_of_work,
+            clock=self.clock,
+            ids=self.ids,
+        ) as attempt:
+            outcome = await self.scheduler.create_due_schedule(request)
+            if isinstance(outcome, ScheduleCreateFailed):
+                attempt.quiescent = False
+                described = await self.scheduler.describe_schedule(request.schedule_name)
+                if described is None:
+                    # An ambiguous create must keep reset closed even if the immediate
+                    # describe has not observed it. No second name is ever manufactured.
+                    return await self._record_failure(command, projection, outcome.reason_code)
         return await self._record_created(command, projection)
 
     async def _record_created(

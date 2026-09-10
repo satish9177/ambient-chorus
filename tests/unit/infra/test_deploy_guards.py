@@ -201,6 +201,20 @@ def test_lambda_asset_code_refuses_a_missing_artifact_in_deployment_mode(
         lambda_asset_code("chorus-api", offline=False)
 
 
+def test_the_reset_lambda_fails_closed_without_its_built_zip_in_deployment_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review completion B4: the Reset Lambda is Macro A compute and gets the same
+    deployment-capable artifact guarantee as the other five -- a missing
+    ``build/lambda/chorus-demo-reset.zip`` refuses synth, with no silent placeholder."""
+
+    monkeypatch.setattr(lambda_support, "LAMBDA_BUILD_OUTPUT_ROOT", tmp_path)
+    with pytest.raises(LambdaArtifactMissingError):
+        lambda_asset_code("chorus-demo-reset", offline=False)
+    # explicit offline mode is still allowed to use the placeholder
+    assert isinstance(lambda_asset_code("chorus-demo-reset", offline=True), lambda_.Code)
+
+
 def test_lambda_asset_code_uses_the_placeholder_only_in_offline_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

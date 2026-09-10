@@ -36,6 +36,7 @@ from dataclasses import dataclass
 
 from aws_cdk import CfnOutput, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_dynamodb as dynamodb
+from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_logs as logs
@@ -49,6 +50,7 @@ from infra.cdk.lambda_support import (
     compiler_environment,
     load_lambda_manifest,
 )
+from infra.cdk.network_support import vpc_eni_policy_statements
 
 VIEW_KEY_PREFIXES = ("NS#*#VIEW#*", "NS#*#VIEW_CURRENT#*")
 """The only Shareable partitions the compiler may write.
@@ -213,6 +215,10 @@ class ChorusCompilerStack(Stack):
         buckets: CompilerBuckets,
         identities: DeploymentIdentities | None = None,
         offline_synth: bool = True,
+        vpc: ec2.IVpc | None = None,
+        vpc_subnets: ec2.SubnetSelection | None = None,
+        vpc_subnet_arns: list[str] | None = None,
+        security_group: ec2.ISecurityGroup | None = None,
         env: Environment | None = None,
     ) -> None:
         super().__init__(scope, construct_id, env=env)
@@ -268,8 +274,28 @@ class ChorusCompilerStack(Stack):
             ),
             log_group=self.log_group,
             offline_synth=offline_synth,
+            vpc=vpc,
+            vpc_subnets=vpc_subnets,
+            security_groups=[security_group] if security_group is not None else None,
         )
         self.function_arn = self.function.function_arn
+
+        # I16 -> VPC attachment (deployment contract §§ 2, 14-17). The compiler is one of the
+        # three functions that go inside the isolated network -- it holds the private-bucket and
+        # private-key reach, so its network reachability should match its data reach. With an
+        # explicit ``role=`` CDK attaches no ``AWSLambdaVPCAccessExecutionRole``; the exact ENI
+        # permissions are the two inline statements below, bound to this function's ARN and the
+        # two isolated subnets.
+        # The ENI grant names the compiler's **deterministic function ARN literal**, not the
+        # ``Fn::GetAtt`` on the resource: routing the role's policy through the function it is
+        # attached to would be a ``role -> function -> role`` cycle. The physical name is fixed
+        # (``chorus-compiler-{env}``), so the literal resolves to the same ARN.
+        if vpc is not None and vpc_subnet_arns is not None:
+            for eni_statement in vpc_eni_policy_statements(
+                function_arn=self.function_arn_literal, subnet_arns=vpc_subnet_arns
+            ):
+                self.role.add_to_policy(eni_statement)
+
         CfnOutput(self, "CompilerFunctionName", value=self.function.function_name)
         CfnOutput(self, "CompilerFunctionArn", value=self.function.function_arn)
 
@@ -376,6 +402,9 @@ class ChorusCompilerStack(Stack):
                 },
             )
         )
+        from infra.cdk.reset_support import grant_demo_reset_condition
+
+        grant_demo_reset_condition(self.role, tables.core.table_arn)
         self.role.add_to_policy(
             iam.PolicyStatement(
                 sid="AppendAudit",

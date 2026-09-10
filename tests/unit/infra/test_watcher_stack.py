@@ -110,7 +110,15 @@ def test_core_is_denied_in_total() -> None:
     deny = statement("DenyAllCoreAccess")
 
     assert deny["Effect"] == "Deny"
-    assert actions_of(deny) == {"dynamodb:*"}
+    assert deny["NotAction"] == "dynamodb:ConditionCheckItem"
+    lock = statement("ConditionCheckDemoResetLock")
+    assert actions_of(lock) == {"dynamodb:ConditionCheckItem"}
+    assert lock["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["NS#DEMO"]}}
+    other = statement("DenyOtherCoreConditions")
+    assert other["Effect"] == "Deny"
+    assert other["Condition"] == {
+        "ForAnyValue:StringNotEquals": {"dynamodb:LeadingKeys": ["NS#DEMO"]}
+    }
 
 
 @pytest.mark.parametrize(
@@ -147,7 +155,9 @@ def test_the_role_holds_no_core_table_action_at_all() -> None:
         if not any(action.startswith("dynamodb:") for action in actions_of(item)):
             continue
         rendered = json.dumps(item["Resource"])
-        assert core_arn_fragment not in rendered.lower()
+        if core_arn_fragment in rendered.lower():
+            assert item["Sid"] == "ConditionCheckDemoResetLock"
+            assert actions_of(item) == {"dynamodb:ConditionCheckItem"}
 
 
 def test_the_schedule_group_and_encrypted_dead_letter_queue_exist() -> None:

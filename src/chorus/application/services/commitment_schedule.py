@@ -103,6 +103,13 @@ def namespace_hash8(namespace: Namespace) -> str:
     return sha256(namespace.value.encode("utf-8")).hexdigest()[:NAMESPACE_HASH_LENGTH]
 
 
+def schedule_name_prefix(*, environment: str, namespace: Namespace) -> str:
+    """The exact namespace boundary shared by creation and bounded reset listing."""
+    if not environment:
+        raise ValueError("a schedule name requires the deployment environment")
+    return f"chorus-{environment}-{namespace_hash8(namespace)}-"
+
+
 def schedule_name(
     *, environment: str, namespace: Namespace, commitment_id: CommitmentId, generation: int
 ) -> str:
@@ -117,7 +124,8 @@ def schedule_name(
         raise ValueError("schedule generation must be positive")
     if not environment:
         raise ValueError("a schedule name requires the deployment environment")
-    name = f"chorus-{environment}-{namespace_hash8(namespace)}-{commitment_id}-{generation}"
+    prefix = schedule_name_prefix(environment=environment, namespace=namespace)
+    name = f"{prefix}{commitment_id}-{generation}"
     if len(name) > MAX_SCHEDULE_NAME_LENGTH:
         # Asserted before the call rather than discovered at the first live create. The two
         # variable parts are an environment word and a decimal generation, so exceeding the

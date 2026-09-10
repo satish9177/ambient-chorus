@@ -462,6 +462,7 @@ def build_local(settings: Settings, *, storage: StorageDriver | None = None) -> 
     )
     scheduler = InMemoryDeadlineScheduler()
     create_due_schedule = CreateDueSchedule(
+        idempotency=idempotency_shareable,
         shareable=shareable,
         audit=audit,
         unit_of_work=unit_of_work,

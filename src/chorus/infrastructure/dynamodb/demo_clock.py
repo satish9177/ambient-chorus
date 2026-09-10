@@ -45,6 +45,7 @@ from chorus.ports.demo_clock import (
     DemoClockConflictError,
     DemoClockNotAdvancedError,
     DemoClockRecord,
+    DemoClockResetConflictError,
     DemoClockUnavailableError,
 )
 from chorus.ports.errors import PersistenceConflictError, PersistenceError
@@ -53,6 +54,7 @@ from chorus.ports.storage import (
     AttributeEqualsNumber,
     AttributeLessThanNumber,
     ItemKey,
+    KeyAbsent,
     PutItem,
     StorageDriver,
     StoredItem,
@@ -234,6 +236,84 @@ class DynamoDbDemoClockStore:
         return moved
 
 
+@dataclass(frozen=True, slots=True)
+class DynamoDbDemoClockResetStore:
+    """The reset principal's fenced reseed of the one clock row (ADR-029 § 3).
+
+    Deliberately a different type from :class:`DynamoDbDemoClockStore` -- the normal adapter
+    exposes ``read`` and ``advance`` and nothing else, and a test asserts that surface, so the
+    one legitimate backward transition lives only here and is reachable only from the reset
+    role. ``namespace`` is composition configuration, never a caller's field: a store that took
+    it per call would be a store whose exact ``dynamodb:LeadingKeys`` literal could be aimed at
+    a partition the deployment does not have.
+    """
+
+    driver: StorageDriver
+    namespace: Namespace
+
+    async def read(self) -> DemoClockRecord | None:
+        """Strongly read the clock row. ``None`` when absent; fail closed when unparseable."""
+
+        try:
+            item = await self.driver.get_item(demo_clock_key(self.namespace), consistent=True)
+        except PersistenceError as error:
+            raise DemoClockUnavailableError("the demo clock could not be read") from error
+        if item is None:
+            return None
+        try:
+            return decode_demo_clock(self.namespace, item)
+        except (IntegrityError, ValueError) as error:
+            # Present but corrupt: reset never blind-overwrites a row it could not parse.
+            raise DemoClockUnavailableError("the demo clock row is not a clock") from error
+
+    async def reseed(
+        self, *, seed_instant: datetime, current: DemoClockRecord | None
+    ) -> DemoClockRecord:
+        """Bump the generation, restore the seed instant, and start a fresh version sequence.
+
+        One conditional whole-item put (the driver has no attribute-level update path). When
+        ``current`` is ``None`` the condition is "the row does not exist" and the new
+        generation is ``1``; otherwise it is ``current``'s exact ``version`` **and**
+        ``reset_generation``, and the new generation is ``current.reset_generation + 1`` -- a
+        value never previously stored, because the sequence only ever increases.
+        """
+
+        require_utc(seed_instant)
+        new_generation = 1 if current is None else current.reset_generation + 1
+        reseeded = DemoClockRecord(
+            logical_time=seed_instant,
+            version=1,
+            reset_generation=new_generation,
+            seed_instant=seed_instant,
+            advance_count=0,
+        )
+        if current is None:
+            condition: object = KeyAbsent()
+        else:
+            condition = AllOf(
+                (
+                    AttributeEqualsNumber(name=ATTR_VERSION, value=current.version),
+                    AttributeEqualsNumber(
+                        name=ATTR_RESET_GENERATION, value=current.reset_generation
+                    ),
+                )
+            )
+        operation = PutItem(
+            key=demo_clock_key(self.namespace),
+            item=encode_demo_clock(self.namespace, reseeded),
+            condition=condition,  # type: ignore[arg-type]
+        )
+        try:
+            await self.driver.write_item(operation)
+        except PersistenceConflictError as error:
+            raise DemoClockResetConflictError(
+                "the demo clock moved between the reset read and the reseed"
+            ) from error
+        except PersistenceError as error:
+            raise DemoClockUnavailableError("the demo clock could not be reseeded") from error
+        return reseeded
+
+
 __all__ = [
     "ATTR_ADVANCE_COUNT",
     "ATTR_LOGICAL_TIME",
@@ -244,6 +324,7 @@ __all__ = [
     "ATTR_VERSION",
     "DEMO_CLOCK_SCHEMA_VERSION",
     "DEMO_CLOCK_SCHEMA_VERSIONS",
+    "DynamoDbDemoClockResetStore",
     "DynamoDbDemoClockStore",
     "decode_demo_clock",
     "demo_clock_key",

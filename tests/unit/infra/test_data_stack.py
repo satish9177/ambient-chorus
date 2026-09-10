@@ -189,6 +189,10 @@ def test_the_application_synthesizes_every_declared_stack() -> None:
 
     assert {stack.stack_name for stack in assembly.stacks} == {
         "AmbientChorusFoundation",
+        # Phase 11 Macro A: the dedicated isolated network is foundational (deployment
+        # contract §§ 6-9, 16). It references only ARN literals, so it takes no dependency on
+        # Data and stays first in the DAG.
+        "AmbientChorusNetwork",
         "AmbientChorusData",
         "AmbientChorusAgents",
         "AmbientChorusCompiler",
@@ -205,6 +209,10 @@ def test_the_application_synthesizes_every_declared_stack() -> None:
         # until now -- ``Share: R/W(commitment/case projection)`` mislocated the case row into a
         # table the watcher is denied outright (ADR-028 § 6). Deployed by Phase 11.
         "AmbientChorusWatcher",
+        # Phase 11 Macro A: the dedicated reset authority and the base observability stack
+        # (deployment contract §§ 12, 19-30).
+        "AmbientChorusReset",
+        "AmbientChorusObservability",
     }
 
 

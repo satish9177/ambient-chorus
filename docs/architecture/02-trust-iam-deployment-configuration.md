@@ -1,5 +1,11 @@
 # Trust zones, IAM, deployment, and configuration
 
+**Phase 11 reset correction:** [ADR-031](../adr/ADR-031-demo-reset-mutation-interlock.md)
+adds an exact Core `NS#DEMO` reset-lock absence condition to every normal DEMO mutation.
+Sender/watcher still cannot read or write Core items; their total Core deny has only this
+condition-only exception. Compiler receives the same condition capability. Existing role
+descriptions below that say "no Core access" exclude this one reset interlock.
+
 ## Trust-zone diagram
 
 ```mermaid
@@ -56,8 +62,8 @@ Trust is directional. Data moving right is re-modeled into narrower types, not p
 | Investigator runtime | D | D | — | D | D | — | — | — | D | D | D | D |
 | Compiler Lambda | R(all)/W(`FENCE` partition only) | R(all safe)/W(view only) | W | R | W | — | — | — | — | D | D | D |
 | Action runtime | D | D | — | D | D | — | — | — | D | D | D | D |
-| Sender Lambda | D | R(all safe)/W(`EXECUTION` partition only) | W | D | D | — | — | — | I(fence API only) | — | D | S |
-| Commitment watcher | D | R/W(`NS#*#CASE#*` only) + R(`NS#DEMO#CLOCK` exactly)‡ | W | D | D | — | — | — | D | D | D | D |
+| Sender Lambda | D except condition-only reset interlock (ADR-031) | R(all safe)/W(`EXECUTION` partition only) | W | D | D | — | — | — | I(fence API only) | — | D | S |
+| Commitment watcher | D except condition-only reset interlock (ADR-031) | R/W(`NS#*#CASE#*` only) + R(`NS#DEMO#CLOCK` exactly)‡ | W | D | D | — | — | — | D | D | D | D |
 | Scheduler execution role | D | D | D | D | D | — | — | — | D | D | — | D; invokes watcher only |
 | Demo reset (operational) | RW(`NS#DEMO*` only) | RW(`NS#DEMO*` only) | RW(`NS#DEMO*` only) | RW(`ns/DEMO/` only) | RW(`ns/DEMO/` only) | — | — | — | — | — | List/Delete in `chorus-{env}` only | D |
 

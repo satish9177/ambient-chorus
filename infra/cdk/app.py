@@ -34,6 +34,7 @@ from infra.cdk.config import (
     DeploymentIdentities,
     offline_synth_requested,
 )
+from infra.cdk.network_support import NetworkConfig
 from infra.cdk.stacks import (
     ApplicationBuckets,
     ApplicationTables,
@@ -42,10 +43,15 @@ from infra.cdk.stacks import (
     ChorusCompilerStack,
     ChorusDataStack,
     ChorusFoundationStack,
+    ChorusNetworkStack,
+    ChorusObservabilityStack,
+    ChorusResetStack,
     ChorusSenderStack,
     ChorusWatcherStack,
     CompilerBuckets,
     CompilerTables,
+    ResetBuckets,
+    ResetTables,
     SenderBuckets,
     SenderTables,
     WatcherBuckets,
@@ -99,9 +105,25 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
     identities = DeploymentIdentities.from_context(
         config.environment, app.node.try_get_context, offline=offline_synth
     )
+    network_config = NetworkConfig.from_context(app.node.try_get_context, offline=offline_synth)
     env = _stack_env(config)
 
+    artifact_bucket_arn = f"arn:aws:s3:::chorus-agent-artifacts-{config.environment}"
+
     ChorusFoundationStack(app, "AmbientChorusFoundation", config=config, env=env)
+
+    # Macro A: the isolated network is foundational (deployment contract §§ 6-9, 16, 18). It
+    # references only deterministic ARN literals, so it takes no dependency on Data and stays
+    # first in the DAG; the three VPC-attached compute stacks depend on it.
+    network = ChorusNetworkStack(
+        app,
+        "AmbientChorusNetwork",
+        config=config,
+        network=network_config,
+        artifact_bucket_arn=artifact_bucket_arn,
+        env=env,
+    )
+
     data = ChorusDataStack(app, "AmbientChorusData", config=config, env=env)
     # The customer artifact bucket is a third bucket, separate from both evidence buckets and
     # their keys, because agent code is not evidence (deployment contract SS 6). Its ARN is a
@@ -111,7 +133,7 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
         "AmbientChorusAgents",
         config=config,
         env=env,
-        artifact_bucket_arn=f"arn:aws:s3:::chorus-agent-artifacts-{config.environment}",
+        artifact_bucket_arn=artifact_bucket_arn,
     )
     compiler = ChorusCompilerStack(
         app,
@@ -129,6 +151,10 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
             private_key=data.private_evidence_key,
             export_key=data.export_evidence_key,
         ),
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        vpc_subnet_arns=network.isolated_subnet_arns,
+        security_group=network.compiler_security_group,
     )
     # The sender invokes the compiler for both halves of the send fence, so it takes the
     # compiler's **actual function ARN** (review P2-2); batch 5 also always wires its
@@ -147,6 +173,10 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
         buckets=SenderBuckets(
             private=data.private_evidence_bucket, export=data.export_evidence_bucket
         ),
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        vpc_subnet_arns=network.isolated_subnet_arns,
+        security_group=network.sender_security_group,
     )
     # Created before Application because the application's narrowed scheduler grant names this
     # stack's schedule group and passes this stack's execution role. Batch 5 adds the watcher
@@ -193,6 +223,48 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
         # The actual ``Alias`` resource ARN, so ``POST /v1/demo/clock/advance`` invokes the same
         # ``:live`` identity the scheduler does (deployment contract SS 8.1, SS 38, SS 46).
         watcher_alias_arn=watcher.watcher_alias_arn,
+        # I16 -> the **worker** is VPC-attached; the API is not (deployment contract SS 2).
+        worker_vpc=network.vpc,
+        worker_vpc_subnets=network.isolated_subnet_selection,
+        worker_vpc_subnet_arns=network.isolated_subnet_arns,
+        worker_security_group=network.worker_security_group,
+    )
+
+    # Macro A: the dedicated reset authority (deployment contract §§ 12, 19-26, DAG stage 11).
+    # Its own narrow role, VPC-attached to the isolated network's reset security group, with no
+    # public route. It names only DEMO-namespace-bounded resources.
+    reset = ChorusResetStack(
+        app,
+        "AmbientChorusReset",
+        config=config,
+        env=env,
+        offline_synth=offline_synth,
+        tables=ResetTables(
+            core=data.core_table, shareable=data.shareable_table, audit=data.audit_table
+        ),
+        buckets=ResetBuckets(
+            private=data.private_evidence_bucket,
+            export=data.export_evidence_bucket,
+            private_key=data.private_evidence_key,
+            export_key=data.export_evidence_key,
+        ),
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        vpc_subnet_arns=network.isolated_subnet_arns,
+        security_group=network.reset_security_group,
+    )
+
+    # Macro A: base observability (deployment contract §§ 27-30, DAG stage 12). Lambda error
+    # alarms for every function that exists after Macro A, and one ``chorus-{env}`` dashboard.
+    # AgentCore alarms are Macro B. It references the watcher DLQ and the HTTP API by their
+    # deterministic identities, so it is last and depends on nothing structurally.
+    observability = ChorusObservabilityStack(
+        app,
+        "AmbientChorusObservability",
+        config=config,
+        env=env,
+        dead_letter_queue_name=watcher.dead_letter_queue.queue_name,
+        http_api_id=application.http_api.http_api_id,
     )
 
     # A principal's stack deploys after every resource its policy names (deployment contract
@@ -202,6 +274,16 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
     application.add_stack_dependency(compiler)
     application.add_stack_dependency(sender)
     application.add_stack_dependency(watcher)
+    # Network is foundational: every VPC-attached compute stack deploys after it.
+    compiler.add_stack_dependency(network)
+    sender.add_stack_dependency(network)
+    application.add_stack_dependency(network)
+    reset.add_stack_dependency(network)
+    reset.add_stack_dependency(data)
+    # Observability is last: it names the alarmed functions, the watcher DLQ, and the HTTP API.
+    observability.add_stack_dependency(application)
+    observability.add_stack_dependency(watcher)
+    observability.add_stack_dependency(reset)
 
     return app
 

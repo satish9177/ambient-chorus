@@ -9,6 +9,9 @@ from infra.cdk.stacks.application import (
 from infra.cdk.stacks.compiler import ChorusCompilerStack, CompilerBuckets, CompilerTables
 from infra.cdk.stacks.data import ChorusDataStack
 from infra.cdk.stacks.foundation import ChorusFoundationStack
+from infra.cdk.stacks.network import ChorusNetworkStack
+from infra.cdk.stacks.observability import ChorusObservabilityStack
+from infra.cdk.stacks.reset import ChorusResetStack, ResetBuckets, ResetTables
 from infra.cdk.stacks.sender import ChorusSenderStack, SenderBuckets, SenderTables
 from infra.cdk.stacks.watcher import ChorusWatcherStack, WatcherBuckets, WatcherTables
 
@@ -20,10 +23,15 @@ __all__ = [
     "ChorusCompilerStack",
     "ChorusDataStack",
     "ChorusFoundationStack",
+    "ChorusNetworkStack",
+    "ChorusObservabilityStack",
+    "ChorusResetStack",
     "ChorusSenderStack",
     "ChorusWatcherStack",
     "CompilerBuckets",
     "CompilerTables",
+    "ResetBuckets",
+    "ResetTables",
     "SenderBuckets",
     "SenderTables",
     "WatcherBuckets",

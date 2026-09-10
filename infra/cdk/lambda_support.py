@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Final
 
 from aws_cdk import Duration
+from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
@@ -104,12 +105,21 @@ def chorus_lambda(
     log_group: logs.ILogGroup,
     offline_synth: bool,
     current_version_options: lambda_.VersionOptions | None = None,
+    vpc: ec2.IVpc | None = None,
+    vpc_subnets: ec2.SubnetSelection | None = None,
+    security_groups: list[ec2.ISecurityGroup] | None = None,
 ) -> lambda_.Function:
     """Build one production Lambda from its manifest and its pre-existing identity.
 
     ``function_name`` is ``{manifest.name}-{config.environment}`` -- taken straight from the
     configured environment string, never parsed out of a token (review P2-1). ``role`` is the
-    stack's already-synthesized execution role, so CDK attaches no managed policy (SS 43).
+    stack's already-synthesized execution role, so CDK attaches no managed policy (SS 43) --
+    **including** ``AWSLambdaVPCAccessExecutionRole`` when ``vpc`` is set: with an explicit
+    ``role=`` CDK adds no VPC-access policy, and the exact inline ENI permissions come from
+    :func:`infra.cdk.network_support.vpc_eni_policy_statements` on the caller's role instead
+    (deployment contract §§ 14-17). ``vpc`` / ``vpc_subnets`` / ``security_groups`` are supplied
+    only for the three VPC-attached functions (worker, compiler, sender); the API and watcher
+    pass none and synthesize with no ``VpcConfig`` (§ 2).
     """
 
     runtime = RUNTIME_BY_PYTHON.get(manifest.python_version)
@@ -134,6 +144,10 @@ def chorus_lambda(
         memory_size=manifest.memory_mb,
         log_group=log_group,
         current_version_options=current_version_options,
+        vpc=vpc,
+        vpc_subnets=vpc_subnets if vpc is not None else None,
+        security_groups=security_groups if vpc is not None else None,
+        allow_public_subnet=False,
     )
 
 
@@ -334,6 +348,37 @@ def sender_environment(
     }
 
 
+def demo_reset_environment(
+    *,
+    config: CdkBuildConfig,
+    names: ResourceNames,
+    private_evidence_key_arn: str,
+    export_evidence_key_arn: str,
+) -> dict[str, str]:
+    """The dedicated demo reset function (deployment contract §§ 12, 19-26; review R5-D).
+
+    All three tables and both evidence buckets (the reset principal purges every DEMO-namespace
+    partition and every ``ns/DEMO/`` object prefix, and deterministically reseeds the two
+    fixture evidence objects), the two evidence KMS key ARNs (``S3ObjectStore`` passes the
+    private one as ``SSEKMSKeyId`` on the reseed write), the schedule group, and the demo clock
+    flag. **No secret ARN of any kind** -- the reset principal reads no secret (§ 26), and no
+    model / SES / worker / compiler ARN, because it invokes nothing.
+    """
+
+    return {
+        **_base_environment(config),
+        **_tables(names),
+        **_demo_agent_mode(config),
+        "CHORUS_DEMO_CLOCK_ENABLED": DEMO_CLOCK_ENABLED,
+        "CHORUS_PRIVATE_EVIDENCE_BUCKET": names.private_evidence_bucket,
+        "CHORUS_EXPORT_EVIDENCE_BUCKET": names.export_evidence_bucket,
+        "CHORUS_PRIVATE_EVIDENCE_KEY_ARN": private_evidence_key_arn,
+        "CHORUS_EXPORT_EVIDENCE_KEY_ARN": export_evidence_key_arn,
+        "CHORUS_SCHEDULER_GROUP": names.scheduler_group,
+        "CHORUS_SCHEDULER_ENVIRONMENT": config.scheduler_environment,
+    }
+
+
 def watcher_environment(
     *,
     config: CdkBuildConfig,
@@ -363,6 +408,7 @@ __all__ = [
     "artifact_is_built",
     "chorus_lambda",
     "compiler_environment",
+    "demo_reset_environment",
     "lambda_asset_code",
     "load_lambda_manifest",
     "sender_environment",

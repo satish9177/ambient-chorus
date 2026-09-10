@@ -48,6 +48,7 @@ from aws_cdk import CfnOutput, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_apigatewayv2 as apigwv2
 from aws_cdk import aws_apigatewayv2_integrations as apigwv2_integrations
 from aws_cdk import aws_dynamodb as dynamodb
+from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_lambda as lambda_
@@ -63,6 +64,7 @@ from infra.cdk.lambda_support import (
     load_lambda_manifest,
     worker_environment,
 )
+from infra.cdk.network_support import vpc_eni_policy_statements
 
 VIEW_KEY_PREFIXES = ("NS#*#VIEW#*", "NS#*#VIEW_CURRENT#*")
 """The compiler-owned Shareable partitions. The application reads and condition-checks these
@@ -319,6 +321,10 @@ class ChorusApplicationStack(Stack):
         destination_registry_secret_arn: str | None = None,
         identities: DeploymentIdentities | None = None,
         offline_synth: bool = True,
+        worker_vpc: ec2.IVpc | None = None,
+        worker_vpc_subnets: ec2.SubnetSelection | None = None,
+        worker_vpc_subnet_arns: list[str] | None = None,
+        worker_security_group: ec2.ISecurityGroup | None = None,
         env: Environment | None = None,
     ) -> None:
         super().__init__(scope, construct_id, env=env)
@@ -422,7 +428,31 @@ class ChorusApplicationStack(Stack):
             ),
             log_group=self.worker_log_group,
             offline_synth=offline_synth,
+            vpc=worker_vpc,
+            vpc_subnets=worker_vpc_subnets,
+            security_groups=(
+                [worker_security_group] if worker_security_group is not None else None
+            ),
         )
+
+        # I16 -> VPC attachment (deployment contract §§ 2, 14-17). The **worker** goes inside
+        # the isolated network -- it invokes the AgentCore runtimes, which are VPC-only. The
+        # **API stays out** (§ 2): it is a request-path front end behind API Gateway, placing it
+        # in the VPC buys no boundary and adds ENI cold-start latency to the one component a
+        # presenter waits on. So only ``worker_role`` receives ENI permissions, and only when
+        # the worker is actually VPC-attached; ``api_role`` never does.
+        worker_function_arn_literal = (
+            f"arn:aws:lambda:{region}:{self.account}:function:{self.worker_function_name}"
+        )
+        # The ENI grant names the worker's **deterministic function ARN literal**, not the
+        # ``Fn::GetAtt`` -- routing the worker role's policy through the worker function would be
+        # a ``role -> function -> role`` cycle.
+        if worker_vpc is not None and worker_vpc_subnet_arns is not None:
+            for eni_statement in vpc_eni_policy_statements(
+                function_arn=worker_function_arn_literal,
+                subnet_arns=worker_vpc_subnet_arns,
+            ):
+                self.worker_role.add_to_policy(eni_statement)
 
         self.api_function_name = f"chorus-api-{config.environment}"
         self.api_function = chorus_lambda(

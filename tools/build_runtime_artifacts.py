@@ -511,15 +511,23 @@ def scan_secret_matches(text: str) -> list[tuple[str, str]]:
     return out
 
 
+_PHOTO_RESOURCE = "chorus/infrastructure/fixtures/data/elevator-v1/evidence/elevator-e42.jpg"
+REVIEWED_BINARY_RESOURCES = {
+    # Frozen synthetic fixture, independently pinned here as well as by its runtime manifest.
+    # A manifest edit cannot authorize new binary bytes to evade the first-party scanner.
+    _PHOTO_RESOURCE: "25cf0f0ce42f8acd9ea6facc223f54105c7fd0cce63fb7bb5d83e6600100acbd",
+}
+
+
 def secret_content_problem(name: str, data: bytes, *, first_party: bool) -> str | None:
     """Refuse a file whose *content* is credential-shaped.
 
     The two classes are decoded differently, and deliberately so.
 
-    **First-party** content is always read, through :func:`decode_first_party`, which honours a
-    Python source encoding declaration and raises rather than skipping. Every first-party path
-    is on a runtime's allowlist and every one of them is source or configuration, so "this is
-    binary" is never a true answer here -- it is only ever a way to not look.
+    **First-party** content is always read. Source uses :func:`decode_first_party`, which
+    honours Python encoding declarations and raises rather than skipping. The one reviewed
+    synthetic binary resource must match an independent exact-path/digest pin, then has every
+    byte scanned for the same credential patterns. All unknown binary resources are refused.
 
     **Vendored** content may genuinely be binary: a compiled extension is not text, and decoding
     one would report whatever byte sequence happened to resemble a pattern. Those are skipped by
@@ -530,7 +538,15 @@ def secret_content_problem(name: str, data: bytes, *, first_party: bool) -> str 
     """
 
     if first_party:
-        text = decode_first_party(name, data)
+        if name in REVIEWED_BINARY_RESOURCES:
+            if sha256(data).hexdigest() != REVIEWED_BINARY_RESOURCES[name]:
+                return f"reviewed binary resource digest mismatch: {name}"
+            # Scan all bytes for the same ASCII credential/private-key patterns. This is
+            # neither a binary skip nor a filename-only exception; both identity checks
+            # above are mandatory and all other first-party binaries are still refused.
+            text = data.decode("latin-1")
+        else:
+            text = decode_first_party(name, data)
     else:
         if name in VENDOR_CONTENT_EXCEPTIONS:
             return None

@@ -1,5 +1,5 @@
 """Can an unpacked Lambda ZIP resolve and import its own handler -- using its **own**
-dependency tree, not the host's? Asked of the five real artifacts the session build fixture
+dependency tree, not the host's? Asked of the six real artifacts the session build fixture
 produces (review P2-5, P2-6; deployment contract SS 9, SS 47).
 
 Each archive is unpacked into a directory outside the repository, with the repository checkout,
@@ -107,7 +107,25 @@ for name in ("importlib", "json", "pathlib"):
     stdlib[name] = _origin(importlib.import_module(name))
 
 cache = getattr(mod, "_composition", getattr(mod, "_adapter", "missing"))
+fixture_count = None
+if handler_module == "functions.demo_reset.handler":
+    from functions.demo_reset.composition import DemoResetSettings, build_demo_reset
+    settings = DemoResetSettings(
+        region="us-east-1", environment="demo", namespace="DEMO",
+        core_table="core", shareable_table="shareable", audit_table="audit",
+        private_evidence_bucket="private-evidence", export_evidence_bucket="export-evidence",
+        private_evidence_key_arn="arn:aws:kms:us-east-1:111111111111:key/private",
+        export_evidence_key_arn="arn:aws:kms:us-east-1:111111111111:key/export",
+        scheduler_group="chorus-demo", scheduler_environment="demo",
+        destination_id="property_manager:demo", destination_display_label="Property manager",
+        destination_registry_version=1,
+        destination_routing_token="11111111-1111-4111-8111-111111111111",
+    )
+    reset = build_demo_reset(settings).reset
+    reset.seeder._validate_frozen_fixture_snapshot()
+    fixture_count = len(reset.seeder.adapter.messages())
 sys.stdout.write("PROBE:" + json.dumps({
+    "fixture_count": fixture_count,
     "handler_callable": callable(mod.handler),
     "handler_file": _origin(mod),
     "chorus_file": _origin(chorus.settings),
@@ -178,6 +196,25 @@ def _report(completed: subprocess.CompletedProcess[str]) -> dict[str, object]:
     return parsed
 
 
+def test_reset_zip_contains_and_validates_the_exact_frozen_resources(
+    built_artifact_paths: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    from chorus.infrastructure.fixtures.synthetic_feed import SyntheticAmbientAdapter
+
+    destination = tmp_path / "reset-resources"
+    with zipfile.ZipFile(built_artifact_paths["demo_reset"]) as archive:
+        archive.extractall(destination)
+    packaged = destination / "chorus/infrastructure/fixtures/data/elevator-v1"
+    source = REPOSITORY_ROOT / "demo/fixtures/elevator-v1"
+    for path in source.rglob("*"):
+        if path.is_file():
+            assert (packaged / path.relative_to(source)).read_bytes() == path.read_bytes()
+    adapter = SyntheticAmbientAdapter(root=packaged)
+    assert adapter.seed_version == "elevator/v1"
+    assert len(adapter.messages()) == 24
+
+
 def test_the_archive_resolves_its_handler_with_only_the_archive_on_the_path(
     extracted: Path, manifest: build.LambdaManifest
 ) -> None:
@@ -225,6 +262,8 @@ def test_the_handler_imports_with_the_artifacts_own_dependency_tree(
     )
     assert report["handler_callable"] is True
     assert report["composition_cache_is_none"] is True
+    if directory == "demo_reset":
+        assert report["fixture_count"] == 24
 
     for key in ("handler_file", "chorus_file"):
         loaded = report[key]

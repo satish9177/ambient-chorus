@@ -119,7 +119,14 @@ def test_each_function_matches_its_manifest_exactly(directory: str) -> None:
     assert props["Timeout"] == manifest.timeout_seconds
     assert props["MemorySize"] == manifest.memory_mb
     assert "ReservedConcurrentExecutions" not in props  # SS 36: none until measured
-    assert "VpcConfig" not in props  # SS 32-33: network attachment still deferred
+    # Phase 11 Macro A (deployment contract § 2): the worker, compiler, and sender are attached
+    # to the isolated network's two subnets; the API and the watcher deliberately are not. The
+    # exact subnet/SG/ENI assertions live in ``test_vpc_lambda_placement.py`` and
+    # ``test_eni_iam.py``.
+    if directory in ("worker", "compiler", "sender"):
+        assert len(props["VpcConfig"]["SubnetIds"]) == 2
+    else:
+        assert "VpcConfig" not in props
 
 
 # -- SS 42-43: the pre-existing role, no managed policy ---------------------------------

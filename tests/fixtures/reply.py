@@ -305,6 +305,7 @@ class ReplyHarness:
 
     def create_schedule(self) -> CreateDueSchedule:
         return CreateDueSchedule(
+            idempotency=self.send.action.compile.idempotency,
             shareable=self.send.action.compile.shareable,
             audit=self.send.action.compile.audit,
             unit_of_work=self.send.action.unit_of_work,  # type: ignore[arg-type]

@@ -95,6 +95,7 @@ def _schedule_command(
 
 def _create_due_schedule(harness: ReplyHarness, *, wall_clock: FixedClock) -> CreateDueSchedule:
     return CreateDueSchedule(
+        idempotency=harness.send.action.compile.idempotency,
         shareable=harness.send.action.compile.shareable,
         audit=harness.send.action.compile.audit,
         unit_of_work=harness.send.action.unit_of_work,  # type: ignore[arg-type]

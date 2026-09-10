@@ -1,7 +1,7 @@
 """The first-party Lambda packaging tool: deterministic, lock-based, and gated (SS 6, SS 8, SS 47).
 
 The tests that need a finished archive depend on the ``built_lambda_artifacts`` session fixture
-(``conftest.py``), which builds all five ZIPs once into a temp directory -- so a clean checkout
+(``conftest.py``), which builds all six ZIPs once into a temp directory -- so a clean checkout
 proves the build and the final-ZIP scans without a checked-in artifact and without a silent
 skip (review P2-5). Everything else (the manifest schema, the command argv, the path remap, the
 narrow secret-scan exceptions) runs unconditionally.
@@ -43,13 +43,14 @@ def test_every_function_declares_a_complete_manifest(directory: str) -> None:
     assert manifest.first_party  # a non-empty allowlist
 
 
-def test_the_five_functions_are_exactly_the_production_set() -> None:
+def test_the_functions_are_exactly_the_production_set() -> None:
     assert set(build.FUNCTION_DIRS) == {
         "api",
         "worker",
         "compiler",
         "sender",
         "commitment_watcher",
+        "demo_reset",
     }
     names = {build.load_lambda_manifest(d).name for d in build.FUNCTION_DIRS}
     assert names == {
@@ -58,6 +59,7 @@ def test_the_five_functions_are_exactly_the_production_set() -> None:
         "chorus-compiler",
         "chorus-sender",
         "chorus-commitment-watcher",
+        "chorus-demo-reset",
     }
 
 
@@ -158,6 +160,17 @@ def test_inspect_requires_the_handler_module_and_the_shared_package(tmp_path: Pa
 
 
 # -- the real archives (built by the session fixture; no skip) ----------------------------
+
+
+def test_reviewed_fixture_binary_is_digest_bound_and_never_an_arbitrary_binary_bypass() -> None:
+    from tools.build_runtime_artifacts import UndecodableFirstPartyError, secret_content_problem
+
+    path = "chorus/infrastructure/fixtures/data/elevator-v1/evidence/elevator-e42.jpg"
+    data = (REPOSITORY_ROOT / "demo/fixtures/elevator-v1/evidence/elevator-e42.jpg").read_bytes()
+    assert secret_content_problem(path, data, first_party=True) is None
+    assert secret_content_problem(path, data + b"changed", first_party=True) is not None
+    with pytest.raises(UndecodableFirstPartyError):
+        secret_content_problem("arbitrary.jpg", data, first_party=True)
 
 
 @pytest.fixture(params=build.FUNCTION_DIRS)
