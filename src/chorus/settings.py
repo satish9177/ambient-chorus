@@ -123,12 +123,29 @@ class Settings(BaseSettings):
     """
     destination_address_digest: str | None = None
     inbound_address_digest: str | None = None
-    """The two non-secret comparison tokens of ADR-026 § 3.
+    """The two non-secret comparison tokens of ADR-026 § 3 (and ADR-030 §§ 5-6).
 
     Digests and never addresses: the destination-address secret belongs to the sender alone,
     and the inbound principal must not become a second holder. They are ordinary deployment
     configuration in the same class as the safe destination label, the registry version, and
     the routing token -- non-secret, naming no mailbox, and never accepted as a credential.
+    ``inbound_address_digest`` is compared against every entry of ``receipt.recipients``
+    (ADR-030 § 6); ``destination_address_digest`` against the parsed RFC 5322 ``From`` mailbox
+    (ADR-030 § 5).
+    """
+    inbound_receiving_address: str | None = None
+    """The non-secret inbound mailbox the SES receipt rule matches on.
+
+    Names a mailbox, so it is deployment configuration rather than a value read from a delivery.
+    The inbound Lambda derives ``inbound_address_digest`` from it when that digest is not set
+    explicitly, so a deploy that configures one of the two need not configure both.
+    """
+    inbound_topic_arn: str | None = None
+    """The SNS topic ARN the inbound Lambda is subscribed to.
+
+    The adapter's *consistency check* only (ADR-030 § 2): ``Records[i].Sns.TopicArn`` must equal
+    it. It is never proof of origin -- the resource-policy chain is -- and it is never compared
+    with ``inbound_source_arn`` (the two ARNs are distinct and describe different resources).
     """
     ses_configuration_set: str = "chorus-development"
     ses_from_identity_id: str = Field(

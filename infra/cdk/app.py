@@ -43,6 +43,7 @@ from infra.cdk.stacks import (
     ChorusCompilerStack,
     ChorusDataStack,
     ChorusFoundationStack,
+    ChorusInboundStack,
     ChorusNetworkStack,
     ChorusObservabilityStack,
     ChorusResetStack,
@@ -128,12 +129,19 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
     # The customer artifact bucket is a third bucket, separate from both evidence buckets and
     # their keys, because agent code is not evidence (deployment contract SS 6). Its ARN is a
     # literal derived from the environment token; no bucket resource is created here.
-    ChorusAgentStack(
+    agents = ChorusAgentStack(
         app,
         "AmbientChorusAgents",
         config=config,
         env=env,
         artifact_bucket_arn=artifact_bucket_arn,
+        artifact_bucket_name=data.agent_artifact_bucket.bucket_name,
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        monitor_security_group=network.monitor_runtime_security_group,
+        investigator_security_group=network.investigator_runtime_security_group,
+        action_security_group=network.action_runtime_security_group,
+        offline_synth=offline_synth,
     )
     compiler = ChorusCompilerStack(
         app,
@@ -196,10 +204,18 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
             private=data.private_evidence_bucket, export=data.export_evidence_bucket
         ),
     )
-    # Batch 5 adds the API and worker Lambdas and the HTTP API here. Application receives the
-    # compiler and sender **actual function ARNs**, the watcher ``live`` Alias resource ARN, the
-    # scheduler identity, and the secret identities; the worker is created in this stack, so the
-    # API binds to it directly.
+    agent_live_endpoint_arns: tuple[str, str, str] | None = None
+    if (
+        agents.monitor_live_endpoint is not None
+        and agents.investigator_live_endpoint is not None
+        and agents.action_live_endpoint is not None
+    ):
+        agent_live_endpoint_arns = (
+            agents.monitor_live_endpoint.agent_runtime_endpoint_arn,
+            agents.investigator_live_endpoint.agent_runtime_endpoint_arn,
+            agents.action_live_endpoint.agent_runtime_endpoint_arn,
+        )
+
     application = ChorusApplicationStack(
         app,
         "AmbientChorusApplication",
@@ -216,6 +232,7 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
             private_key=data.private_evidence_key,
             export_key=data.export_evidence_key,
         ),
+        agent_live_endpoint_arns=agent_live_endpoint_arns,
         scheduler_group_name=watcher.schedule_group_name,
         scheduler_role_arn=watcher.scheduler_role_arn_literal,
         compiler_function_arn=compiler.function.function_arn,
@@ -228,6 +245,30 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
         worker_vpc_subnets=network.isolated_subnet_selection,
         worker_vpc_subnet_arns=network.isolated_subnet_arns,
         worker_security_group=network.worker_security_group,
+    )
+
+    # Phase 11 Macro B: Inbound SES transport (deployment contract § 10, DAG stage 10).
+    inbound_receiving_address = (
+        app.node.try_get_context("inbound_receiving_address") or "reply@inbound.demo.invalid"
+    )
+    inbound = ChorusInboundStack(
+        app,
+        "AmbientChorusInbound",
+        config=config,
+        env=env,
+        identities=identities,
+        offline_synth=offline_synth,
+        private_evidence_bucket=data.private_evidence_bucket,
+        private_evidence_key=data.private_evidence_key,
+        core_table=data.core_table,
+        shareable_table=data.shareable_table,
+        audit_table=data.audit_table,
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        vpc_subnet_arns=network.isolated_subnet_arns,
+        security_group=network.inbound_security_group,
+        inbound_source_arn=identities.inbound_source_arn,
+        inbound_receiving_address=inbound_receiving_address,
     )
 
     # Macro A: the dedicated reset authority (deployment contract §§ 12, 19-26, DAG stage 11).
@@ -265,6 +306,12 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
         env=env,
         dead_letter_queue_name=watcher.dead_letter_queue.queue_name,
         http_api_id=application.http_api.http_api_id,
+        monitor_runtime=agents.monitor_runtime,
+        investigator_runtime=agents.investigator_runtime,
+        action_runtime=agents.action_runtime,
+        monitor_live_endpoint=agents.monitor_live_endpoint,
+        investigator_live_endpoint=agents.investigator_live_endpoint,
+        action_live_endpoint=agents.action_live_endpoint,
     )
 
     # A principal's stack deploys after every resource its policy names (deployment contract
@@ -274,16 +321,25 @@ def build_app(*, offline: bool | None = None, context: dict[str, str] | None = N
     application.add_stack_dependency(compiler)
     application.add_stack_dependency(sender)
     application.add_stack_dependency(watcher)
+    application.add_stack_dependency(agents)
     # Network is foundational: every VPC-attached compute stack deploys after it.
+    agents.add_stack_dependency(network)
+    agents.add_stack_dependency(data)
     compiler.add_stack_dependency(network)
     sender.add_stack_dependency(network)
     application.add_stack_dependency(network)
+    inbound.add_stack_dependency(network)
+    inbound.add_stack_dependency(data)
+    inbound.add_stack_dependency(application)
     reset.add_stack_dependency(network)
     reset.add_stack_dependency(data)
-    # Observability is last: it names the alarmed functions, the watcher DLQ, and the HTTP API.
+    # Observability is last: it names the alarmed functions, the watcher DLQ, the HTTP API,
+    # and the agent runtimes.
     observability.add_stack_dependency(application)
     observability.add_stack_dependency(watcher)
+    observability.add_stack_dependency(inbound)
     observability.add_stack_dependency(reset)
+    observability.add_stack_dependency(agents)
 
     return app
 

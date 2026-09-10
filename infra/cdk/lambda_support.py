@@ -262,12 +262,15 @@ def api_environment(
 def worker_environment(
     *,
     config: CdkBuildConfig,
-    identities: DeploymentIdentities,
     names: ResourceNames,
+    monitor_runtime_arn: str | None = None,
+    investigator_runtime_arn: str | None = None,
+    action_runtime_arn: str | None = None,
     compiler_function_arn: str,
     sender_function_arn: str,
     watcher_alias_arn: str,
     scheduler_role_arn: str,
+    identities: DeploymentIdentities | None = None,
 ) -> dict[str, str]:
     """The asynchronous operation worker (deployment contract SS 14).
 
@@ -277,13 +280,18 @@ def worker_environment(
     every ``GetSecretValue`` (SS 40). The watcher ARN is the scheduler's ``:live`` target (SS 37).
     """
 
+    if identities is not None:
+        monitor_runtime_arn = monitor_runtime_arn or identities.monitor_runtime_arn
+        investigator_runtime_arn = investigator_runtime_arn or identities.investigator_runtime_arn
+        action_runtime_arn = action_runtime_arn or identities.action_runtime_arn
+
     return {
         **_base_environment(config),
         **_tables(names),
         **_demo_agent_mode(config),
-        "CHORUS_MONITOR_RUNTIME_ARN": identities.monitor_runtime_arn,
-        "CHORUS_INVESTIGATOR_RUNTIME_ARN": identities.investigator_runtime_arn,
-        "CHORUS_ACTION_RUNTIME_ARN": identities.action_runtime_arn,
+        "CHORUS_MONITOR_RUNTIME_ARN": monitor_runtime_arn or "",
+        "CHORUS_INVESTIGATOR_RUNTIME_ARN": investigator_runtime_arn or "",
+        "CHORUS_ACTION_RUNTIME_ARN": action_runtime_arn or "",
         "CHORUS_AGENT_TIMEOUT_SECONDS": "90",
         "CHORUS_DEMO_CLOCK_ENABLED": DEMO_CLOCK_ENABLED,
         "CHORUS_SES_CONFIGURATION_SET": names.ses_configuration_set,
@@ -399,6 +407,37 @@ def watcher_environment(
     }
 
 
+def inbound_environment(
+    *,
+    config: CdkBuildConfig,
+    names: ResourceNames,
+    private_evidence_key_arn: str,
+    inbound_source_arn: str,
+    inbound_receiving_address: str,
+    inbound_topic_arn: str | None = None,
+) -> dict[str, str]:
+    """The inbound reply entry point (deployment contract § 10; ADR-026, ADR-030).
+
+    Carries Core, Shareable, Audit tables and the private evidence bucket + key.
+    No SES send, no Bedrock, no AgentCore, no Secrets Manager, no Scheduler variables.
+    """
+
+    env = {
+        **_base_environment(config),
+        **_tables(names),
+        **_demo_agent_mode(config),
+        "CHORUS_DEMO_CLOCK_ENABLED": DEMO_CLOCK_ENABLED,
+        "CHORUS_PRIVATE_EVIDENCE_BUCKET": names.private_evidence_bucket,
+        "CHORUS_PRIVATE_EVIDENCE_KEY_ARN": private_evidence_key_arn,
+        "CHORUS_INBOUND_TRANSPORT": "aws:ses-receipt",
+        "CHORUS_INBOUND_SOURCE_ARN": inbound_source_arn,
+        "CHORUS_INBOUND_RECEIVING_ADDRESS": inbound_receiving_address,
+    }
+    if inbound_topic_arn:
+        env["CHORUS_INBOUND_TOPIC_ARN"] = inbound_topic_arn
+    return env
+
+
 __all__ = [
     "OFFLINE_PLACEHOLDER_CODE_DIR",
     "PHASE_11_REGION",
@@ -409,6 +448,7 @@ __all__ = [
     "chorus_lambda",
     "compiler_environment",
     "demo_reset_environment",
+    "inbound_environment",
     "lambda_asset_code",
     "load_lambda_manifest",
     "sender_environment",

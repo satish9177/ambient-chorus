@@ -29,12 +29,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import Environment, Stack, Tags
+from aws_cdk import ArnFormat, CfnOutput, Environment, Stack, Tags
+from aws_cdk import aws_bedrock as bedrock
+from aws_cdk import aws_bedrockagentcore as agentcore
+from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
+from aws_cdk import aws_s3 as s3
 from constructs import Construct
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import PHASE_11_REGION, CdkBuildConfig
+from infra.cdk.runtime_support import runtime_artifact_location
 
 AGENTCORE_SERVICE_PRINCIPAL = "bedrock-agentcore.amazonaws.com"
 
@@ -149,13 +154,23 @@ INFERENCE_PROFILE_ARN_CONDITION_KEY = "bedrock:InferenceProfileArn"
 (deployment contract § 4). The foundation-model statement is usable *only* through the profile
 whose ARN this key equals, so the grant is not a direct unrestricted model invocation."""
 
-RUNTIME_MODEL_ACTIONS = ("bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream")
-"""Both actions are required. ``strands`` ``structured_output`` -> ``stream`` ->
-``converse_stream`` (streaming defaults to ``True`` in ``BedrockModel``, and
-``runtimes/*/agent.py`` never sets it ``False``), which the IAM policy simulator authorizes
-through ``bedrock:InvokeModelWithResponseStream``. ``InvokeModel`` alone covers the
-non-streaming fallback path. No ``Converse``/``ConverseStream`` grant -- those are the
-data-plane API names, not the IAM actions Bedrock evaluates."""
+RUNTIME_MODEL_ACTIONS = ("bedrock:InvokeModelWithResponseStream",)
+"""The single action required for Bedrock model invocation by the agent runtimes.
+
+Traced through ``strands-agents 1.54.0``:
+* ``runtimes/*/agent.py`` calls ``agent.structured_output_async(...)``;
+* ``BedrockModel.structured_output`` calls ``self.stream(...)``;
+* inside ``stream``, the model source reads ``streaming = self.config.get("streaming", True)``
+  and then ``converse_method = self.client.converse_stream if streaming else self.client.converse``;
+* no runtime constructs ``BedrockModel(streaming=False)`` -- none passes ``streaming`` at all.
+
+So the only Bedrock data-plane call any runtime makes is ``ConverseStream``, which IAM authorizes
+through ``bedrock:InvokeModelWithResponseStream``. ``bedrock:InvokeModel`` was removed because
+``Converse`` is never called (unused grant, Macro B § 7). A future adapter that sets
+``streaming=False`` must add ``bedrock:InvokeModel`` back, and the test asserting the exact action
+set is what will force that. No ``Converse``/``ConverseStream`` grant -- those are the data-plane
+API names, not the IAM actions Bedrock evaluates.
+"""
 
 
 def _foundation_model_arns() -> list[str]:
@@ -231,6 +246,20 @@ ACTION_STATEMENT_IDS = RuntimeStatementIds(
 )
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RuntimeSpec:
+    """Specification for constructing one AgentCore runtime and its application profile."""
+
+    agent: str
+    construct_prefix: str
+    role: iam.Role
+    log_group: logs.LogGroup
+    statement_ids: RuntimeStatementIds
+    security_group: ec2.ISecurityGroup
+    manage_delivery_resource_policy: bool
+    description: str
+
+
 class ChorusAgentStack(Stack):
     """Creates each agent runtime's execution role and its dedicated log group."""
 
@@ -240,10 +269,14 @@ class ChorusAgentStack(Stack):
         construct_id: str,
         *,
         config: CdkBuildConfig,
-        monitor_model_profile_arn: str | None = None,
-        investigator_model_profile_arn: str | None = None,
-        action_model_profile_arn: str | None = None,
         artifact_bucket_arn: str | None = None,
+        vpc: ec2.IVpc | None = None,
+        vpc_subnets: ec2.SubnetSelection | None = None,
+        monitor_security_group: ec2.ISecurityGroup | None = None,
+        investigator_security_group: ec2.ISecurityGroup | None = None,
+        action_security_group: ec2.ISecurityGroup | None = None,
+        artifact_bucket_name: str | None = None,
+        offline_synth: bool = True,
         env: Environment | None = None,
     ) -> None:
         super().__init__(scope, construct_id, env=env)
@@ -252,23 +285,32 @@ class ChorusAgentStack(Stack):
         Tags.of(self).add("Namespace", config.namespace)
         Tags.of(self).add("DataClass", "PRIVATE")
 
-        # I4: the three application inference-profile ARNs are **discovered** deployment inputs,
-        # never constructed from a friendly name. An application-profile ARN ends in a
-        # service-generated identifier, so ``chorus-monitor-demo`` names nothing (deployment
-        # contract § 4). They are supplied together -- the three profiles deploy in one stage --
-        # or not at all, in which case this stack synthesizes offline with no Bedrock grant and
-        # the deploy pipeline must pass the real ARNs before the runtimes can invoke a model.
-        profiles = {
-            "monitor_model_profile_arn": monitor_model_profile_arn,
-            "investigator_model_profile_arn": investigator_model_profile_arn,
-            "action_model_profile_arn": action_model_profile_arn,
+        self.monitor_runtime: agentcore.Runtime | None = None
+        self.monitor_live_endpoint: agentcore.RuntimeEndpoint | None = None
+        self.monitor_inference_profile: bedrock.CfnApplicationInferenceProfile | None = None
+
+        self.investigator_runtime: agentcore.Runtime | None = None
+        self.investigator_live_endpoint: agentcore.RuntimeEndpoint | None = None
+        self.investigator_inference_profile: bedrock.CfnApplicationInferenceProfile | None = None
+
+        self.action_runtime: agentcore.Runtime | None = None
+        self.action_live_endpoint: agentcore.RuntimeEndpoint | None = None
+        self.action_inference_profile: bedrock.CfnApplicationInferenceProfile | None = None
+
+        runtime_inputs = {
+            "vpc": vpc,
+            "vpc_subnets": vpc_subnets,
+            "monitor_security_group": monitor_security_group,
+            "investigator_security_group": investigator_security_group,
+            "action_security_group": action_security_group,
+            "artifact_bucket_name": artifact_bucket_name,
         }
-        supplied = {name for name, arn in profiles.items() if arn}
-        if supplied and supplied != set(profiles):
-            missing = sorted(set(profiles) - supplied)
+        supplied_runtime = {name for name, val in runtime_inputs.items() if val is not None}
+        if supplied_runtime and supplied_runtime != set(runtime_inputs):
+            missing_runtime = sorted(set(runtime_inputs) - supplied_runtime)
             raise ValueError(
-                "application inference-profile ARNs must be supplied together or not at all; "
-                f"missing: {', '.join(missing)}"
+                "AgentCore runtime networking and artifact bucket must be supplied together "
+                f"or not at all; missing: {', '.join(missing_runtime)}"
             )
 
         # The two evidence buckets, named exactly as the data stack names them so the
@@ -291,14 +333,6 @@ class ChorusAgentStack(Stack):
             assumed_by=iam.ServicePrincipal(AGENTCORE_SERVICE_PRINCIPAL),
             description="Monitor AgentCore runtime: model invocation and own telemetry only.",
         )
-        self._grant_runtime_boundary(
-            role=self.monitor_role,
-            log_group=self.monitor_log_group,
-            profile_arn=monitor_model_profile_arn,
-            artifact_bucket_arn=artifact_bucket_arn,
-            artifact_prefix="monitor",
-            sids=MONITOR_STATEMENT_IDS,
-        )
 
         self.investigator_log_group = logs.LogGroup(
             self,
@@ -315,14 +349,6 @@ class ChorusAgentStack(Stack):
                 "Investigator AgentCore runtime: model invocation and own telemetry only."
             ),
         )
-        self._grant_runtime_boundary(
-            role=self.investigator_role,
-            log_group=self.investigator_log_group,
-            profile_arn=investigator_model_profile_arn,
-            artifact_bucket_arn=artifact_bucket_arn,
-            artifact_prefix="investigator",
-            sids=INVESTIGATOR_STATEMENT_IDS,
-        )
 
         self.action_log_group = logs.LogGroup(
             self,
@@ -337,23 +363,218 @@ class ChorusAgentStack(Stack):
             assumed_by=iam.ServicePrincipal(AGENTCORE_SERVICE_PRINCIPAL),
             description="Action AgentCore runtime: model invocation and own telemetry only.",
         )
-        # Built by the same helper as the other two, from the same denied-action lists, because
-        # "the Action runtime is isolated like the others" has to be a fact about one
-        # construction rather than a resemblance between three hand-written blocks. Its allow
-        # list is narrower in exactly one respect and wider in none: it invokes its own
-        # inference profile, not another agent's.
-        #
-        # The Action runtime is also the one a reader might expect to need *something* -- a
-        # recipient lookup, a fact check, a send path. It has none of those, and the denies
-        # below say so in the one place a permission could otherwise appear.
-        self._grant_runtime_boundary(
-            role=self.action_role,
-            log_group=self.action_log_group,
-            profile_arn=action_model_profile_arn,
-            artifact_bucket_arn=artifact_bucket_arn,
-            artifact_prefix="action",
-            sids=ACTION_STATEMENT_IDS,
-        )
+
+        # The runtimes exist only once every network and artifact input is present. The guard is
+        # written as six explicit ``is not None`` tests rather than as a set comparison against
+        # ``runtime_inputs`` so the narrowing is visible to the type checker as well as to a
+        # reader: every value below is used unconditionally, and none needs a suppression to say
+        # so. The all-or-nothing refusal above is what makes reaching here with a partial set
+        # impossible.
+        if (
+            vpc is not None
+            and vpc_subnets is not None
+            and monitor_security_group is not None
+            and investigator_security_group is not None
+            and action_security_group is not None
+            and artifact_bucket_name is not None
+        ):
+            system_profile_arn = self.format_arn(
+                service="bedrock",
+                region=PHASE_11_REGION,
+                account=self.account,
+                resource="inference-profile",
+                resource_name=NOVA_2_LITE_US_SYSTEM_PROFILE_ID,
+                arn_format=ArnFormat.SLASH_RESOURCE_NAME,
+            )
+
+            specs = (
+                RuntimeSpec(
+                    agent="monitor",
+                    construct_prefix="Monitor",
+                    role=self.monitor_role,
+                    log_group=self.monitor_log_group,
+                    statement_ids=MONITOR_STATEMENT_IDS,
+                    security_group=monitor_security_group,
+                    manage_delivery_resource_policy=True,
+                    description="CHORUS Monitor AgentCore runtime",
+                ),
+                RuntimeSpec(
+                    agent="investigator",
+                    construct_prefix="Investigator",
+                    role=self.investigator_role,
+                    log_group=self.investigator_log_group,
+                    statement_ids=INVESTIGATOR_STATEMENT_IDS,
+                    security_group=investigator_security_group,
+                    manage_delivery_resource_policy=False,
+                    description="CHORUS Investigator AgentCore runtime",
+                ),
+                RuntimeSpec(
+                    agent="action",
+                    construct_prefix="Action",
+                    role=self.action_role,
+                    log_group=self.action_log_group,
+                    statement_ids=ACTION_STATEMENT_IDS,
+                    security_group=action_security_group,
+                    manage_delivery_resource_policy=False,
+                    description="CHORUS Action AgentCore runtime",
+                ),
+            )
+
+            for spec in specs:
+                profile = bedrock.CfnApplicationInferenceProfile(
+                    self,
+                    f"{spec.construct_prefix}InferenceProfile",
+                    inference_profile_name=f"chorus-{spec.agent}-{config.environment}",
+                    description=f"CHORUS {spec.agent} application inference profile",
+                    model_source=bedrock.CfnApplicationInferenceProfile.InferenceProfileModelSourceProperty(
+                        copy_from=system_profile_arn,
+                    ),
+                )
+
+                self._grant_runtime_boundary(
+                    role=spec.role,
+                    log_group=spec.log_group,
+                    profile_arn=profile.attr_inference_profile_arn,
+                    artifact_bucket_arn=artifact_bucket_arn,
+                    artifact_prefix=spec.agent,
+                    sids=spec.statement_ids,
+                )
+
+                artifact_loc = runtime_artifact_location(
+                    spec.agent,
+                    bucket_name=artifact_bucket_name,
+                    offline=offline_synth,
+                )
+
+                # **Do not replace this with ``spec.role``.** It looks like an indirection that
+                # buys nothing, and removing it silently widens all three runtime roles.
+                #
+                # ``agentcore.Runtime`` calls ``grant()`` on whatever role it is handed. Given
+                # the real mutable ``iam.Role``, it appends -- with no warning and no opt-out --
+                # ``logs:CreateLogGroup``, ``logs:DescribeLogGroups``,
+                # ``cloudwatch:PutMetricData``, the three
+                # ``bedrock-agentcore:GetWorkloadAccessToken*`` actions, and
+                # ``s3:GetObject*``/``s3:GetBucket*``/``s3:List*`` **on the entire artifact
+                # bucket**. That last one is the serious one: it would let every runtime read
+                # every other runtime's artifact, which is precisely the isolation deployment
+                # contract § 12 exists to state, and which ``ReadOwn*Artifact`` scopes to one
+                # prefix. The workload-token family is a capability no accepted document grants,
+                # and the manifests declare every AgentCore capability ``false``.
+                #
+                # An **immutable** reference to the same role makes CDK skip every one of those
+                # grants while still resolving to the real role's ``Fn::GetAtt ... Arn``, so the
+                # deployed identity is unchanged and its policy is exactly what this stack wrote.
+                # ``test_runtime_execution_roles_gain_no_implicit_grants`` is the regression
+                # guard; the stack keeps using the mutable ``spec.role`` for its own statements.
+                frozen_role = iam.Role.from_role_arn(
+                    self,
+                    f"{spec.construct_prefix}RuntimeRoleRef",
+                    spec.role.role_arn,
+                    mutable=False,
+                )
+
+                net_config = agentcore.RuntimeNetworkConfiguration.using_vpc(
+                    self,
+                    vpc=vpc,
+                    security_groups=[spec.security_group],
+                    vpc_subnets=vpc_subnets,
+                )
+
+                runtime = agentcore.Runtime(
+                    self,
+                    f"{spec.construct_prefix}Runtime",
+                    runtime_name=artifact_loc.deployed_name,
+                    agent_runtime_artifact=agentcore.AgentRuntimeArtifact.from_s3(
+                        s3.Location(
+                            bucket_name=artifact_loc.bucket_name,
+                            object_key=artifact_loc.object_key,
+                        ),
+                        agentcore.AgentCoreRuntime.PYTHON_3_12,
+                        ["python", "main.py"],
+                    ),
+                    execution_role=frozen_role,
+                    environment_variables={
+                        f"CHORUS_{spec.agent.upper()}_MODEL_PROFILE_ARN": (
+                            profile.attr_inference_profile_arn
+                        ),
+                        "CHORUS_AWS_REGION": PHASE_11_REGION,
+                        "AWS_REGION": PHASE_11_REGION,
+                        "CHORUS_OTEL_ENABLED": "false",
+                    },
+                    network_configuration=net_config,
+                    authorizer_configuration=agentcore.RuntimeAuthorizerConfiguration.using_iam(),
+                    logging_configs=[
+                        agentcore.LoggingConfig(
+                            destination=agentcore.LoggingDestination.cloud_watch_logs(
+                                spec.log_group
+                            ),
+                            log_type=agentcore.LogType.APPLICATION_LOGS,
+                        )
+                    ],
+                    manage_delivery_resource_policy=spec.manage_delivery_resource_policy,
+                    tracing_enabled=False,
+                    description=spec.description,
+                )
+                endpoint = runtime.add_endpoint("live")
+
+                if spec.agent == "monitor":
+                    self.monitor_runtime = runtime
+                    self.monitor_live_endpoint = endpoint
+                    self.monitor_inference_profile = profile
+                elif spec.agent == "investigator":
+                    self.investigator_runtime = runtime
+                    self.investigator_live_endpoint = endpoint
+                    self.investigator_inference_profile = profile
+                elif spec.agent == "action":
+                    self.action_runtime = runtime
+                    self.action_live_endpoint = endpoint
+                    self.action_inference_profile = profile
+
+                CfnOutput(
+                    self,
+                    f"{spec.construct_prefix}InferenceProfileArn",
+                    value=profile.attr_inference_profile_arn,
+                )
+                CfnOutput(
+                    self,
+                    f"{spec.construct_prefix}RuntimeArn",
+                    value=runtime.agent_runtime_arn,
+                )
+                CfnOutput(
+                    self,
+                    f"{spec.construct_prefix}RuntimeId",
+                    value=runtime.agent_runtime_id,
+                )
+                CfnOutput(
+                    self,
+                    f"{spec.construct_prefix}LiveEndpointArn",
+                    value=endpoint.agent_runtime_endpoint_arn,
+                )
+        else:
+            self._grant_runtime_boundary(
+                role=self.monitor_role,
+                log_group=self.monitor_log_group,
+                profile_arn=None,
+                artifact_bucket_arn=artifact_bucket_arn,
+                artifact_prefix="monitor",
+                sids=MONITOR_STATEMENT_IDS,
+            )
+            self._grant_runtime_boundary(
+                role=self.investigator_role,
+                log_group=self.investigator_log_group,
+                profile_arn=None,
+                artifact_bucket_arn=artifact_bucket_arn,
+                artifact_prefix="investigator",
+                sids=INVESTIGATOR_STATEMENT_IDS,
+            )
+            self._grant_runtime_boundary(
+                role=self.action_role,
+                log_group=self.action_log_group,
+                profile_arn=None,
+                artifact_bucket_arn=artifact_bucket_arn,
+                artifact_prefix="action",
+                sids=ACTION_STATEMENT_IDS,
+            )
 
     def _grant_runtime_boundary(
         self,
@@ -380,15 +601,15 @@ class ChorusAgentStack(Stack):
         runtime's own artifact prefix reachable, which a blanket ``GetObject`` deny made
         impossible (deployment contract SS 6).
 
-        I4: the model grant is two statements and appears only once ``profile_arn`` is a
-        discovered deployment input. ``invoke_profile`` allows :data:`RUNTIME_MODEL_ACTIONS`
-        (``bedrock:InvokeModel`` **and** ``bedrock:InvokeModelWithResponseStream`` -- the
+        I4: the model grant is two statements and appears only once ``profile_arn`` is
+        available from the created application inference profile. ``invoke_profile`` allows
+        :data:`RUNTIME_MODEL_ACTIONS` (``bedrock:InvokeModelWithResponseStream`` -- the
         runtime's ``strands`` structured-output call streams by default) on that exact
-        application inference-profile ARN; ``invoke_foundation_models`` allows the same two
-        actions on the Nova 2 Lite foundation-model ARNs for every frozen US destination region,
+        application inference-profile ARN; ``invoke_foundation_models`` allows the same action
+        on the Nova 2 Lite foundation-model ARNs for every frozen US destination region,
         **condition-bound** to the same profile through ``bedrock:InferenceProfileArn`` so the
-        foundation-model grant -- streaming included -- is usable only through the profile it
-        belongs to and is not a direct unrestricted model invocation (deployment contract § 4).
+        foundation-model grant is usable only through the profile it belongs to and is not a
+        direct unrestricted model invocation (deployment contract § 4).
         """
 
         if profile_arn is not None:

@@ -17,10 +17,12 @@ that point unnoticed.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cache
 from typing import Any
 
 import pytest
-from aws_cdk import App, assertions
+from aws_cdk import App, Stack, assertions
+from infra.cdk.app import build_app
 from infra.cdk.config import CdkBuildConfig
 from infra.cdk.stacks import ChorusAgentStack
 from infra.cdk.stacks.agents import (
@@ -54,31 +56,67 @@ PROFILE_ARNS = {
 
 
 def template(**kwargs: object) -> assertions.Template:
+    """The Agents stack synthesized **alone**, with no network and no artifact bucket.
+
+    Macro B made the three application inference profiles resources of this stack rather than
+    context-supplied ARNs, and they -- like the runtimes -- are created only when the VPC,
+    subnets, security groups and artifact bucket are all supplied. So an isolated synthesis has
+    roles, log groups and every deny, but no profile and therefore no model grant. That is the
+    right shape for the boundary assertions below, which are about what the role may *not* do;
+    the model-grant assertions use :func:`runtime_template` instead.
+    """
+
     app = App()
-    stack = ChorusAgentStack(
-        app,
-        "TestAgents",
-        config=CdkBuildConfig(),
-        **{**PROFILE_ARNS, **kwargs},  # type: ignore[arg-type]
+    stack = ChorusAgentStack(app, "TestAgents", config=CdkBuildConfig(), **kwargs)  # type: ignore[arg-type]
+    return assertions.Template.from_stack(stack)
+
+
+@cache
+def runtime_template() -> assertions.Template:
+    """The Agents stack as it synthesizes in the real app, where the profiles exist."""
+
+    app = build_app(offline=True, context={"environment": "demo", "namespace": "DEMO"})
+    stack = next(
+        child
+        for child in app.node.children
+        if isinstance(child, Stack) and child.stack_name == "AmbientChorusAgents"
     )
     return assertions.Template.from_stack(stack)
 
 
-def statements() -> list[Mapping[str, Any]]:
-    policies = template().find_resources(POLICY_TYPE)
+def _statements_of(built: assertions.Template) -> list[Mapping[str, Any]]:
     found: list[Mapping[str, Any]] = []
-    for policy in policies.values():
+    for policy in built.find_resources(POLICY_TYPE).values():
         found.extend(policy["Properties"]["PolicyDocument"]["Statement"])
     return found
+
+
+def statements() -> list[Mapping[str, Any]]:
+    return _statements_of(template())
 
 
 def statement(sid: str) -> Mapping[str, Any]:
     return next(item for item in statements() if item.get("Sid") == sid)
 
 
+def runtime_statement(sid: str) -> Mapping[str, Any]:
+    return next(item for item in _statements_of(runtime_template()) if item.get("Sid") == sid)
+
+
 def actions_of(sid: str) -> set[str]:
     action = statement(sid)["Action"]
     return {action} if isinstance(action, str) else set(action)
+
+
+def runtime_actions_of(sid: str) -> set[str]:
+    action = runtime_statement(sid)["Action"]
+    return {action} if isinstance(action, str) else set(action)
+
+
+def profile_attr(agent: str) -> dict[str, Any]:
+    """The generated ARN reference for one agent's application inference profile."""
+
+    return {"Fn::GetAtt": [f"{agent.capitalize()}InferenceProfile", "InferenceProfileArn"]}
 
 
 def test_the_action_role_exists_and_is_assumable_only_by_agentcore() -> None:
@@ -96,15 +134,18 @@ def test_the_action_role_exists_and_is_assumable_only_by_agentcore() -> None:
 
 
 def test_the_role_may_invoke_only_its_own_inference_profile() -> None:
-    allowed = statement("InvokeActionInferenceProfileOnly")
+    allowed = runtime_statement("InvokeActionInferenceProfileOnly")
 
     assert allowed["Effect"] == "Allow"
-    # I4 / P1-2: BOTH model actions -- the runtime's structured-output call streams.
-    assert actions_of("InvokeActionInferenceProfileOnly") == {
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream",
+    # Macro B Chunk 2: exactly ONE model action. ``structured_output`` -> ``stream`` ->
+    # ``converse_stream`` (streaming defaults to True and no runtime disables it), so
+    # ``ConverseStream`` is the only Bedrock call any runtime makes and
+    # ``bedrock:InvokeModel`` would be an unused grant.
+    assert runtime_actions_of("InvokeActionInferenceProfileOnly") == {
+        "bedrock:InvokeModelWithResponseStream"
     }
-    assert allowed["Resource"] == ACTION_PROFILE_ARN
+    # The generated attribute of this stack's own profile resource -- never a name-built ARN.
+    assert allowed["Resource"] == profile_attr("action")
     assert allowed["Resource"] != "*"
 
 
@@ -115,24 +156,23 @@ def test_the_role_cannot_invoke_another_agents_profile() -> None:
     Investigator ran" in the one place that is still true after a compromise.
     """
 
-    profile = str(statement("InvokeActionInferenceProfileOnly")["Resource"])
-    assert "chorus-monitor" not in profile
-    assert "chorus-investigator" not in profile
+    profile = str(runtime_statement("InvokeActionInferenceProfileOnly")["Resource"])
+    assert "MonitorInferenceProfile" not in profile
+    assert "InvestigatorInferenceProfile" not in profile
 
     # The FM grant is condition-bound to the Action profile, never another agent's.
-    fm = statement("InvokeActionFoundationModelsViaProfileOnly")
+    fm = runtime_statement("InvokeActionFoundationModelsViaProfileOnly")
     bound = fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY]
-    assert bound == ACTION_PROFILE_ARN
-    assert MONITOR_PROFILE_ARN not in str(fm)
-    assert INVESTIGATOR_PROFILE_ARN not in str(fm)
+    assert bound == profile_attr("action")
+    assert "MonitorInferenceProfile" not in str(fm)
+    assert "InvestigatorInferenceProfile" not in str(fm)
 
 
 def test_the_action_fm_grant_covers_the_three_frozen_us_regions_without_an_account() -> None:
-    fm = statement("InvokeActionFoundationModelsViaProfileOnly")
+    fm = runtime_statement("InvokeActionFoundationModelsViaProfileOnly")
 
-    assert actions_of("InvokeActionFoundationModelsViaProfileOnly") == {
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream",
+    assert runtime_actions_of("InvokeActionFoundationModelsViaProfileOnly") == {
+        "bedrock:InvokeModelWithResponseStream"
     }
     assert set(fm["Resource"]) == {
         f"arn:aws:bedrock:{region}::foundation-model/{NOVA_2_LITE_BASE_MODEL_ID}"

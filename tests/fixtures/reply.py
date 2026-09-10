@@ -235,7 +235,7 @@ class ReplyHarness:
             received_at=received_at or self.send.action.compile.clock.now(),
             object_key=object_key,
             headers_truncated=headers_truncated,
-            **verdicts,
+            **verdicts,  # type: ignore[arg-type]  # only ever the 5 verdict-status strings
         )
         return InboundMailTransportContext(
             transport=transport, source_arn=source_arn, envelope=envelope

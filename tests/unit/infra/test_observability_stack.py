@@ -50,6 +50,7 @@ def test_one_lambda_error_alarm_per_deployed_function_including_reset() -> None:
         "chorus-sender-demo-errors",
         "chorus-commitment-watcher-demo-errors",
         "chorus-demo-reset-demo-errors",
+        "chorus-inbound-demo-errors",
     }
 
 
@@ -78,21 +79,24 @@ def test_there_is_exactly_one_dashboard_named_for_the_environment() -> None:
     built.has_resource_properties(DASHBOARD, {"DashboardName": "chorus-demo"})
 
 
-def test_the_dashboard_references_real_current_metrics_and_no_fake_agentcore_metric() -> None:
+def test_the_isolated_dashboard_draws_no_fake_agentcore_metric() -> None:
+    # This helper builds the stack **in isolation** -- no runtimes are passed -- so the
+    # AgentCore section is the deferred placeholder, not a fabricated metric. The real
+    # per-runtime widgets are asserted against the full app in
+    # ``test_agentcore_observability.py``.
     dashboard = next(iter(observability_template().find_resources(DASHBOARD).values()))[
         "Properties"
     ]
     body = json.dumps(dashboard["DashboardBody"])
-    # real current signals
     assert "AWS/Lambda" in body
     assert "chorus-worker-demo" in body
     assert "chorus-demo-reset-demo" in body
     assert "chorus-commitment-dlq-demo" in body
     assert "AWS/ApiGateway" in body
-    # AgentCore is reserved, not faked
+    # No fabricated AgentCore metric when no runtime is wired in -- the section is simply
+    # absent (or a text placeholder), never an invented metric line.
     assert "AgentInvocations" not in body
-    assert "bedrock-agentcore" not in body
-    assert "Deferred to Macro B" in body
+    assert "AWS/Bedrock-AgentCore" not in body
 
 
 def test_no_sns_topic_or_subscription_is_invented_here() -> None:

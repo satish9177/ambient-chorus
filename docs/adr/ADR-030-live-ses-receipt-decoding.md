@@ -1,7 +1,8 @@
 # ADR-030: The live SES receipt path — one S3 action, a pinned object, and the three fields the schema actually publishes
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-08
+**Accepted:** 2026-09-10 — Phase 11 Macro B, after independent review against ADR-025, ADR-026, the deployment contract, the current inbound attester, and installed `aws-cdk-lib` / `botocore` SES + AgentCore service models.
 **Deciders:** Ambient CHORUS maintainers and product owner
 **Supersedes:** [ADR-026](ADR-026-inbound-reply-trust-and-correlation.md) **only** in respect of the SES receipt transport shape and three decoded field choices — § 2 step 5 (which envelope fields are read), § 3 agreement 4 (which address the correspondent comparison uses), and § 3 agreement 5 (which address the recipient comparison uses). Everything else in ADR-026 is unchanged and remains in force: the four-stage boundary, the verdict gate, the attester/verifier split and its HMAC, the frozen refusal codes, the immutable outbound locator, the `SEND_UNKNOWN`-has-no-locator consequence, replay and idempotency behaviour, the raw-MIME-to-private-bucket rule, the attachment refusal, the size caps, the quoted-outbound-text removal, and the empty allowed-verification-source set. `Message-ID` correlation remains a live-canary question, not a redesign.
 **Depends on:** [ADR-026](ADR-026-inbound-reply-trust-and-correlation.md)

@@ -96,7 +96,13 @@ def test_real_arns_pass_deployment_mode_validation() -> None:
             "arn:aws:lambda:us-east-1:111122223333:function:x",
             "runtime wrong service",
         ),
-        ("action_runtime_arn", "", "runtime missing"),
+        # NOTE: there is deliberately no ``("action_runtime_arn", "", ...)`` case any more.
+        # The three AgentCore runtime-endpoint ARNs became **outputs of the Agents stack** in
+        # Macro B, produced during the same deployment that consumes them, so requiring an
+        # operator to supply one up front would demand a value that does not exist yet. They
+        # are still shape-checked when supplied -- see the ``runtime wrong service`` case
+        # above -- and their absence is proved acceptable by
+        # ``test_deployment_mode_accepts_absent_runtime_arns`` below.
         # R1 -- the resource portion, not just the prefix
         (
             "demo_access_secret_arn",
@@ -148,6 +154,25 @@ def test_real_arns_pass_deployment_mode_validation() -> None:
 def test_deployment_mode_rejects_a_bad_identity(field: str, value: str, why: str) -> None:
     with pytest.raises(MissingDeploymentIdentityError):
         _identities(**{field: value})
+
+
+def test_deployment_mode_accepts_absent_runtime_arns() -> None:
+    """The three AgentCore runtime-endpoint ARNs are outputs, not prerequisites.
+
+    Macro B creates the three ``Runtime`` resources and their ``live`` endpoints in
+    ``AmbientChorusAgents``, and the Application stack consumes their generated ARNs by
+    cross-stack reference. Demanding them from context before the deployment that produces them
+    would be asking the operator for a value that cannot exist. The three **secret** ARNs stay
+    required -- those really are created out of band and really must be supplied.
+    """
+
+    identities = _identities(
+        monitor_runtime_arn="",
+        investigator_runtime_arn="",
+        action_runtime_arn="",
+    )
+
+    assert identities.agent_runtime_arns == ("", "", "")
 
 
 def test_deployment_mode_accepts_a_real_secrets_manager_suffix() -> None:

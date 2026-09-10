@@ -164,8 +164,25 @@ WORKLOAD_WORKER: Final = "worker"
 WORKLOAD_COMPILER: Final = "compiler"
 WORKLOAD_SENDER: Final = "sender"
 WORKLOAD_RESET: Final = "reset"
+WORKLOAD_INBOUND: Final = "inbound"
 
-VPC_WORKLOADS: Final = (WORKLOAD_WORKER, WORKLOAD_COMPILER, WORKLOAD_SENDER, WORKLOAD_RESET)
+WORKLOAD_MONITOR_RUNTIME: Final = "monitor_runtime"
+WORKLOAD_INVESTIGATOR_RUNTIME: Final = "investigator_runtime"
+WORKLOAD_ACTION_RUNTIME: Final = "action_runtime"
+AGENT_RUNTIME_WORKLOADS: Final = (
+    WORKLOAD_MONITOR_RUNTIME,
+    WORKLOAD_INVESTIGATOR_RUNTIME,
+    WORKLOAD_ACTION_RUNTIME,
+)
+
+VPC_WORKLOADS: Final = (
+    WORKLOAD_WORKER,
+    WORKLOAD_COMPILER,
+    WORKLOAD_SENDER,
+    WORKLOAD_RESET,
+    WORKLOAD_INBOUND,
+    *AGENT_RUNTIME_WORKLOADS,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,11 +202,18 @@ class InterfaceEndpointSpec:
 # ``com.amazonaws.<region>.scheduler`` (verified from the synthesized ``ServiceName``).
 SCHEDULER_ENDPOINT_SERVICE: Final = ec2.InterfaceVpcEndpointAwsService("scheduler")
 
+# Why the runtime security groups reach Bedrock Runtime and S3 and nothing else:
+# The three AgentCore direct-code runtimes (Monitor, Investigator, Action) make foundation model
+# invocations via the Bedrock Runtime interface endpoint, and fetch their direct-code deployment
+# zip during cold start via the S3 gateway endpoint (deployment contract §§ 6-7).
+# They hold no client or reachability for DynamoDB, Lambda, Secrets Manager, Scheduler, SES, or
+# bedrock-agentcore (no agent invokes another agent -- an IAM fact and a network boundary).
+
 INTERFACE_ENDPOINTS: Final[tuple[InterfaceEndpointSpec, ...]] = (
     InterfaceEndpointSpec(
         "BedrockRuntimeEndpoint",
         ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME,
-        reachable_by=(),
+        reachable_by=AGENT_RUNTIME_WORKLOADS,
     ),
     InterfaceEndpointSpec(
         "BedrockAgentCoreEndpoint",
@@ -222,13 +246,21 @@ endpoint is ``email`` -- not ``sesv2`` (the boto3 client name) and not ``email-s
 different protocol this system does not use)."""
 
 # Which workloads route S3 / DynamoDB through the two free gateway endpoints. The sender holds
-# a total evidence-object deny (ADR-024), so it needs no S3 route.
-GATEWAY_S3_REACHABLE_BY: Final = (WORKLOAD_WORKER, WORKLOAD_COMPILER, WORKLOAD_RESET)
+# a total evidence-object deny (ADR-024), so it needs no S3 route. The three runtime workloads
+# fetch their direct-code artifact from S3 during cold start (deployment contract § 6).
+GATEWAY_S3_REACHABLE_BY: Final = (
+    WORKLOAD_WORKER,
+    WORKLOAD_COMPILER,
+    WORKLOAD_RESET,
+    WORKLOAD_INBOUND,
+    *AGENT_RUNTIME_WORKLOADS,
+)
 GATEWAY_DYNAMODB_REACHABLE_BY: Final = (
     WORKLOAD_WORKER,
     WORKLOAD_COMPILER,
     WORKLOAD_SENDER,
     WORKLOAD_RESET,
+    WORKLOAD_INBOUND,
 )
 
 
@@ -335,6 +367,7 @@ def vpc_eni_policy_statements(
 
 
 __all__ = [
+    "AGENT_RUNTIME_WORKLOADS",
     "ENI_ALL_ACTIONS",
     "ENI_CREATE_ACTIONS",
     "ENI_DESCRIBE_ACTIONS",
@@ -350,7 +383,11 @@ __all__ = [
     "SCHEDULER_ENDPOINT_SERVICE",
     "VPC_CIDR",
     "VPC_WORKLOADS",
+    "WORKLOAD_ACTION_RUNTIME",
     "WORKLOAD_COMPILER",
+    "WORKLOAD_INBOUND",
+    "WORKLOAD_INVESTIGATOR_RUNTIME",
+    "WORKLOAD_MONITOR_RUNTIME",
     "WORKLOAD_RESET",
     "WORKLOAD_SENDER",
     "WORKLOAD_WORKER",

@@ -545,15 +545,33 @@ def test_each_evidence_bucket_blocks_public_access_and_disables_acls(
     assert encryption["ServerSideEncryptionByDefault"]["SSEAlgorithm"] == "aws:kms"
 
 
+def _evidence_buckets(data: Template) -> dict[str, Any]:
+    """The two evidence buckets, excluding the AgentCore artifact bucket.
+
+    The artifact bucket (deployment contract § 6) holds agent code rather than evidence: it is
+    SSE-S3 with no customer key, carries no expiry rule, and is deliberately outside every
+    property the evidence buckets are asserted for below.
+    """
+
+    return {
+        name: resource
+        for name, resource in data.find_resources("AWS::S3::Bucket").items()
+        if "evidence" in resource["Properties"]["BucketName"]
+    }
+
+
 def test_the_two_buckets_use_two_different_keys(data: Template) -> None:
     keys = set(data.find_resources("AWS::KMS::Key"))
     assert len(keys) == 2
+
+    evidence = _evidence_buckets(data)
+    assert len(evidence) == 2
 
     encryption = {
         name: resource["Properties"]["BucketEncryption"]["ServerSideEncryptionConfiguration"][0][
             "ServerSideEncryptionByDefault"
         ]["KMSMasterKeyID"]
-        for name, resource in data.find_resources("AWS::S3::Bucket").items()
+        for name, resource in evidence.items()
     }
     assert len({json.dumps(value, sort_keys=True) for value in encryption.values()}) == 2
 
@@ -561,21 +579,33 @@ def test_the_two_buckets_use_two_different_keys(data: Template) -> None:
 def test_every_bucket_policy_denies_insecure_transport_and_unencrypted_writes(
     data: Template,
 ) -> None:
+    evidence_logical_ids = set(_evidence_buckets(data))
+
     for policy in data.find_resources("AWS::S3::BucketPolicy").values():
-        sids = {item.get("Sid") for item in policy["Properties"]["PolicyDocument"]["Statement"]}
-        assert "DenyUnencryptedObjectUploads" in sids
-        assert "DenyWrongKmsKey" in sids
-        effects = {
-            item.get("Sid"): item["Effect"]
-            for item in policy["Properties"]["PolicyDocument"]["Statement"]
-        }
-        assert effects["DenyUnencryptedObjectUploads"] == "Deny"
+        statements = policy["Properties"]["PolicyDocument"]["Statement"]
+
+        # The TLS deny is universal -- it applies to the artifact bucket exactly as it does to
+        # the two evidence buckets, and no bucket in this system is exempt from it.
         transport = [
             item
-            for item in policy["Properties"]["PolicyDocument"]["Statement"]
+            for item in statements
             if item.get("Condition", {}).get("Bool", {}).get("aws:SecureTransport") == "false"
         ]
-        assert transport, "every evidence bucket denies non-TLS access"
+        assert transport, "every bucket denies non-TLS access"
+
+        # The two encryption denies are specific to the KMS-encrypted evidence buckets. They
+        # pin an exact customer key, so they are meaningless on the SSE-S3 artifact bucket,
+        # which has no key to pin (deployment contract §§ 6, 18).
+        bucket_ref = policy["Properties"]["Bucket"]
+        target = bucket_ref.get("Ref") if isinstance(bucket_ref, dict) else bucket_ref
+        if target not in evidence_logical_ids:
+            continue
+
+        sids = {item.get("Sid") for item in statements}
+        assert "DenyUnencryptedObjectUploads" in sids
+        assert "DenyWrongKmsKey" in sids
+        effects = {item.get("Sid"): item["Effect"] for item in statements}
+        assert effects["DenyUnencryptedObjectUploads"] == "Deny"
 
 
 def test_only_the_compiler_role_may_write_export_objects(data: Template) -> None:
@@ -608,11 +638,23 @@ def test_no_bucket_grants_public_read(data: Template) -> None:
 def test_each_bucket_has_a_lifecycle_backstop(data: Template) -> None:
     """The orphan story: an unreferenced derivative is swept, never compensated away."""
 
-    for resource in data.find_resources("AWS::S3::Bucket").values():
+    for resource in _evidence_buckets(data).values():
         rules = resource["Properties"]["LifecycleConfiguration"]["Rules"]
         assert rules
         assert all(rule["Status"] == "Enabled" for rule in rules)
         assert all(rule["ExpirationInDays"] > 0 for rule in rules)
+
+    # The artifact bucket is the deliberate exception and is asserted as such rather than
+    # merely skipped: expiring an artifact object would delete the bytes a deployed runtime
+    # version points at, which is what rollback repoints `live` to (deployment contract § 5).
+    artifact = [
+        resource
+        for resource in data.find_resources("AWS::S3::Bucket").values()
+        if "agent-artifacts" in resource["Properties"]["BucketName"]
+    ]
+    assert len(artifact) == 1
+    for rule in artifact[0]["Properties"]["LifecycleConfiguration"]["Rules"]:
+        assert "ExpirationInDays" not in rule, "an artifact object must never expire"
 
 
 # -- the agent runtimes, restated against the new buckets ---------------------------------

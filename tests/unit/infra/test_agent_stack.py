@@ -18,7 +18,8 @@ import pytest
 from aws_cdk import App, assertions
 from infra.cdk.app import build_app
 from infra.cdk.config import CdkBuildConfig
-from infra.cdk.stacks import ChorusAgentStack
+from infra.cdk.network_support import NetworkConfig
+from infra.cdk.stacks import ChorusAgentStack, ChorusDataStack, ChorusNetworkStack
 from infra.cdk.stacks.agents import (
     AGENTCORE_SERVICE_PRINCIPAL,
     DENIED_DATASTORE_ACTIONS,
@@ -31,16 +32,20 @@ from infra.cdk.stacks.agents import (
     US_INFERENCE_PROFILE_DESTINATION_REGIONS,
 )
 
-# P1-2: the runtime roles need BOTH actions -- ``strands`` structured output streams by
-# default. Sourced from the stack module so a change there fails these tests loudly.
+# Phase 11 Macro B Chunk 2: narrowed to the single action strands-agents actually calls:
+# ``bedrock:InvokeModelWithResponseStream``. Sourced from the stack module so a change there
+# fails these tests loudly.
 MODEL_ACTIONS = set(RUNTIME_MODEL_ACTIONS)
 
 POLICY_TYPE = "AWS::IAM::Policy"
 ROLE_TYPE = "AWS::IAM::Role"
 
-# Discovered application inference-profile ARNs carry a service-generated suffix -- they are
-# never constructed from ``chorus-monitor-demo`` (deployment contract § 4). These stand in for
-# that shape in the assertions below.
+# Model grants bind to the actual created CfnApplicationInferenceProfile resources in this stack,
+# resolved as Fn::GetAtt references to their InferenceProfileArn attributes.
+MONITOR_PROFILE_REF = {"Fn::GetAtt": ["MonitorInferenceProfile", "InferenceProfileArn"]}
+INVESTIGATOR_PROFILE_REF = {"Fn::GetAtt": ["InvestigatorInferenceProfile", "InferenceProfileArn"]}
+ACTION_PROFILE_REF = {"Fn::GetAtt": ["ActionInferenceProfile", "InferenceProfileArn"]}
+
 MONITOR_PROFILE_ARN = (
     "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-monitor-a1b2c3d4"
 )
@@ -58,12 +63,28 @@ PROFILE_ARNS = {
 
 
 def template(config: CdkBuildConfig | None = None, **kwargs: object) -> assertions.Template:
+    cfg = config or CdkBuildConfig()
     app = App()
+    network = ChorusNetworkStack(
+        app,
+        "TestNetwork",
+        config=cfg,
+        network=NetworkConfig(availability_zones=("us-east-1a", "us-east-1b")),
+        artifact_bucket_arn=f"arn:aws:s3:::chorus-agent-artifacts-{cfg.environment}",
+    )
+    data = ChorusDataStack(app, "TestData", config=cfg)
     stack = ChorusAgentStack(
         app,
         "TestAgents",
-        config=config or CdkBuildConfig(),
-        **{**PROFILE_ARNS, **kwargs},  # type: ignore[arg-type]
+        config=cfg,
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        monitor_security_group=network.monitor_runtime_security_group,
+        investigator_security_group=network.investigator_runtime_security_group,
+        action_security_group=network.action_runtime_security_group,
+        artifact_bucket_name=data.agent_artifact_bucket.bucket_name,
+        offline_synth=True,
+        **kwargs,  # type: ignore[arg-type]
     )
     return assertions.Template.from_stack(stack)
 
@@ -114,11 +135,9 @@ def test_the_role_may_invoke_only_its_own_inference_profile() -> None:
     allowed = statement("InvokeMonitorInferenceProfileOnly")
 
     assert allowed["Effect"] == "Allow"
-    # I4 / P1-2: BOTH model actions -- ``strands`` ``structured_output`` -> ``stream`` ->
-    # ``converse_stream`` (streaming defaults on), which IAM authorizes through
-    # ``bedrock:InvokeModelWithResponseStream``; ``InvokeModel`` covers the non-streaming path.
+    # Phase 11 Macro B Chunk 2: narrowed to bedrock:InvokeModelWithResponseStream
     assert actions_of("InvokeMonitorInferenceProfileOnly") == MODEL_ACTIONS
-    assert allowed["Resource"] == MONITOR_PROFILE_ARN
+    assert allowed["Resource"] == MONITOR_PROFILE_REF
     assert allowed["Resource"] != "*"
     assert "Condition" not in allowed
 
@@ -139,51 +158,60 @@ def test_no_model_grant_at_all_until_the_profile_arn_is_a_discovered_input() -> 
                 assert not action.startswith("bedrock:"), item.get("Sid")
 
 
-def test_profile_arns_must_be_supplied_together_or_not_at_all() -> None:
+def test_runtime_inputs_must_be_supplied_together_or_not_at_all() -> None:
+    """A half-supplied runtime configuration is refused rather than partially built.
+
+    This replaces the old ``profile ARNs together or not at all`` check. Those three
+    constructor parameters no longer exist: Macro B made the application inference profiles
+    **resources of this stack** rather than discovered ARNs passed in, so there is no longer a
+    partial-profile state to refuse. The all-or-nothing invariant did not go away, it moved --
+    the runtime networking and artifact inputs are now the set that must arrive complete, and a
+    partial set would otherwise synthesize a runtime with, say, a security group but no subnets.
+    """
+
     with pytest.raises(ValueError, match="together or not at all"):
         ChorusAgentStack(
             App(),
             "PartialAgents",
             config=CdkBuildConfig(),
-            monitor_model_profile_arn=MONITOR_PROFILE_ARN,
+            artifact_bucket_name="chorus-agent-artifacts-demo",
         )
 
 
 @pytest.mark.parametrize(
-    ("profile_sid", "fm_sid", "profile_arn"),
+    ("profile_sid", "fm_sid", "profile_ref"),
     [
         (
             "InvokeMonitorInferenceProfileOnly",
             "InvokeMonitorFoundationModelsViaProfileOnly",
-            MONITOR_PROFILE_ARN,
+            MONITOR_PROFILE_REF,
         ),
         (
             "InvokeInvestigatorInferenceProfileOnly",
             "InvokeInvestigatorFoundationModelsViaProfileOnly",
-            INVESTIGATOR_PROFILE_ARN,
+            INVESTIGATOR_PROFILE_REF,
         ),
         (
             "InvokeActionInferenceProfileOnly",
             "InvokeActionFoundationModelsViaProfileOnly",
-            ACTION_PROFILE_ARN,
+            ACTION_PROFILE_REF,
         ),
     ],
 )
 def test_each_role_invokes_its_own_profile_and_the_fm_arns_bound_to_it(
-    profile_sid: str, fm_sid: str, profile_arn: str
+    profile_sid: str, fm_sid: str, profile_ref: Mapping[str, Any]
 ) -> None:
     """ALLOW own application profile; ALLOW the Nova 2 Lite FM ARNs for the three frozen US
     regions, condition-bound to that same profile so it is not a direct FM invocation."""
 
     profile = statement(profile_sid)
     assert profile["Effect"] == "Allow"
-    # P1-2: both actions present in the application-profile statement.
+    # Phase 11 Macro B Chunk 2: action narrowed to InvokeModelWithResponseStream.
     assert actions_of(profile_sid) == MODEL_ACTIONS
-    assert profile["Resource"] == profile_arn
+    assert profile["Resource"] == profile_ref
 
     fm = statement(fm_sid)
     assert fm["Effect"] == "Allow"
-    # P1-2: both actions present in the condition-bound foundation-model statement too.
     assert actions_of(fm_sid) == MODEL_ACTIONS
     assert set(fm["Resource"]) == {
         f"arn:aws:bedrock:{region}::foundation-model/{NOVA_2_LITE_BASE_MODEL_ID}"
@@ -193,7 +221,7 @@ def test_each_role_invokes_its_own_profile_and_the_fm_arns_bound_to_it(
     assert all("111122223333" not in arn for arn in fm["Resource"])
     for region in ("us-east-1", "us-east-2", "us-west-2"):
         assert any(f":{region}::foundation-model/" in arn for arn in fm["Resource"])
-    assert fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY] == profile_arn
+    assert fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY] == profile_ref
 
 
 def test_no_role_receives_another_agents_profile_or_fm_condition() -> None:
@@ -201,13 +229,13 @@ def test_no_role_receives_another_agents_profile_or_fm_condition() -> None:
 
     monitor_fm = statement("InvokeMonitorFoundationModelsViaProfileOnly")
     bound = monitor_fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY]
-    assert bound == MONITOR_PROFILE_ARN
-    assert INVESTIGATOR_PROFILE_ARN not in str(monitor_fm)
-    assert ACTION_PROFILE_ARN not in str(monitor_fm)
+    assert bound == MONITOR_PROFILE_REF
+    assert "InvestigatorInferenceProfile" not in str(monitor_fm)
+    assert "ActionInferenceProfile" not in str(monitor_fm)
 
 
 def test_no_unconditioned_foundation_model_invocation_statement_exists() -> None:
-    """Every model allow -- ``InvokeModel`` *or* ``InvokeModelWithResponseStream`` -- either
+    """Every model allow -- ``InvokeModelWithResponseStream`` -- either
     names an application profile ARN, or names FM ARNs and is condition-bound to one. No
     statement grants unrestricted foundation-model invocation, streaming included (P1-2)."""
 
@@ -218,10 +246,13 @@ def test_no_unconditioned_foundation_model_invocation_statement_exists() -> None
         if not actions & MODEL_ACTIONS:
             continue
         resources = item["Resource"] if isinstance(item["Resource"], list) else [item["Resource"]]
-        if any("foundation-model/" in arn for arn in resources):
+        if any("foundation-model/" in str(arn) for arn in resources):
             assert INFERENCE_PROFILE_ARN_CONDITION_KEY in str(item.get("Condition")), item["Sid"]
         else:
-            assert all("application-inference-profile/" in arn for arn in resources), item["Sid"]
+            assert all(
+                "application-inference-profile/" in str(arn) or "InferenceProfile" in str(arn)
+                for arn in resources
+            ), item["Sid"]
 
 
 def test_no_unconditioned_streaming_foundation_model_grant() -> None:
@@ -235,7 +266,7 @@ def test_no_unconditioned_streaming_foundation_model_grant() -> None:
         if "bedrock:InvokeModelWithResponseStream" not in actions:
             continue
         resources = item["Resource"] if isinstance(item["Resource"], list) else [item["Resource"]]
-        if any("foundation-model/" in arn for arn in resources):
+        if any("foundation-model/" in str(arn) for arn in resources):
             bound = item.get("Condition", {}).get("StringEquals", {})
             assert bound.get(INFERENCE_PROFILE_ARN_CONDITION_KEY) is not None, item["Sid"]
 

@@ -26,6 +26,13 @@ SORT_KEY = "SK"
 
 PRIVATE_EVIDENCE_RETENTION_DAYS = 30
 EXPORT_EVIDENCE_RETENTION_DAYS = 14
+AGENT_ARTIFACT_PREFIXES = ("monitor", "investigator", "action")
+"""The one prefix per agent under which that runtime's direct-code zip is published.
+
+The same three tokens :mod:`infra.cdk.stacks.agents` scopes each runtime role's ``s3:GetObject``
+to, so "each runtime reads its own artifact and no other's" is one shared vocabulary rather
+than two lists that happen to agree (deployment contract § 12).
+"""
 """Demo lifecycle backstops.
 
 The export rule is also the orphan story. A derivative written for a compile that was then
@@ -98,6 +105,59 @@ class ChorusDataStack(Stack):
             expiration_days=EXPORT_EVIDENCE_RETENTION_DAYS,
             config=config,
         )
+        self.agent_artifact_bucket = self._agent_artifact_bucket(config=config)
+
+    # -- the customer-owned AgentCore artifact bucket (deployment contract §§ 6, 16 stage 2) ---
+
+    def _agent_artifact_bucket(self, *, config: CdkBuildConfig) -> s3.Bucket:
+        """``chorus-agent-artifacts-{env}`` -- a **third** bucket, and deliberately not a third
+        pair of evidence controls.
+
+        Separate from both evidence buckets *and their keys*, because agent code is not evidence
+        (deployment contract § 6). Three consequences a reader should not have to infer:
+
+        * **SSE-S3, not SSE-KMS.** The frozen cost inventory (§ 18) names exactly three customer
+          keys -- private, export, and the DLQ -- so there is no fourth key for this bucket, and
+          inventing one would also mean inventing a ``kms:Decrypt`` grant for a cold-start fetch
+          whose mechanism is still unresolved (§ 21 open question 1). Agent code is a published
+          build output, not private community data; the property that matters here is integrity
+          and provenance, which versioning and the digest-addressed key give.
+        * **No expiry rule.** Both evidence buckets carry a demo lifecycle backstop. This one
+          must not: a rollback is "repoint ``live`` at the previous version" (§ 5), and expiring
+          the object that version was built from would silently delete the ability to roll back.
+          Only the incomplete-multipart abort is kept, which removes no completed artifact.
+        * **No allowlist bucket policy beyond the TLS deny.** ``enforce_ssl`` contributes the
+          insecure-transport deny; nothing further is added offline. Whether AgentCore fetches
+          under the execution role or under a service-owned mechanism is an open question, and
+          § 12 is explicit that this must not be overfitted to one mechanism before a live
+          cold start settles it -- an over-tight artifact policy is the one shape whose failure
+          reads as an unrelated runtime error (§ 6).
+        """
+
+        bucket = s3.Bucket(
+            self,
+            "AgentArtifactBucket",
+            bucket_name=f"chorus-agent-artifacts-{config.environment}",
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            versioned=True,
+            public_read_access=False,
+            removal_policy=(
+                RemovalPolicy.DESTROY if config.is_disposable else RemovalPolicy.RETAIN
+            ),
+            auto_delete_objects=False,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="abort-incomplete-uploads",
+                    enabled=True,
+                    abort_incomplete_multipart_upload_after=Duration.days(1),
+                )
+            ],
+        )
+        Tags.of(bucket).add("DataClass", "AGENT_CODE")
+        return bucket
 
     def _table(
         self,

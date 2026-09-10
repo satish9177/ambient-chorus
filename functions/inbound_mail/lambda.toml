@@ -1,0 +1,23 @@
+# Deployment manifest for the inbound reply processing Lambda (ADR-026, ADR-030).
+#
+# Runs `functions.inbound_mail.handler.handler`. Triggered by SNS receipt notifications
+# from the SES inbound receipt rule. See `functions/api/lambda.toml` for the shared manifest contract.
+
+[function]
+name = "chorus-inbound"
+handler = "functions.inbound_mail.handler.handler"
+description = "Inbound reply processing: SES receipt verification, attestation, and evidence ingestion."
+
+[runtime]
+architecture = "x86_64"
+python_version = "3.12"
+timeout_seconds = 60
+memory_mb = 1024
+
+[artifact]
+first_party = [
+  "functions/__init__.py",
+  "functions/envelope.py",
+  "functions/inbound_mail",
+  "src/chorus",
+]

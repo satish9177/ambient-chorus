@@ -264,6 +264,42 @@ def test_agent_invocation_is_scoped_to_named_runtimes_when_supplied() -> None:
     assert actions_of(found[0]) == {"bedrock-agentcore:InvokeAgentRuntime"}
 
 
+def test_agent_live_endpoint_arns_take_precedence_over_runtime_arns() -> None:
+    live_endpoints = (
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_monitor/runtime-endpoint/live",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_investigator/runtime-endpoint/live",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_action/runtime-endpoint/live",
+    )
+    fallback_runtimes = (
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/other-monitor",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/other-investigator",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/other-action",
+    )
+    built = _template(
+        agent_live_endpoint_arns=live_endpoints,
+        agent_runtime_arns=fallback_runtimes,
+    )
+    found = [
+        item for item in statements(built) if item.get("Sid") == "InvokeNamedAgentRuntimesOnly"
+    ]
+
+    assert found
+    grant = found[0]
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"bedrock-agentcore:InvokeAgentRuntime"}
+    assert grant["Resource"] == list(live_endpoints)
+
+    worker_fn = built.find_resources("AWS::Lambda::Function")
+    worker_vars = next(
+        res["Properties"]["Environment"]["Variables"]
+        for res in worker_fn.values()
+        if "chorus-worker" in str(res["Properties"].get("FunctionName", ""))
+    )
+    assert worker_vars["CHORUS_MONITOR_RUNTIME_ARN"] == live_endpoints[0]
+    assert worker_vars["CHORUS_INVESTIGATOR_RUNTIME_ARN"] == live_endpoints[1]
+    assert worker_vars["CHORUS_ACTION_RUNTIME_ARN"] == live_endpoints[2]
+
+
 def test_no_allow_statement_grants_a_wildcard_resource() -> None:
     for item in statements():
         if item["Effect"] != "Allow":

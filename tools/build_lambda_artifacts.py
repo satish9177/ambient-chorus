@@ -93,6 +93,7 @@ FUNCTION_DIRS: Final = (
     "sender",
     "commitment_watcher",
     "demo_reset",
+    "inbound_mail",
 )
 """The production function packages, by directory name under ``functions/``.
 

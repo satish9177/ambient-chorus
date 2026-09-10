@@ -311,6 +311,7 @@ class ChorusApplicationStack(Stack):
         tables: ApplicationTables,
         buckets: ApplicationBuckets,
         agent_runtime_arns: tuple[str, ...] = (),
+        agent_live_endpoint_arns: tuple[str, str, str] | None = None,
         scheduler_group_name: str | None = None,
         scheduler_role_arn: str | None = None,
         compiler_function_arn: str | None = None,
@@ -338,9 +339,11 @@ class ChorusApplicationStack(Stack):
         # ``worker_function_arn`` is deliberately no longer an argument: the worker Lambda is
         # created **in this stack** below, so the API's grant and environment bind to the
         # created resource directly rather than to a hand-built external ARN (deployment
-        # contract SS 15, SS 30).
+        # contract SS 15, SS 30). Supplied live endpoint ARNs win over placeholder runtime ARNs.
         identities = identities or DeploymentIdentities(environment=config.environment)
-        agent_runtime_arns = agent_runtime_arns or identities.agent_runtime_arns
+        resolved_agent_runtime_arns: tuple[str, ...] = (
+            agent_live_endpoint_arns or agent_runtime_arns or identities.agent_runtime_arns
+        )
         demo_access_secret_arn = demo_access_secret_arn or identities.demo_access_secret_arn
         cursor_signing_secret_arn = (
             cursor_signing_secret_arn or identities.cursor_signing_secret_arn
@@ -419,8 +422,16 @@ class ChorusApplicationStack(Stack):
             role=self.worker_role,
             environment=worker_environment(
                 config=config,
-                identities=identities,
                 names=names,
+                monitor_runtime_arn=(
+                    resolved_agent_runtime_arns[0] if len(resolved_agent_runtime_arns) > 0 else ""
+                ),
+                investigator_runtime_arn=(
+                    resolved_agent_runtime_arns[1] if len(resolved_agent_runtime_arns) > 1 else ""
+                ),
+                action_runtime_arn=(
+                    resolved_agent_runtime_arns[2] if len(resolved_agent_runtime_arns) > 2 else ""
+                ),
                 compiler_function_arn=compiler_function_arn,
                 sender_function_arn=sender_function_arn,
                 watcher_alias_arn=watcher_alias_arn,
@@ -485,7 +496,7 @@ class ChorusApplicationStack(Stack):
         )
         self._grant_worker_boundary(
             tables=tables,
-            agent_runtime_arns=agent_runtime_arns,
+            agent_runtime_arns=resolved_agent_runtime_arns,
             compiler_function_arn=compiler_function_arn,
             sender_function_arn=sender_function_arn,
         )

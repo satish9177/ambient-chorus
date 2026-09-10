@@ -51,6 +51,7 @@ def test_the_functions_are_exactly_the_production_set() -> None:
         "sender",
         "commitment_watcher",
         "demo_reset",
+        "inbound_mail",
     }
     names = {build.load_lambda_manifest(d).name for d in build.FUNCTION_DIRS}
     assert names == {
@@ -60,6 +61,7 @@ def test_the_functions_are_exactly_the_production_set() -> None:
         "chorus-sender",
         "chorus-commitment-watcher",
         "chorus-demo-reset",
+        "chorus-inbound",
     }
 
 

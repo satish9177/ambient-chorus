@@ -78,4 +78,23 @@ class InboundMailTransportAuthenticator(Protocol):
         ...
 
 
-__all__ = ["InboundMailTransportAuthenticator", "InboundMailTransportContext"]
+class InboundRawMessageReader(Protocol):
+    """Fetch the raw MIME the receipt action stored, by the bucket and key it names.
+
+    A port because the deployed source is the SES receipt bucket, which Phase 11 builds, and the
+    local source is a reviewed fixture. Neither the bucket nor the key is caller-supplied at the
+    application boundary: both are read out of the authenticated receipt envelope. It lives here
+    rather than beside the attester so the deployed S3 adapter can implement it without an
+    ``infrastructure -> application`` import (ADR-030 § 3; import-linter).
+    """
+
+    async def read(self, *, bucket: str, key: str) -> bytes:
+        """Return the raw bytes, or raise ``NotFoundError``."""
+        ...
+
+
+__all__ = [
+    "InboundMailTransportAuthenticator",
+    "InboundMailTransportContext",
+    "InboundRawMessageReader",
+]

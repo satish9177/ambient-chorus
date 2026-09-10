@@ -34,6 +34,8 @@ AZ fixture; deployment mode fails closed without the real names (deployment cont
 
 from __future__ import annotations
 
+from typing import Final
+
 from aws_cdk import CfnOutput, Environment, Fn, Stack, Tags
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
@@ -41,6 +43,7 @@ from constructs import Construct
 
 from infra.cdk.config import PHASE_11_REGION, CdkBuildConfig
 from infra.cdk.network_support import (
+    AGENT_RUNTIME_WORKLOADS,
     GATEWAY_DYNAMODB_REACHABLE_BY,
     GATEWAY_S3_REACHABLE_BY,
     HTTPS_PORT,
@@ -49,12 +52,31 @@ from infra.cdk.network_support import (
     MANAGED_PREFIX_LIST_DYNAMODB,
     MANAGED_PREFIX_LIST_S3,
     VPC_CIDR,
+    VPC_WORKLOADS,
+    WORKLOAD_ACTION_RUNTIME,
     WORKLOAD_COMPILER,
+    WORKLOAD_INBOUND,
+    WORKLOAD_INVESTIGATOR_RUNTIME,
+    WORKLOAD_MONITOR_RUNTIME,
     WORKLOAD_RESET,
     WORKLOAD_SENDER,
     WORKLOAD_WORKER,
     NetworkConfig,
 )
+
+_WORKLOAD_SECURITY_GROUP_IDENTITY: Final = {
+    WORKLOAD_WORKER: ("WorkerSecurityGroup", "chorus-worker-{env}"),
+    WORKLOAD_COMPILER: ("CompilerSecurityGroup", "chorus-compiler-{env}"),
+    WORKLOAD_SENDER: ("SenderSecurityGroup", "chorus-sender-{env}"),
+    WORKLOAD_RESET: ("ResetSecurityGroup", "chorus-reset-{env}"),
+    WORKLOAD_INBOUND: ("InboundSecurityGroup", "chorus-inbound-{env}"),
+    WORKLOAD_MONITOR_RUNTIME: ("MonitorRuntimeSecurityGroup", "chorus-monitor-runtime-{env}"),
+    WORKLOAD_INVESTIGATOR_RUNTIME: (
+        "InvestigatorRuntimeSecurityGroup",
+        "chorus-investigator-runtime-{env}",
+    ),
+    WORKLOAD_ACTION_RUNTIME: ("ActionRuntimeSecurityGroup", "chorus-action-runtime-{env}"),
+}
 
 ISOLATED_SUBNET_GROUP_NAME = "isolated"
 """The one subnet group. ``PRIVATE_ISOLATED`` with ``nat_gateways=0`` and no public group is
@@ -155,22 +177,37 @@ class ChorusNetworkStack(Stack):
             for subnet in self.isolated_subnets
         ]
 
-        # -- the four VPC-attached workload security groups (deployment contract §§ 8, 14, 24) --
-        self.workload_security_groups: dict[str, ec2.SecurityGroup] = {
-            key: ec2.SecurityGroup(
+        # -- the seven VPC-attached workload security groups (deployment contract §§ 8, 14, 24) --
+        self.workload_security_groups = {}
+        for key in VPC_WORKLOADS:
+            construct_id, name_template = _WORKLOAD_SECURITY_GROUP_IDENTITY[key]
+            is_runtime = key in AGENT_RUNTIME_WORKLOADS
+            desc = (
+                f"CHORUS {key} AgentCore runtime: HTTPS to named endpoints only, no open egress."
+                if is_runtime
+                else f"CHORUS {key} Lambda: HTTPS to named endpoints only, no open egress."
+            )
+            self.workload_security_groups[key] = ec2.SecurityGroup(
                 self,
-                f"{key.capitalize()}SecurityGroup",
+                construct_id,
                 vpc=self.vpc,
-                security_group_name=f"chorus-{key}-{config.environment}",
-                description=f"CHORUS {key} Lambda: HTTPS to named endpoints only, no open egress.",
+                security_group_name=name_template.format(env=config.environment),
+                description=desc,
                 allow_all_outbound=False,
             )
-            for key in (WORKLOAD_WORKER, WORKLOAD_COMPILER, WORKLOAD_SENDER, WORKLOAD_RESET)
-        }
+
         self.worker_security_group = self.workload_security_groups[WORKLOAD_WORKER]
         self.compiler_security_group = self.workload_security_groups[WORKLOAD_COMPILER]
         self.sender_security_group = self.workload_security_groups[WORKLOAD_SENDER]
         self.reset_security_group = self.workload_security_groups[WORKLOAD_RESET]
+        self.inbound_security_group = self.workload_security_groups[WORKLOAD_INBOUND]
+        self.monitor_runtime_security_group = self.workload_security_groups[
+            WORKLOAD_MONITOR_RUNTIME
+        ]
+        self.investigator_runtime_security_group = self.workload_security_groups[
+            WORKLOAD_INVESTIGATOR_RUNTIME
+        ]
+        self.action_runtime_security_group = self.workload_security_groups[WORKLOAD_ACTION_RUNTIME]
 
         self._create_interface_endpoints()
         self._create_gateway_endpoints()
@@ -361,6 +398,24 @@ class ChorusNetworkStack(Stack):
         CfnOutput(self, "SenderSecurityGroupId", value=self.sender_security_group.security_group_id)
         CfnOutput(self, "ResetSecurityGroupId", value=self.reset_security_group.security_group_id)
         CfnOutput(
+            self, "InboundSecurityGroupId", value=self.inbound_security_group.security_group_id
+        )
+        CfnOutput(
+            self,
+            "MonitorRuntimeSecurityGroupId",
+            value=self.monitor_runtime_security_group.security_group_id,
+        )
+        CfnOutput(
+            self,
+            "InvestigatorRuntimeSecurityGroupId",
+            value=self.investigator_runtime_security_group.security_group_id,
+        )
+        CfnOutput(
+            self,
+            "ActionRuntimeSecurityGroupId",
+            value=self.action_runtime_security_group.security_group_id,
+        )
+        CfnOutput(
             self,
             "InterfaceEndpointIds",
             value=Fn.join(
@@ -378,14 +433,19 @@ class ChorusNetworkStack(Stack):
     # -- consumed by the compute stacks and the Reset stack ---------------------------------
 
     def security_group_for(self, workload_key: str) -> ec2.SecurityGroup:
-        """The VPC-attached SG for ``worker`` / ``compiler`` / ``sender`` / ``reset``."""
+        """The VPC-attached SG for the seven workloads."""
 
         return self.workload_security_groups[workload_key]
 
 
 __all__ = [
+    "AGENT_RUNTIME_WORKLOADS",
     "ISOLATED_SUBNET_GROUP_NAME",
+    "WORKLOAD_ACTION_RUNTIME",
     "WORKLOAD_COMPILER",
+    "WORKLOAD_INBOUND",
+    "WORKLOAD_INVESTIGATOR_RUNTIME",
+    "WORKLOAD_MONITOR_RUNTIME",
     "WORKLOAD_RESET",
     "WORKLOAD_SENDER",
     "WORKLOAD_WORKER",

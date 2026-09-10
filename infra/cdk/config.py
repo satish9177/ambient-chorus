@@ -69,6 +69,9 @@ and an empty runtime or endpoint component.
 """
 _MODEL_PROFILE_RESOURCE_RE = re.compile(r"^application-inference-profile/[^/\s]+$")
 """``application-inference-profile/<id>`` -- a Bedrock *application* inference profile."""
+_RECEIPT_RULE_RESOURCE_RE = re.compile(r"^receipt-rule-set/[^/\s]+/receipt-rule/[^/\s]+$")
+"""``receipt-rule-set/<ruleset-name>/receipt-rule/<rule-name>`` -- the full SES receipt rule
+resource, both components non-empty."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +168,14 @@ def _offline_model_profile_arn(environment: str, agent: str) -> str:
     )
 
 
+def _offline_receipt_rule_arn(environment: str) -> str:
+    """A clearly-typed offline fixture for an SES receipt rule identity."""
+    return (
+        f"arn:aws:ses:{PHASE_11_REGION}:{_SENTINEL_ACCOUNT}:receipt-rule-set/"
+        f"chorus-{environment}-inbound:receipt-rule/chorus-{environment}-reply-PLACEHOLDER"
+    )
+
+
 def _validate_identity(
     value: str,
     *,
@@ -241,6 +252,7 @@ class DeploymentIdentities:
     monitor_model_profile_arn: str = ""
     investigator_model_profile_arn: str = ""
     action_model_profile_arn: str = ""
+    inbound_source_arn: str | None = None
 
     def __post_init__(self) -> None:
         if not self.offline:
@@ -259,6 +271,7 @@ class DeploymentIdentities:
                 self.environment, "investigator"
             ),
             "action_model_profile_arn": _offline_model_profile_arn(self.environment, "action"),
+            "inbound_source_arn": _offline_receipt_rule_arn(self.environment),
         }
         for name, value in fixtures.items():
             if not getattr(self, name):
@@ -288,6 +301,7 @@ class DeploymentIdentities:
             monitor_model_profile_arn=_ctx("monitor_model_profile_arn"),
             investigator_model_profile_arn=_ctx("investigator_model_profile_arn"),
             action_model_profile_arn=_ctx("action_model_profile_arn"),
+            inbound_source_arn=_ctx("inbound_source_arn") or None,
         )
         if offline:
             return raw
@@ -309,14 +323,19 @@ class DeploymentIdentities:
                 resource_kind="Secrets Manager secret resource",
             )
         for agent in ("monitor", "investigator", "action"):
-            _validate_identity(
-                getattr(self, f"{agent}_runtime_arn"),
-                field_name=f"{agent}_runtime_arn",
-                service="bedrock-agentcore",
-                resource_re=_RUNTIME_ENDPOINT_RESOURCE_RE,
-                resource_kind="AgentCore runtime-endpoint resource "
-                "(runtime/<id>/runtime-endpoint/<id>)",
-            )
+            # The three runtime ARNs are cross-stack outputs produced by the Agents stack during
+            # deployment rather than pre-existing identities, so they are optional and shape-checked
+            # only when supplied.
+            runtime_arn = getattr(self, f"{agent}_runtime_arn")
+            if runtime_arn:  # optional; shape-checked only when supplied
+                _validate_identity(
+                    runtime_arn,
+                    field_name=f"{agent}_runtime_arn",
+                    service="bedrock-agentcore",
+                    resource_re=_RUNTIME_ENDPOINT_RESOURCE_RE,
+                    resource_kind="AgentCore runtime-endpoint resource "
+                    "(runtime/<id>/runtime-endpoint/<id>)",
+                )
             profile = getattr(self, f"{agent}_model_profile_arn")
             if profile:  # optional; shape-checked only when supplied
                 _validate_identity(
@@ -326,6 +345,15 @@ class DeploymentIdentities:
                     resource_re=_MODEL_PROFILE_RESOURCE_RE,
                     resource_kind="Bedrock application-inference-profile resource",
                 )
+        if self.inbound_source_arn:  # optional; shape-checked only when supplied
+            _validate_identity(
+                self.inbound_source_arn,
+                field_name="inbound_source_arn",
+                service="ses",
+                resource_re=_RECEIPT_RULE_RESOURCE_RE,
+                resource_kind="SES receipt-rule resource "
+                "(receipt-rule-set/<set>/receipt-rule/<rule>)",
+            )
         return self
 
     @property

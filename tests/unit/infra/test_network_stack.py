@@ -16,7 +16,17 @@ from typing import Any
 
 from aws_cdk import App, Environment, assertions
 from infra.cdk.config import CdkBuildConfig
-from infra.cdk.network_support import INTERFACE_ENDPOINTS, NetworkConfig
+from infra.cdk.network_support import (
+    AGENT_RUNTIME_WORKLOADS,
+    INTERFACE_ENDPOINTS,
+    MANAGED_PREFIX_LIST_DYNAMODB,
+    MANAGED_PREFIX_LIST_S3,
+    WORKLOAD_COMPILER,
+    WORKLOAD_RESET,
+    WORKLOAD_SENDER,
+    WORKLOAD_WORKER,
+    NetworkConfig,
+)
 from infra.cdk.stacks.network import ChorusNetworkStack
 
 SUBNET = "AWS::EC2::Subnet"
@@ -203,7 +213,9 @@ def test_the_bedrock_runtime_endpoint_is_reachable_by_no_current_workload() -> N
     (deployment contract § 8)."""
 
     spec = next(s for s in INTERFACE_ENDPOINTS if s.logical_id == "BedrockRuntimeEndpoint")
-    assert spec.reachable_by == ()
+    assert spec.reachable_by == AGENT_RUNTIME_WORKLOADS
+    lambda_workloads = (WORKLOAD_WORKER, WORKLOAD_COMPILER, WORKLOAD_SENDER, WORKLOAD_RESET)
+    assert not any(w in spec.reachable_by for w in lambda_workloads)
 
 
 def _all_ingress_rules() -> list[dict[str, Any]]:
@@ -297,3 +309,183 @@ def test_the_dynamodb_endpoint_policy_names_only_the_three_chorus_tables() -> No
     assert "chorus-shareable-demo" in rendered
     assert "chorus-audit-demo" in rendered
     assert "dynamodb:Scan" not in json.dumps(statement["Action"])
+
+
+# -- Phase 11 Macro B: AgentCore runtime networking (deployment contract §§ 6-8, 14, 24) --
+
+
+def _sg_logical_id_by_group_name(group_name: str) -> str:
+    for logical_id, res in _resources(SECURITY_GROUP).items():
+        if res.get("Properties", {}).get("GroupName") == group_name:
+            return logical_id
+    raise KeyError(f"No security group found with GroupName={group_name}")
+
+
+def _resolve_sg_ref(val: Any) -> str | None:
+    if isinstance(val, dict):
+        if "Ref" in val:
+            return str(val["Ref"])
+        if "Fn::GetAtt" in val and isinstance(val["Fn::GetAtt"], list):
+            return str(val["Fn::GetAtt"][0])
+    elif isinstance(val, str):
+        return val
+    return None
+
+
+def _ingress_rules_for_sg(sg_logical_id: str) -> list[dict[str, Any]]:
+    sg_res = _resources(SECURITY_GROUP)[sg_logical_id]
+    rules: list[dict[str, Any]] = list(
+        sg_res.get("Properties", {}).get("SecurityGroupIngress", []) or []
+    )
+    for r in _resources(SG_INGRESS).values():
+        props = r["Properties"]
+        target = _resolve_sg_ref(props.get("GroupId"))
+        if target == sg_logical_id:
+            rules.append(props)
+    return rules
+
+
+def _egress_rules_for_sg(sg_logical_id: str) -> list[dict[str, Any]]:
+    sg_res = _resources(SECURITY_GROUP)[sg_logical_id]
+    rules: list[dict[str, Any]] = list(
+        sg_res.get("Properties", {}).get("SecurityGroupEgress", []) or []
+    )
+    for r in _resources(SG_EGRESS).values():
+        props = r["Properties"]
+        target = _resolve_sg_ref(props.get("GroupId"))
+        if target == sg_logical_id:
+            rules.append(props)
+    return rules
+
+
+def test_seven_workload_security_groups_exist_with_expected_names() -> None:
+    """Requirement 13: Seven workload security groups exist with expected names (chorus-*-{env})."""
+    expected_workload_sg_names = {
+        "chorus-worker-demo",
+        "chorus-compiler-demo",
+        "chorus-sender-demo",
+        "chorus-reset-demo",
+        "chorus-monitor-runtime-demo",
+        "chorus-investigator-runtime-demo",
+        "chorus-action-runtime-demo",
+    }
+    sg_resources = _resources(SECURITY_GROUP)
+    actual_names = {
+        res["Properties"].get("GroupName")
+        for res in sg_resources.values()
+        if "GroupName" in res.get("Properties", {})
+    }
+    assert expected_workload_sg_names.issubset(actual_names)
+    workload_sgs = [
+        res
+        for res in sg_resources.values()
+        if res["Properties"].get("GroupName") in expected_workload_sg_names
+    ]
+    assert len(workload_sgs) == 7
+    for name in expected_workload_sg_names:
+        logical_id = _sg_logical_id_by_group_name(name)
+        assert logical_id in sg_resources
+
+
+def test_bedrock_runtime_endpoint_sg_admits_ingress_from_runtime_sgs_only() -> None:
+    """Requirement 14: bedrock-runtime endpoint SG admits ingress on TCP 443 from exactly
+    the three runtime SGs and no Lambda workload SG."""
+    bedrock_sg_logical_id = _sg_logical_id_by_group_name("chorus-bedrockruntimeendpoint-demo")
+    ingress_rules = _ingress_rules_for_sg(bedrock_sg_logical_id)
+    assert len(ingress_rules) == 3
+
+    source_names: set[str] = set()
+    for rule in ingress_rules:
+        assert rule.get("IpProtocol") == "tcp"
+        assert rule.get("FromPort") == 443
+        assert rule.get("ToPort") == 443
+        source_ref = _resolve_sg_ref(rule.get("SourceSecurityGroupId"))
+        assert source_ref is not None
+        source_name = _resources(SECURITY_GROUP)[source_ref]["Properties"]["GroupName"]
+        source_names.add(source_name)
+
+    expected_runtime_sg_names = {
+        "chorus-monitor-runtime-demo",
+        "chorus-investigator-runtime-demo",
+        "chorus-action-runtime-demo",
+    }
+    assert source_names == expected_runtime_sg_names
+
+    lambda_sg_names = {
+        "chorus-worker-demo",
+        "chorus-compiler-demo",
+        "chorus-sender-demo",
+        "chorus-reset-demo",
+    }
+    assert not (source_names & lambda_sg_names)
+
+
+def test_each_runtime_sg_egress_is_exactly_bedrock_runtime_and_s3() -> None:
+    """Requirement 15: Each runtime SG's egress is exactly:
+    - 443 to bedrock-runtime endpoint SG.
+    - 443 to S3 managed prefix list (MANAGED_PREFIX_LIST_S3).
+    Assert count is 2."""
+    bedrock_sg_logical_id = _sg_logical_id_by_group_name("chorus-bedrockruntimeendpoint-demo")
+    runtime_sg_names = (
+        "chorus-monitor-runtime-demo",
+        "chorus-investigator-runtime-demo",
+        "chorus-action-runtime-demo",
+    )
+
+    for sg_name in runtime_sg_names:
+        sg_logical_id = _sg_logical_id_by_group_name(sg_name)
+        egress_rules = _egress_rules_for_sg(sg_logical_id)
+        assert len(egress_rules) == 2, f"{sg_name} expected 2 egress rules, got {len(egress_rules)}"
+
+        # Verify S3 prefix list rule
+        s3_prefix_rules = [
+            r for r in egress_rules if r.get("DestinationPrefixListId") == MANAGED_PREFIX_LIST_S3
+        ]
+        assert len(s3_prefix_rules) == 1, f"{sg_name} missing MANAGED_PREFIX_LIST_S3 egress rule"
+        s3_rule = s3_prefix_rules[0]
+        assert s3_rule.get("FromPort") == 443
+        assert s3_rule.get("ToPort") == 443
+        assert s3_rule.get("IpProtocol") == "tcp"
+
+        # Verify Bedrock runtime endpoint SG rule
+        bedrock_rules = [
+            r
+            for r in egress_rules
+            if _resolve_sg_ref(r.get("DestinationSecurityGroupId")) == bedrock_sg_logical_id
+        ]
+        assert len(bedrock_rules) == 1, f"{sg_name} missing bedrock-runtime SG egress rule"
+        bedrock_rule = bedrock_rules[0]
+        assert bedrock_rule.get("FromPort") == 443
+        assert bedrock_rule.get("ToPort") == 443
+        assert bedrock_rule.get("IpProtocol") == "tcp"
+
+
+def test_no_runtime_sg_has_egress_to_dynamodb_or_other_endpoint_sg() -> None:
+    """Requirement 16: No runtime SG has an egress rule to MANAGED_PREFIX_LIST_DYNAMODB
+    or to any other endpoint SG."""
+    bedrock_sg_logical_id = _sg_logical_id_by_group_name("chorus-bedrockruntimeendpoint-demo")
+    runtime_sg_names = (
+        "chorus-monitor-runtime-demo",
+        "chorus-investigator-runtime-demo",
+        "chorus-action-runtime-demo",
+    )
+
+    for sg_name in runtime_sg_names:
+        sg_logical_id = _sg_logical_id_by_group_name(sg_name)
+        egress_rules = _egress_rules_for_sg(sg_logical_id)
+
+        # Assert no rule targets DynamoDB managed prefix list
+        ddb_rules = [
+            r
+            for r in egress_rules
+            if r.get("DestinationPrefixListId") == MANAGED_PREFIX_LIST_DYNAMODB
+        ]
+        assert not ddb_rules, f"{sg_name} has unexpected DynamoDB prefix list egress rule"
+
+        # Assert no SG target other than Bedrock runtime endpoint SG
+        for rule in egress_rules:
+            dest_sg = _resolve_sg_ref(rule.get("DestinationSecurityGroupId"))
+            if dest_sg is not None:
+                assert dest_sg == bedrock_sg_logical_id, (
+                    f"{sg_name} has unexpected egress to SG {dest_sg}"
+                )

@@ -12,9 +12,11 @@ are the other half and belong to Phase 11.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cache
 from typing import Any
 
-from aws_cdk import App, assertions
+from aws_cdk import App, Stack, assertions
+from infra.cdk.app import build_app
 from infra.cdk.config import CdkBuildConfig
 from infra.cdk.stacks import ChorusAgentStack
 from infra.cdk.stacks.agents import (
@@ -56,9 +58,33 @@ def template(*, artifact_bucket_arn: str | None = None) -> assertions.Template:
         "TestAgents",
         config=CdkBuildConfig(),
         artifact_bucket_arn=artifact_bucket_arn,
-        **PROFILE_ARNS,  # type: ignore[arg-type]
     )
     return assertions.Template.from_stack(stack)
+
+
+@cache
+def runtime_template() -> assertions.Template:
+    """The Agents stack as it synthesizes in the real app, where the profiles exist.
+
+    Macro B made the three application inference profiles resources of this stack, created only
+    when the VPC, subnets, security groups and artifact bucket are all supplied. The isolated
+    ``template()`` above therefore has no model grant, so the model assertions read the real
+    synthesis instead.
+    """
+
+    app = build_app(offline=True, context={"environment": "demo", "namespace": "DEMO"})
+    stack = next(
+        child
+        for child in app.node.children
+        if isinstance(child, Stack) and child.stack_name == "AmbientChorusAgents"
+    )
+    return assertions.Template.from_stack(stack)
+
+
+def profile_attr(agent: str) -> dict[str, object]:
+    """The generated ARN reference for one agent's application inference profile."""
+
+    return {"Fn::GetAtt": [f"{agent.capitalize()}InferenceProfile", "InferenceProfileArn"]}
 
 
 def statements(built: assertions.Template) -> list[Mapping[str, Any]]:
@@ -109,24 +135,23 @@ def test_the_investigator_role_is_assumable_only_by_the_agentcore_service() -> N
 
 
 def test_the_investigator_may_invoke_only_its_own_inference_profile() -> None:
-    built = template()
+    built = runtime_template()
     allowed = statement(built, INVESTIGATOR_STATEMENT_IDS.invoke_profile)
-    # I4 / P1-2: BOTH model actions -- the runtime's structured-output call streams.
+    # Macro B Chunk 2: exactly ONE model action. ``structured_output`` -> ``stream`` ->
+    # ``converse_stream``, so ``bedrock:InvokeModel`` would be an unused grant.
     assert actions_of(built, INVESTIGATOR_STATEMENT_IDS.invoke_profile) == {
-        "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
     }
-    assert allowed["Resource"] == INVESTIGATOR_PROFILE_ARN
-    assert "chorus-monitor" not in str(allowed["Resource"])
+    assert allowed["Resource"] == profile_attr("investigator")
+    assert "MonitorInferenceProfile" not in str(allowed["Resource"])
 
 
 def test_the_investigator_fm_grant_is_bound_to_its_own_profile_across_three_regions() -> None:
-    built = template()
+    built = runtime_template()
     fm = statement(built, INVESTIGATOR_STATEMENT_IDS.invoke_foundation_models)
 
     assert fm["Effect"] == "Allow"
     assert actions_of(built, INVESTIGATOR_STATEMENT_IDS.invoke_foundation_models) == {
-        "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
     }
     assert set(fm["Resource"]) == {
@@ -134,9 +159,8 @@ def test_the_investigator_fm_grant_is_bound_to_its_own_profile_across_three_regi
         for region in US_INFERENCE_PROFILE_DESTINATION_REGIONS
     }
     assert all("111122223333" not in arn for arn in fm["Resource"])
-    assert (
-        fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY]
-        == INVESTIGATOR_PROFILE_ARN
+    assert fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY] == profile_attr(
+        "investigator"
     )
     assert MONITOR_PROFILE_ARN not in str(fm)
     assert ACTION_PROFILE_ARN not in str(fm)
