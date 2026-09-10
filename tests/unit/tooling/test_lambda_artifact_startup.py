@@ -137,12 +137,29 @@ sys.stdout.write("PROBE:" + json.dumps({
 }))
 """
 
+# Ambient AWS credential / profile / provider variables scrubbed from the probe's child
+# environment entirely, so client construction cannot lean on a developer or CI profile,
+# instance metadata, container credentials, or a web-identity role. Scrubbing (rather than
+# blanking) matters: botocore reads an empty ``AWS_PROFILE`` / ``AWS_DEFAULT_PROFILE`` as a
+# real profile literally named "" and raises ``ProfileNotFound``; an absent variable means
+# "no profile selected", which is what we want.
+AWS_AMBIENT_VARS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+)
+
+# Safe isolation controls layered on top of the scrub: the EC2 metadata endpoint off, and
+# the shared-credentials and config files pointed at the null device so no on-disk profile
+# is discovered either. No profile is named -- neither set nor blanked.
 CREDENTIAL_FREE = {
     "AWS_EC2_METADATA_DISABLED": "true",
-    "AWS_ACCESS_KEY_ID": "",
-    "AWS_SECRET_ACCESS_KEY": "",
-    "AWS_SESSION_TOKEN": "",
-    "AWS_PROFILE": "",
     "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
     "AWS_CONFIG_FILE": os.devnull,
 }
@@ -174,7 +191,9 @@ def extracted(directory: str, built_artifact_paths: dict[str, Path], tmp_path: P
 def _run(
     cwd: Path, source: str, *arguments: str, flags: list[str]
 ) -> subprocess.CompletedProcess[str]:
-    environment = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    environment = {
+        k: v for k, v in os.environ.items() if k != "PYTHONPATH" and k not in AWS_AMBIENT_VARS
+    }
     environment.update(CREDENTIAL_FREE)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return subprocess.run(  # noqa: S603 - fixed argv, no shell, source from this file
