@@ -72,6 +72,8 @@ _MODEL_PROFILE_RESOURCE_RE = re.compile(r"^application-inference-profile/[^/\s]+
 _RECEIPT_RULE_RESOURCE_RE = re.compile(r"^receipt-rule-set/[^/\s]+/receipt-rule/[^/\s]+$")
 """``receipt-rule-set/<ruleset-name>/receipt-rule/<rule-name>`` -- the full SES receipt rule
 resource, both components non-empty."""
+_SES_IDENTITY_RESOURCE_RE = re.compile(r"^identity/[^/\s]+$")
+"""``identity/<email-or-domain>`` -- an SES verified identity, non-empty."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +178,20 @@ def _offline_receipt_rule_arn(environment: str) -> str:
     )
 
 
+def _offline_ses_identity_arn(environment: str) -> str:
+    """A clearly-typed offline fixture for the sender's verified SES identity.
+
+    The real identity is a deployment-time fact (which mailbox was actually verified in this
+    account), never constructed from a name -- the same reasoning as the model-profile and
+    receipt-rule fixtures above. Optional: the sender's IAM grant degrades to the
+    configuration-set resource alone when it is not supplied (deployment contract SS 8.1)."""
+
+    return (
+        f"arn:aws:ses:{PHASE_11_REGION}:{_SENTINEL_ACCOUNT}:identity/"
+        f"chorus-{environment}-PLACEHOLDER"
+    )
+
+
 def _validate_identity(
     value: str,
     *,
@@ -253,6 +269,7 @@ class DeploymentIdentities:
     investigator_model_profile_arn: str = ""
     action_model_profile_arn: str = ""
     inbound_source_arn: str | None = None
+    ses_identity_arn: str | None = None
 
     def __post_init__(self) -> None:
         if not self.offline:
@@ -272,6 +289,7 @@ class DeploymentIdentities:
             ),
             "action_model_profile_arn": _offline_model_profile_arn(self.environment, "action"),
             "inbound_source_arn": _offline_receipt_rule_arn(self.environment),
+            "ses_identity_arn": _offline_ses_identity_arn(self.environment),
         }
         for name, value in fixtures.items():
             if not getattr(self, name):
@@ -302,6 +320,7 @@ class DeploymentIdentities:
             investigator_model_profile_arn=_ctx("investigator_model_profile_arn"),
             action_model_profile_arn=_ctx("action_model_profile_arn"),
             inbound_source_arn=_ctx("inbound_source_arn") or None,
+            ses_identity_arn=_ctx("ses_identity_arn") or None,
         )
         if offline:
             return raw
@@ -353,6 +372,14 @@ class DeploymentIdentities:
                 resource_re=_RECEIPT_RULE_RESOURCE_RE,
                 resource_kind="SES receipt-rule resource "
                 "(receipt-rule-set/<set>/receipt-rule/<rule>)",
+            )
+        if self.ses_identity_arn:  # optional; shape-checked only when supplied
+            _validate_identity(
+                self.ses_identity_arn,
+                field_name="ses_identity_arn",
+                service="ses",
+                resource_re=_SES_IDENTITY_RESOURCE_RE,
+                resource_kind="SES identity resource (identity/<address-or-domain>)",
             )
         return self
 

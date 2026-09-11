@@ -217,6 +217,9 @@ class ChorusSenderStack(Stack):
         destination_registry_secret_arn = (
             destination_registry_secret_arn or identities.destination_registry_secret_arn
         )
+        # The verified SES sending identity's ARN, deployment-config-carried like the secret
+        # identities above (never hardcoded): an explicit constructor argument still wins.
+        ses_identity_arn = ses_identity_arn or identities.ses_identity_arn
         # The compiler ARN the sender invokes for both halves of the fence. The **actual**
         # compiler ``Function`` ARN when the Compiler stack passed one (review P2-2); the
         # deterministic literal only as an isolated-synthesis fallback.
