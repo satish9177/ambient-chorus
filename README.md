@@ -2,8 +2,17 @@
 
 > One complaint is easy to ignore. Chorus finds the pattern.
 
-**STATUS: Phase 0–1 deterministic foundation implemented; later phases are intentionally
-deferred.**
+**STATUS: Phases 0–11 implemented — ambient intake through AWS deployment.** Seven of eleven
+AWS CDK stacks are independently deployed and verified live in `us-east-1`: Foundation, Network,
+Data, Reset, Compiler, Sender, and Watcher, including a verified SES sending identity, a live
+`SendEmail` canary, and confirmed delivery to a real Gmail inbox. The three Bedrock AgentCore
+agent runtimes (Monitor, Investigator, Action) are code-complete and validated under offline CDK
+synthesis; live agent execution is currently blocked by AWS account provisioning (AgentCore
+quota and Bedrock Nova 2 Lite model access), tracked in an open, escalated AWS Support case. The
+Application, Inbound, and Observability stacks are built but not yet independently reverified
+live. See [phase-11-deployment-contract.md](docs/plans/phase-11-deployment-contract.md) for the
+deployment architecture and [phase-13-submission-kit.md](docs/plans/phase-13-submission-kit.md)
+for the current live/blocked breakdown and demo plan.
 
 Ambient CHORUS is a background community investigator for the AWS Agents for Humans Hackathon, Good Neighbor Agents track. It watches a channel a community already uses, recognizes when independent fragments point to the same unresolved problem, asks affected people privately what may be shared, and turns only authorized facts into one evidence-backed action.
 
@@ -23,15 +32,16 @@ This is **compile, don't filter**. CHORUS does not give an LLM private data and 
 - **Mandate / Privacy Compiler:** deterministic, fail-closed authorization code that is the only creator of `ShareableCaseView`.
 - **Commitment Watcher:** deterministic scheduling and replay-safe deadline verification. `ACTIONED` never means `RESOLVED`.
 
-The planned AWS stack is Python 3.12, FastAPI, Pydantic v2, Strands Agents, Amazon Bedrock with Nova 2 Lite, Bedrock AgentCore Runtime, DynamoDB, S3, SES, EventBridge Scheduler, Lambda, CloudWatch, React, TypeScript, Vite, AWS CDK v2, `uv`, and `npm`.
+The AWS stack is Python 3.12, FastAPI, Pydantic v2, Strands Agents, Amazon Bedrock with Nova 2 Lite, Bedrock AgentCore Runtime, DynamoDB, S3, SES, EventBridge Scheduler, Lambda, CloudWatch, React, TypeScript, Vite, AWS CDK v2, `uv`, and `npm`. Nova 2 Lite and AgentCore are code-complete but not yet live — see the status note above.
 
 ## Engineering source of truth
 
 Start with [docs/README.md](docs/README.md). It defines the document precedence, frozen decisions, reading order, ADR index, and implementation-plan entry point. [AGENTS.md](AGENTS.md) contains mandatory instructions for coding agents.
 
 The build sequence is in
-[docs/plans/implementation-plan.md](docs/plans/implementation-plan.md). Phase 0 and Phase 1
-were explicitly approved; implementation must stop before Phase 2 until separately approved.
+[docs/plans/implementation-plan.md](docs/plans/implementation-plan.md). Phases 0 through 11 have
+been implemented and approved in sequence; Phase 13 (hackathon submission) is in progress. Any
+further architectural change still requires an accepted ADR first.
 
 ## Developer commands
 
