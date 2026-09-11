@@ -208,6 +208,26 @@ def test_the_codec_has_no_default_secret() -> None:
     assert field.default_factory is MISSING
 
 
+NON_KEY_CONSTANTS = frozenset(
+    {
+        "SECRETS_SERVICE_NAME",
+        "DEMO_ACCESS_SECRET_SCHEMA",
+        "CURSOR_SIGNING_SECRET_SCHEMA",
+    }
+)
+"""Assignments the "no literal on a secret line" scan below is allowed to skip.
+
+Both are *identifiers*, not key material: the boto3 service name a Secrets Manager client must
+be constructed with, and the schema token a secret's own JSON body declares. Neither is
+sensitive and neither can be renamed out of the way -- the service really is called
+``secretsmanager``, and a secret's schema token really does name the secret.
+
+Enumerated rather than pattern-matched so that adding one is a visible, reviewable event. A
+constant admitted here must be a value that is safe to read in a public repository, and the
+scan stays exact for everything else.
+"""
+
+
 def test_no_runtime_module_embeds_signing_key_material() -> None:
     """Key material lives only in tests; runtime code must receive it from its caller."""
 
@@ -217,6 +237,8 @@ def test_no_runtime_module_embeds_signing_key_material() -> None:
         assert "CURSOR_SECRET" not in source
         for line in source.splitlines():
             if "secret" not in line.lower():
+                continue
+            if any(line.lstrip().startswith(name) for name in NON_KEY_CONSTANTS):
                 continue
             # A byte or text literal on a line mentioning a secret is the shape of an
             # embedded key. Type annotations and messages carry no literal.

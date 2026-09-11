@@ -55,7 +55,28 @@ class Settings(BaseSettings):
     audit_table: str = "chorus-audit-development"
     private_evidence_bucket: str = "chorus-private-evidence-development"
     export_evidence_bucket: str = "chorus-export-evidence-development"
-    dynamodb_endpoint: AnyHttpUrl | None = AnyHttpUrl("http://localhost:8000")
+    private_evidence_key_arn: str | None = None
+    export_evidence_key_arn: str | None = None
+    """The exact KMS key ARN each evidence bucket is encrypted under, from CDK outputs.
+
+    ``S3ObjectStore`` passes these as ``SSEKMSKeyId`` on every ``put_object``. The deployed
+    bucket policy denies a write whose ``s3:x-amz-server-side-encryption-aws-kms-key-id`` is
+    absent or not the configured key, so a production composition that leaves these unset must
+    fail closed rather than write an object the policy rejects (deployment contract SS 9). They
+    stay **separate** so the private/export trust split is two keys and not one. ``None`` in the
+    environments Phase 9 ships, where the in-memory object store is used and no bucket policy is
+    evaluated.
+    """
+    dynamodb_endpoint: AnyHttpUrl | None = None
+    """A local DynamoDB endpoint, or ``None`` to reach the real service.
+
+    The default is ``None`` because that is what a **deployed** composition requires: every
+    function that touches DynamoDB passes this straight through as ``endpoint_url`` and a
+    deployed API refuses to construct when it is set at all (deployment contract SS 14). Local
+    development against DynamoDB Local sets ``CHORUS_DYNAMODB_ENDPOINT=http://localhost:8000``
+    explicitly in ``.env`` (see ``.env.example``); the in-memory local composition never reads
+    this field.
+    """
     local_data_dir: Path = Path(".local")
 
     agent_mode: AgentMode = AgentMode.FAKE
@@ -102,12 +123,29 @@ class Settings(BaseSettings):
     """
     destination_address_digest: str | None = None
     inbound_address_digest: str | None = None
-    """The two non-secret comparison tokens of ADR-026 § 3.
+    """The two non-secret comparison tokens of ADR-026 § 3 (and ADR-030 §§ 5-6).
 
     Digests and never addresses: the destination-address secret belongs to the sender alone,
     and the inbound principal must not become a second holder. They are ordinary deployment
     configuration in the same class as the safe destination label, the registry version, and
     the routing token -- non-secret, naming no mailbox, and never accepted as a credential.
+    ``inbound_address_digest`` is compared against every entry of ``receipt.recipients``
+    (ADR-030 § 6); ``destination_address_digest`` against the parsed RFC 5322 ``From`` mailbox
+    (ADR-030 § 5).
+    """
+    inbound_receiving_address: str | None = None
+    """The non-secret inbound mailbox the SES receipt rule matches on.
+
+    Names a mailbox, so it is deployment configuration rather than a value read from a delivery.
+    The inbound Lambda derives ``inbound_address_digest`` from it when that digest is not set
+    explicitly, so a deploy that configures one of the two need not configure both.
+    """
+    inbound_topic_arn: str | None = None
+    """The SNS topic ARN the inbound Lambda is subscribed to.
+
+    The adapter's *consistency check* only (ADR-030 § 2): ``Records[i].Sns.TopicArn`` must equal
+    it. It is never proof of origin -- the resource-policy chain is -- and it is never compared
+    with ``inbound_source_arn`` (the two ARNs are distinct and describe different resources).
     """
     ses_configuration_set: str = "chorus-development"
     ses_from_identity_id: str = Field(
@@ -135,29 +173,42 @@ class Settings(BaseSettings):
     destination_routing_token: UUID = UUID("00000000-0000-0000-0000-000000000000")
     destination_registry_secret_arn: str | None = None
     demo_access_secret_arn: str | None = None
+    cursor_signing_secret_arn: str | None = None
+    """The one Secrets Manager identity a pagination cursor's HMAC key is drawn from.
+
+    Deliberately its own secret rather than a field folded into the demo access secret: the two
+    have unrelated blast radii (a leaked cursor key lets a caller forge a page token; a leaked
+    access digest lets a caller pass the bearer check) and unrelated rotation schedules, and a
+    purpose-separated secret is what keeps rotating one from ever touching the other.
+
+    Read once per execution environment when the API's request path is composed
+    (:func:`functions.api.composition.build_api_container`) and never regenerated per cold
+    start: a cursor a browser is holding when its serving container recycles must still verify
+    on whichever container answers the next page request, and a random per-container key
+    cannot promise that (Phase 11 batch 4 repair, P2-5).
+    """
     demo_clock_enabled: bool = True
     otel_enabled: bool = False
 
     @model_validator(mode="after")
     def validate_environment_contract(self) -> Settings:
-        """Reject environment combinations that would create an unsafe fallback."""
+        """Reject environment combinations that would create an unsafe fallback.
+
+        This is the **global** contract every deployed process shares -- ``demo`` runs in the
+        ``DEMO`` namespace under ``agentcore`` mode, and nothing else. *Which* AgentCore
+        runtime, model-profile, secret, or function ARNs a given process actually needs is a
+        property of its **composition**, so those requirements moved into the per-function
+        settings mappers (``worker_settings``, ``api_settings``, and friends) -- the API, the
+        compiler, the sender, and the watcher never invoke an agent and no longer have to carry
+        six ARNs to satisfy a validator (review P2-8). ``build_worker`` still refuses a missing
+        runtime endpoint ARN, so "the worker cannot start without its agents" is unchanged.
+        """
 
         if self.environment is Environment.DEMO:
             if self.namespace != "DEMO":
                 raise ValueError("demo environment requires the DEMO namespace")
             if self.agent_mode is not AgentMode.AGENTCORE:
                 raise ValueError("demo environment requires agentcore mode")
-        if self.agent_mode is AgentMode.AGENTCORE:
-            required = (
-                self.monitor_runtime_arn,
-                self.investigator_runtime_arn,
-                self.action_runtime_arn,
-                self.monitor_model_profile_arn,
-                self.investigator_model_profile_arn,
-                self.action_model_profile_arn,
-            )
-            if any(value is None or value == "" for value in required):
-                raise ValueError("agentcore mode requires all runtime and model profile ARNs")
         return self
 
     @classmethod

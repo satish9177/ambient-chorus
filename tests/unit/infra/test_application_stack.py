@@ -16,6 +16,7 @@ repository can be changed by anyone, and a policy is what AWS actually enforces.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -32,6 +33,8 @@ from infra.cdk.stacks import (
 from infra.cdk.stacks.application import (
     APPLICATION_SHAREABLE_PREFIXES,
     CONDITION_CHECK_ACTION,
+    DEMO_CLOCK_PARTITION,
+    DENIED_CLOCK_WRITE_ACTIONS,
     DENIED_MODEL_ACTIONS,
     DENIED_SEND_ACTIONS,
     DENIED_VIEW_WRITE_ACTIONS,
@@ -261,6 +264,42 @@ def test_agent_invocation_is_scoped_to_named_runtimes_when_supplied() -> None:
     assert actions_of(found[0]) == {"bedrock-agentcore:InvokeAgentRuntime"}
 
 
+def test_agent_live_endpoint_arns_take_precedence_over_runtime_arns() -> None:
+    live_endpoints = (
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_monitor/runtime-endpoint/live",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_investigator/runtime-endpoint/live",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_action/runtime-endpoint/live",
+    )
+    fallback_runtimes = (
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/other-monitor",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/other-investigator",
+        "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/other-action",
+    )
+    built = _template(
+        agent_live_endpoint_arns=live_endpoints,
+        agent_runtime_arns=fallback_runtimes,
+    )
+    found = [
+        item for item in statements(built) if item.get("Sid") == "InvokeNamedAgentRuntimesOnly"
+    ]
+
+    assert found
+    grant = found[0]
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"bedrock-agentcore:InvokeAgentRuntime"}
+    assert grant["Resource"] == list(live_endpoints)
+
+    worker_fn = built.find_resources("AWS::Lambda::Function")
+    worker_vars = next(
+        res["Properties"]["Environment"]["Variables"]
+        for res in worker_fn.values()
+        if "chorus-worker" in str(res["Properties"].get("FunctionName", ""))
+    )
+    assert worker_vars["CHORUS_MONITOR_RUNTIME_ARN"] == live_endpoints[0]
+    assert worker_vars["CHORUS_INVESTIGATOR_RUNTIME_ARN"] == live_endpoints[1]
+    assert worker_vars["CHORUS_ACTION_RUNTIME_ARN"] == live_endpoints[2]
+
+
 def test_no_allow_statement_grants_a_wildcard_resource() -> None:
     for item in statements():
         if item["Effect"] != "Allow":
@@ -269,6 +308,388 @@ def test_no_allow_statement_grants_a_wildcard_resource() -> None:
 
 
 def test_the_application_stack_is_part_of_the_synthesized_app() -> None:
-    assembly = build_app().synth()
+    assembly = build_app(offline=True).synth()
 
     assert "AmbientChorusApplication" in [stack.stack_name for stack in assembly.stacks]
+
+
+# =====================================================================================
+# I5 -- the request path and the durable worker are two principals, not one
+# =====================================================================================
+
+ROLE_TYPE = "AWS::IAM::Role"
+
+WORKER_FN = "arn:aws:lambda:us-east-1:111122223333:function:chorus-worker-demo"
+COMPILER_FN = "arn:aws:lambda:us-east-1:111122223333:function:chorus-compiler-demo"
+SENDER_FN = "arn:aws:lambda:us-east-1:111122223333:function:chorus-sender-demo"
+RUNTIME_ARNS = (
+    "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_monitor-abc",
+    "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_investigator-def",
+    "arn:aws:bedrock-agentcore:us-east-1:111122223333:runtime/chorus_action-ghi",
+)
+DEMO_SECRET = "arn:aws:secretsmanager:us-east-1:111122223333:secret:chorus-demo-access-AbCdEf"
+CURSOR_SECRET = "arn:aws:secretsmanager:us-east-1:111122223333:secret:chorus-cursor-signing-QrS"
+DEST_SECRET = "arn:aws:secretsmanager:us-east-1:111122223333:secret:chorus-demo-destination-XyZ"
+SCHEDULER_ROLE_ARN = "arn:aws:iam::111122223333:role/chorus-scheduler-demo"
+WATCHER_ALIAS = "arn:aws:lambda:us-east-1:111122223333:function:chorus-commitment-watcher-demo:live"
+
+
+def _split_template() -> assertions.Template:
+    # ``worker_function_arn`` is no longer an argument: the worker Lambda is created inside this
+    # stack, so the API binds to the created resource directly (deployment contract SS 15).
+    return _template(
+        agent_runtime_arns=RUNTIME_ARNS,
+        scheduler_group_name="chorus-demo",
+        scheduler_role_arn=SCHEDULER_ROLE_ARN,
+        compiler_function_arn=COMPILER_FN,
+        sender_function_arn=SENDER_FN,
+        watcher_alias_arn=WATCHER_ALIAS,
+        demo_access_secret_arn=DEMO_SECRET,
+        cursor_signing_secret_arn=CURSOR_SECRET,
+        destination_registry_secret_arn=DEST_SECRET,
+    )
+
+
+def _worker_function_logical_id(built: assertions.Template) -> str:
+    for logical_id, resource in built.find_resources("AWS::Lambda::Function").items():
+        if "chorus-worker" in str(resource["Properties"].get("FunctionName", "")):
+            return logical_id
+    raise AssertionError("no worker function in the Application stack")
+
+
+def _role_statements(built: assertions.Template, logical_prefix: str) -> list[Mapping[str, Any]]:
+    """Every policy statement attached to the role whose default policy logical id starts with
+    ``logical_prefix`` (``ApiRole`` / ``WorkerRole``)."""
+
+    found: list[Mapping[str, Any]] = []
+    for logical_id, policy in built.find_resources(POLICY_TYPE).items():
+        if logical_id.startswith(logical_prefix):
+            found.extend(policy["Properties"]["PolicyDocument"]["Statement"])
+    return found
+
+
+def _api(built: assertions.Template) -> list[Mapping[str, Any]]:
+    return _role_statements(built, "ApiRole")
+
+
+def _worker(built: assertions.Template) -> list[Mapping[str, Any]]:
+    return _role_statements(built, "WorkerRole")
+
+
+def _find(items: list[Mapping[str, Any]], sid: str) -> Mapping[str, Any]:
+    return next(item for item in items if item.get("Sid") == sid)
+
+
+def _allowed_actions(items: list[Mapping[str, Any]]) -> set[str]:
+    out: set[str] = set()
+    for item in items:
+        if item["Effect"] == "Allow":
+            out |= actions_of(item)
+    return out
+
+
+def test_the_stack_synthesizes_exactly_two_roles_named_api_and_worker() -> None:
+    built = _split_template()
+    built.resource_count_is(ROLE_TYPE, 2)
+    names = {
+        str(role["Properties"]["RoleName"]) for role in built.find_resources(ROLE_TYPE).values()
+    }
+    assert names == {"chorus-api-development", "chorus-worker-development"}
+
+
+# -- API: ALLOW the request path's capabilities ----------------------------------------
+
+
+def test_api_holds_the_shared_private_zone_boundary() -> None:
+    api = _api(_split_template())
+    allowed = _allowed_actions(api)
+    assert {"dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:ConditionCheckItem"} <= allowed
+    assert {"s3:GetObject", "s3:PutObject"} <= allowed
+    assert {"kms:Decrypt", "kms:GenerateDataKey"} <= allowed
+
+
+def test_api_writes_the_action_and_case_prefixes_but_not_outbound_message() -> None:
+    grant = _find(_api(_split_template()), "WriteApiActionAndCasePrefixesOnly")
+    keys = set(leading_keys(grant))
+    assert keys == {
+        "NS#*#ACTION#*",
+        "NS#*#ACTION_CURRENT#*",
+        "NS#*#EXECUTION#*",
+        "NS#*#CASE#*",
+    }
+    assert "NS#*#OUTBOUND_MESSAGE#*" not in keys
+
+
+def test_api_invokes_the_worker_and_the_compiler_and_nothing_else() -> None:
+    built = _split_template()
+    grant = _find(_api(built), "InvokeOperationWorkerAndCompilerOnly")
+    assert actions_of(grant) == {"lambda:InvokeFunction"}
+    # the compiler by its deterministic literal; the worker by a GetAtt of the in-stack resource
+    worker_logical = _worker_function_logical_id(built)
+    assert grant["Resource"] == [
+        {"Fn::GetAtt": [worker_logical, "Arn"]},
+        COMPILER_FN,
+    ]
+    assert SENDER_FN not in json.dumps(grant["Resource"])
+
+
+def test_the_api_and_the_worker_grant_name_the_same_in_stack_worker_function() -> None:
+    """SS 15: no hand-built external worker ARN. The API's invoke grant and the created worker
+    ``Function`` are provably one object."""
+
+    built = _split_template()
+    worker_logical = _worker_function_logical_id(built)
+    grant = _find(_api(built), "InvokeOperationWorkerAndCompilerOnly")
+    assert {"Fn::GetAtt": [worker_logical, "Arn"]} in grant["Resource"]
+    # the worker's own environment names the same function's ARN
+    env = built.find_resources("AWS::Lambda::Function")[worker_logical]["Properties"][
+        "Environment"
+    ]["Variables"]
+    assert "CHORUS_WORKER_FUNCTION_ARN" not in env  # the worker does not invoke itself
+
+
+def test_api_reads_the_demo_access_token_secret_only() -> None:
+    grant = _find(_api(_split_template()), "ReadDemoAccessTokenSecretOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"secretsmanager:GetSecretValue"}
+    assert grant["Resource"] == DEMO_SECRET
+
+
+def test_api_reads_the_cursor_signing_key_secret_only() -> None:
+    """P2-5: its own exact secret identity -- a separate statement from the demo access token
+    grant above, naming a different ARN, so widening one can never silently widen the other."""
+
+    grant = _find(_api(_split_template()), "ReadCursorSigningKeySecretOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"secretsmanager:GetSecretValue"}
+    assert grant["Resource"] == CURSOR_SECRET
+    assert grant["Resource"] != DEMO_SECRET
+
+
+# -- API: DENY / no grant of the worker-only capabilities ------------------------------
+
+
+def test_api_has_no_agentcore_invocation_grant_and_denies_it() -> None:
+    api = _api(_split_template())
+    assert "bedrock-agentcore:InvokeAgentRuntime" not in _allowed_actions(api)
+    deny = _find(api, "DenyApiAgentRuntimeInvocation")
+    assert deny["Effect"] == "Deny"
+    assert "bedrock-agentcore:InvokeAgentRuntime" in actions_of(deny)
+
+
+def test_api_has_no_scheduler_grant_and_denies_scheduler_creation() -> None:
+    api = _api(_split_template())
+    assert not any(a.startswith("scheduler:") for a in _allowed_actions(api))
+    deny = _find(api, "DenyApiSchedulerAuthority")
+    assert deny["Effect"] == "Deny"
+    assert {"scheduler:CreateSchedule", "scheduler:*"} <= actions_of(deny)
+
+
+def test_api_has_no_pass_role_grant_and_denies_it() -> None:
+    api = _api(_split_template())
+    assert "iam:PassRole" not in _allowed_actions(api)
+    deny = _find(api, "DenyApiPassRole")
+    assert deny["Effect"] == "Deny"
+    assert actions_of(deny) == {"iam:PassRole"}
+
+
+def test_api_cannot_read_the_destination_registry_secret() -> None:
+    deny = _find(_api(_split_template()), "DenyApiDestinationRegistrySecret")
+    assert deny["Effect"] == "Deny"
+    assert actions_of(deny) == {"secretsmanager:GetSecretValue"}
+    assert deny["Resource"] == DEST_SECRET
+
+
+# -- Worker: ALLOW the exact worker capabilities --------------------------------------
+
+
+def test_worker_invokes_the_three_named_runtimes() -> None:
+    grant = _find(_worker(_split_template()), "InvokeNamedAgentRuntimesOnly")
+    assert actions_of(grant) == {"bedrock-agentcore:InvokeAgentRuntime"}
+    assert set(grant["Resource"]) == set(RUNTIME_ARNS)
+
+
+def test_worker_invokes_the_compiler_and_the_sender() -> None:
+    grant = _find(_worker(_split_template()), "InvokeCompilerAndSenderOnly")
+    assert actions_of(grant) == {"lambda:InvokeFunction"}
+    assert set(grant["Resource"]) == {COMPILER_FN, SENDER_FN}
+    assert WORKER_FN not in grant["Resource"]
+
+
+def test_worker_writes_the_outbound_message_locator_prefix() -> None:
+    grant = _find(_worker(_split_template()), "WriteActionAndCasePrefixesOnly")
+    assert "NS#*#OUTBOUND_MESSAGE#*" in set(leading_keys(grant))
+
+
+def test_worker_creates_and_gets_schedules_and_passes_the_scheduler_role_alone() -> None:
+    worker = _worker(_split_template())
+    create = _find(worker, "CreateAndGetCommitmentSchedulesOnly")
+    assert actions_of(create) == {"scheduler:CreateSchedule", "scheduler:GetSchedule"}
+    assert "chorus-demo/*" in str(create["Resource"])
+
+    passrole = _find(worker, "PassSchedulerExecutionRoleOnly")
+    assert actions_of(passrole) == {"iam:PassRole"}
+    assert passrole["Resource"] == SCHEDULER_ROLE_ARN
+    assert passrole["Condition"]["StringEquals"]["iam:PassedToService"] == "scheduler.amazonaws.com"
+
+    deny = _find(worker, "DenyScheduleDeletionAndUpdate")
+    assert actions_of(deny) == {"scheduler:DeleteSchedule", "scheduler:UpdateSchedule"}
+
+
+# -- Worker: DENY / no grant of the demo-token secret --------------------------------
+
+
+def test_worker_reads_no_secret_and_denies_the_demo_token_read() -> None:
+    worker = _worker(_split_template())
+    assert not any(a.startswith("secretsmanager:") for a in _allowed_actions(worker))
+    deny = _find(worker, "DenyWorkerSecretReads")
+    assert deny["Effect"] == "Deny"
+    assert actions_of(deny) == {"secretsmanager:GetSecretValue"}
+    assert deny["Resource"] == "*"
+
+
+# -- Both: the earlier negative boundaries are retained on each role -----------------
+
+
+@pytest.mark.parametrize("collect", [_api, _worker], ids=["api", "worker"])
+def test_each_role_retains_the_view_send_and_model_denies(
+    collect: object,
+) -> None:
+    items = collect(_split_template())  # type: ignore[operator]
+    view = _find(items, "DenyViewPartitionWrites")
+    assert view["Effect"] == "Deny"
+    assert set(leading_keys(view)) == set(VIEW_KEY_PREFIXES)
+
+    send = _find(items, "DenyApplicationSend")
+    assert send["Effect"] == "Deny"
+    assert "ses:SendEmail" in actions_of(send)
+
+    model = _find(items, "DenyDirectModelAccess")
+    assert model["Effect"] == "Deny"
+    assert "bedrock:InvokeModel" in actions_of(model)
+
+
+@pytest.mark.parametrize("collect", [_api, _worker], ids=["api", "worker"])
+def test_neither_role_can_write_a_view_prefix(collect: object) -> None:
+    for item in collect(_split_template()):  # type: ignore[operator]
+        if item["Effect"] != "Allow":
+            continue
+        if not actions_of(item) & set(WRITE_ACTIONS):
+            continue
+        assert not (set(leading_keys(item)) & set(VIEW_KEY_PREFIXES)), item.get("Sid")
+
+
+def test_offline_synth_wires_the_cross_function_arns_and_secret_identities() -> None:
+    """Phase 11 batch 5 (SS 30): the offline synth wires the **actual** resources rather than
+    omitting optional arguments. With no explicit ARNs, the stack falls back to placeholder
+    deployment identities -- so both conditional grants now appear on each role, on concrete
+    ARNs, never a wildcard.
+    """
+
+    built = _template()
+
+    api = _api(built)
+    assert "lambda:InvokeFunction" in _allowed_actions(api)
+    assert "secretsmanager:GetSecretValue" in _allowed_actions(api)
+    demo = _find(api, "ReadDemoAccessTokenSecretOnly")
+    assert demo["Resource"] != "*" and "secret" in json.dumps(demo["Resource"])
+    cursor = _find(api, "ReadCursorSigningKeySecretOnly")
+    assert cursor["Resource"] != demo["Resource"]
+
+    worker = _worker(built)
+    assert "lambda:InvokeFunction" in _allowed_actions(worker)
+    # the worker still reads no secret
+    assert not any(a.startswith("secretsmanager:") for a in _allowed_actions(worker))
+
+
+# -- Phase 11 batch 4: the API -> watcher resolution ----------------------------------
+
+
+def test_the_api_may_invoke_the_watcher_live_alias_and_only_that() -> None:
+    """The exact resolution of the ``POST /v1/demo/clock/advance`` contradiction.
+
+    That endpoint's frozen response carries ``watcher_outcome`` and ``commitment_status``, so it
+    promises the watcher's *decision* rather than that one was scheduled. Serving that promise
+    means one synchronous invocation, which needs one grant -- and this asserts it is exactly
+    one, on exactly the ``:live`` alias.
+    """
+
+    grant = _find(_api(_split_template()), "InvokeCommitmentWatcherLiveAliasOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"lambda:InvokeFunction"}
+    assert grant["Resource"] == WATCHER_ALIAS
+
+
+def test_the_watcher_grant_names_the_alias_and_never_the_bare_function() -> None:
+    """Rollback repoints the alias at a published version; no policy statement changes.
+
+    An unqualified function ARN or a numeric version would both break that, so the assertion is
+    on the literal rather than on "it mentions the watcher somewhere".
+    """
+
+    resources: list[str] = []
+    for item in _api(_split_template()):
+        if item["Effect"] != "Allow" or "lambda:InvokeFunction" not in actions_of(item):
+            continue
+        resource = item["Resource"]
+        resources.extend(resource if isinstance(resource, list) else [resource])
+
+    watcher = [value for value in resources if "commitment-watcher" in value]
+    assert watcher == [WATCHER_ALIAS]
+    assert all(not value.endswith(":1") for value in watcher)
+    assert all("*" not in value for value in watcher)
+
+
+def test_the_worker_may_not_invoke_the_watcher() -> None:
+    """The demo-clock route is the request path's, and the schedule is the scheduler role's."""
+
+    for item in _worker(_split_template()):
+        if item["Effect"] != "Allow" or "lambda:InvokeFunction" not in actions_of(item):
+            continue
+        resource = item["Resource"]
+        values = resource if isinstance(resource, list) else [resource]
+        assert all("commitment-watcher" not in value for value in values)
+
+
+# -- Phase 11 batch 4: the demo clock (ADR-029) ---------------------------------------
+
+
+def test_only_the_api_may_move_the_demo_clock() -> None:
+    """One action, one exact literal partition, and the forward rule is a stored condition."""
+
+    grant = _find(_api(_split_template()), "AdvanceDemoClockItemOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"dynamodb:PutItem"}
+    assert leading_keys(grant) == [DEMO_CLOCK_PARTITION]
+    assert SHAREABLE_REFERENCE in json.dumps(grant["Resource"])
+
+
+def test_the_worker_reads_the_demo_clock_and_can_never_write_it() -> None:
+    """The § 14 resolution: ``EXTRACT_COMMITMENT`` needs authoritative logical time, read-only."""
+
+    worker = _worker(_split_template())
+    read = _find(worker, "ReadDemoClockItemOnly")
+    assert read["Effect"] == "Allow"
+    assert actions_of(read) == {"dynamodb:GetItem"}
+    assert leading_keys(read) == [DEMO_CLOCK_PARTITION]
+
+    deny = _find(worker, "DenyWorkerDemoClockWrites")
+    assert deny["Effect"] == "Deny"
+    assert actions_of(deny) == set(DENIED_CLOCK_WRITE_ACTIONS)
+    assert deny["Condition"]["ForAnyValue:StringLike"]["dynamodb:LeadingKeys"] == [
+        DEMO_CLOCK_PARTITION
+    ]
+
+
+def test_no_role_holds_a_wildcard_clock_grant() -> None:
+    """ADR-029 § 2: there is no ``NS#*#CLOCK*`` anywhere, and a policy with one fails review."""
+
+    for items in (_api(_split_template()), _worker(_split_template())):
+        for item in items:
+            for key in leading_keys(item):
+                if "CLOCK" in key:
+                    assert key == DEMO_CLOCK_PARTITION
+
+
+def test_the_demo_clock_partition_is_the_exact_deployed_literal() -> None:
+    assert DEMO_CLOCK_PARTITION == "NS#DEMO#CLOCK"

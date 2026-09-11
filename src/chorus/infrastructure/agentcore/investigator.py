@@ -9,6 +9,11 @@ Session identity is random per invocation because V1 agents are stateless. Reusi
 would give one investigation access to another case's context, which is precisely the implicit
 shared state the frozen orchestration decision rules out -- and here the context is a whole
 private case rather than one message batch.
+
+The deployed Investigator runtime serves two operations, so the payload is the invocation
+wrapped in :class:`~chorus.contracts.agentcore.InvestigateRequest`. The operation is stated by
+this adapter and read by the runtime; neither infers it from the payload, which is what keeps a
+reply's extraction and a case's investigation from ever selecting each other's reviewed prompt.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from dataclasses import dataclass
 import anyio
 from pydantic import ValidationError
 
+from chorus.contracts.agentcore import InvestigateRequest, InvestigatorOperation
 from chorus.contracts.common import AgentResultEnvelope
 from chorus.contracts.investigation import InvestigationAssessmentDraft
 from chorus.infrastructure.agentcore.client import AgentCoreInvoker
@@ -45,7 +51,10 @@ class AgentCoreInvestigatorAgent:
     runtime_arn: str
 
     async def invoke_investigator(self, invocation: InvestigationInvocation) -> InvestigationResult:
-        payload = invocation.model_dump_json().encode("utf-8")
+        request = InvestigateRequest(
+            operation=InvestigatorOperation.INVESTIGATE, invocation=invocation
+        )
+        payload = request.model_dump_json().encode("utf-8")
         if len(payload) > MAX_PAYLOAD_BYTES:
             # Refused locally rather than at the service, so an oversized case is a typed
             # contract failure instead of an opaque transport error.

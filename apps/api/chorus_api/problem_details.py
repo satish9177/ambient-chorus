@@ -626,6 +626,55 @@ _HTTP_CODES: Final[dict[int, str]] = {
 }
 
 
+UNAUTHENTICATED_PROBLEM: Final = ProblemShape(
+    status=401,
+    title="Authentication is required",
+    detail="This surface requires the demo access token.",
+    retryable=False,
+)
+"""Answered to a request with no bearer token, a malformed one, or the wrong one.
+
+**One shape for all three.** A caller who could tell "no token" from "wrong token" from "the
+token store could not be read" would have an oracle, and the surface this gates is the whole
+deployed API.
+"""
+
+LOGICAL_TIME_UNAVAILABLE_PROBLEM: Final = ProblemShape(
+    status=503,
+    title="Logical time is unavailable",
+    detail="The deployment's authoritative clock could not be read. Nothing was changed.",
+    retryable=True,
+)
+"""Answered when the durable demo clock is missing, corrupt, or unreachable.
+
+Failing closed with a typed error is the whole of
+[ADR-029](../../../docs/adr/ADR-029-deployed-demo-clock-authority.md) SS 4: a missed request is
+recoverable and visible, and a request served against a fabricated clock is neither.
+"""
+
+
+def middleware_problem(
+    *, request: Request, code: str, shape: ProblemShape, reason_codes: tuple[str, ...] = ()
+) -> JSONResponse:
+    """Build a Problem Details response from **outside** the exception-handler stack.
+
+    Starlette runs ``ExceptionMiddleware`` inside the user middleware stack, so an exception
+    raised by a middleware never reaches the handlers :func:`register_problem_handlers` and
+    :func:`register_transport_handlers` install -- it becomes a bare 500 with no correlation
+    identifier and no problem body. The two boundaries that must run before any route, the demo
+    access check and the logical-time binding, therefore build their own response through this
+    rather than raising.
+    """
+
+    return problem_response(
+        code=code,
+        shape=shape,
+        instance=safe_instance(request),
+        correlation_id=correlation_id_of(request),
+        reason_codes=reason_codes,
+    )
+
+
 def validation_problem(*, request: Request, error: RequestValidationError) -> JSONResponse:
     """Answer a rejected request without describing the data that caused the rejection."""
 

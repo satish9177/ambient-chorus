@@ -167,6 +167,18 @@ class ApplyCommitmentResult:
     replayed: bool
 
 
+def _recorded_commitment(invocation: AgentInvocationResult) -> UUID | None:
+    """The one commitment this invocation record says it produced, or ``None``.
+
+    Anything other than exactly one reference reads as ``None``, so a record carrying two
+    commitments never satisfies a comparison against the single one an idempotency record
+    names -- ADR-027 § 7 admits an exact ``{COMMITMENT}`` or an empty set and nothing else.
+    """
+
+    refs = [ref for ref in invocation.result_refs if ref.entity_type == "COMMITMENT"]
+    return refs[0].entity_id if len(refs) == 1 else None
+
+
 @dataclass(slots=True)
 class ApplyCommitment:
     """Validate one extraction against the nine checks and persist at most one commitment."""
@@ -567,6 +579,18 @@ class ApplyCommitment:
         of that: the same key completed for one model output must never answer for a retry
         that carries a different one (empty proposals, a sibling proposal, an altered clause),
         so a mismatch fails closed here rather than replaying a stranger's outcome.
+
+        **The input binding is required on both outcomes, and it used not to be** (Astra P2-A).
+        The no-commitment branch verified the invocation record and the commitment branch did
+        not, so a completed apply could hand back its old commitment under an input the model had
+        never been shown. The two branches ask different questions about the *result* and the
+        same question about the *request*, so the request half is one helper both call.
+
+        The asymmetry mattered because ``output_hash`` does not always move when the input does.
+        An extraction run under one safe destination label and re-run under another is a
+        different request by construction -- the label is part of ``extraction_input_hash`` -- but
+        a model whose answer happens not to change produces the same output digest, sails past
+        the ``request_hash`` gate, and would have been served the earlier commitment.
         """
 
         record = await self.idempotency.load(key)
@@ -578,27 +602,49 @@ class ApplyCommitment:
         commitment_ref = next(
             (ref for ref in record.result_entity_refs if ref.entity_type == "COMMITMENT"), None
         )
-        reason_codes: tuple[str, ...] = ()
-        if commitment_ref is None:
-            invocation = await self.core.load_agent_invocation(command.scope, command.invocation_id)
-            if (
-                invocation is None
-                or invocation.outcome is not AgentInvocationOutcome.SUCCEEDED
-                or invocation.prompt_version != COMMITMENT_EXTRACTION_PROMPT_VERSION
-                or invocation.input_hash != command.input_hash
-                or invocation.case_id != command.case_id
-            ):
-                raise IntegrityError("AGENT_INVOCATION")
-            reason_codes = invocation.reason_codes
+        invocation = await self._proven_invocation(command, commitment_ref=commitment_ref)
         return ApplyCommitmentResult(
             commitment_id=(
                 CommitmentId(commitment_ref.entity_id) if commitment_ref is not None else None
             ),
             case_state=case.state,
             case_version=case.version,
-            rejection_codes=reason_codes,
+            # Unchanged: an accepted replay reports no rejection codes, exactly as it did before
+            # the binding check was added. Only the *right to replay* moved.
+            rejection_codes=() if commitment_ref is not None else invocation.reason_codes,
             replayed=True,
         )
+
+    async def _proven_invocation(
+        self, command: ApplyCommitmentCommand, *, commitment_ref: EntityRef | None
+    ) -> AgentInvocationResult:
+        """The durable record, verified as proof of *this* request before it is reused.
+
+        The same binding ``ExtractCommitment._recovered`` applies before it skips a model call,
+        asserted here before a completed result is handed back: scope and invocation identity
+        (how the record is addressed), prompt version, the input hash recomputed from the
+        immutable evidence and the safe destination label, and the case the run was about. A
+        record that agreed about the invocation but not about the input describes a run that read
+        something else, and is not proof of anything about this one.
+
+        It also checks the *result* the record claims against the result the idempotency record
+        claims -- an exact ``{COMMITMENT}`` reference or an empty set, per ADR-027 § 7. Two
+        durable rows disagreeing about whether a commitment exists is a corrupt proof, not a
+        result to choose between.
+        """
+
+        invocation = await self.core.load_agent_invocation(command.scope, command.invocation_id)
+        expected = None if commitment_ref is None else commitment_ref.entity_id
+        if (
+            invocation is None
+            or invocation.outcome is not AgentInvocationOutcome.SUCCEEDED
+            or invocation.prompt_version != COMMITMENT_EXTRACTION_PROMPT_VERSION
+            or invocation.input_hash != command.input_hash
+            or invocation.case_id != command.case_id
+            or _recorded_commitment(invocation) != expected
+        ):
+            raise IntegrityError("AGENT_INVOCATION")
+        return invocation
 
     def _audit_event(
         self,

@@ -39,7 +39,7 @@ is the reason the SES grant is deliberately **not** narrowed by ``ses:Recipients
 
 @pytest.fixture(scope="module")
 def app() -> App:
-    return build_app()
+    return build_app(offline=True)
 
 
 def _stack(app: App, name: str) -> Stack:
@@ -131,6 +131,38 @@ def test_the_forbidden_prefixes_are_denied_by_for_any_value(
     assert any(operator.startswith("ForAnyValue") for operator in deny["Condition"])
 
 
+# -- P1 (Phase 11 batch 4 repair): the sender reads the same clock, and cannot move it -------
+
+
+def test_the_demo_clock_partition_is_explicitly_denied_to_the_sender(
+    sender: assertions.Template,
+) -> None:
+    """No new *read* grant: ``ReadShareable`` is already unrestricted over the whole table, so
+    it already reaches ``NS#DEMO#CLOCK``. What is new is the explicit write refusal."""
+
+    deny = statement(sender, "DenyProposalApprovalViewAndCaseWrites")
+    assert "NS#DEMO#CLOCK" in leading_keys(deny)
+
+
+def test_the_sender_read_shareable_grant_is_unrestricted_and_needed_no_new_statement(
+    sender: assertions.Template,
+) -> None:
+    read = statement(sender, "ReadShareable")
+    assert read["Effect"] == "Allow"
+    assert "Condition" not in read, "an unrestricted read must carry no LeadingKeys narrowing"
+
+
+def test_no_clock_grant_on_the_sender_is_a_wildcard(sender: assertions.Template) -> None:
+    """ADR-029 § 2: there is no ``NS#*#CLOCK*``, and a policy containing one fails review."""
+
+    for item in statements(sender):
+        for block in ("ForAllValues:StringLike", "ForAnyValue:StringLike"):
+            keys = item.get("Condition", {}).get(block, {}).get("dynamodb:LeadingKeys", [])
+            for key in keys if isinstance(keys, list) else [keys]:
+                if "CLOCK" in key:
+                    assert key == "NS#DEMO#CLOCK"
+
+
 def test_the_sender_holds_no_update_item_and_no_blanket_transaction_action(
     sender: assertions.Template,
 ) -> None:
@@ -159,12 +191,20 @@ def test_the_sender_has_no_allow_reaching_the_core_table(sender: assertions.Temp
     """
 
     for item in statements(sender):
-        if item["Effect"] == "Allow":
+        if item["Effect"] == "Allow" and item.get("Sid") != "ConditionCheckDemoResetLock":
             assert not targets(item, "CoreTable"), f"{item.get('Sid')} reaches Core"
 
     deny = statement(sender, "DenyAllCoreAccess")
     assert deny["Effect"] == "Deny"
-    assert actions_of(deny) == {"dynamodb:*"}
+    assert deny["NotAction"] == "dynamodb:ConditionCheckItem"
+    lock = statement(sender, "ConditionCheckDemoResetLock")
+    assert actions_of(lock) == {"dynamodb:ConditionCheckItem"}
+    assert lock["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["NS#DEMO"]}}
+    other = statement(sender, "DenyOtherCoreConditions")
+    assert other["Effect"] == "Deny"
+    assert other["Condition"] == {
+        "ForAnyValue:StringNotEquals": {"dynamodb:LeadingKeys": ["NS#DEMO"]}
+    }
 
 
 def test_the_sender_cannot_invoke_a_model_or_a_scheduler(sender: assertions.Template) -> None:
@@ -300,3 +340,92 @@ def test_the_application_may_write_the_execution_prefix(app: App) -> None:
 
     assert EXECUTION_KEY_PREFIX in APPLICATION_SHAREABLE_PREFIXES
     assert EXECUTION_KEY_PREFIX in leading_keys(grant)
+
+
+# ---------------------------------------------------------------------------------------
+# ``ses_identity_arn`` deployment-config wiring (Macro C: the sender's SES grant was missing
+# the verified identity resource because app.py never passed one through)
+# ---------------------------------------------------------------------------------------
+
+_TEST_ACCOUNT = "111111111111"  # synthetic, never the real deployment account
+_TEST_SES_IDENTITY_ARN = f"arn:aws:ses:us-east-1:{_TEST_ACCOUNT}:identity/verified@example.com"
+
+
+@pytest.fixture(scope="module")
+def deployment_mode_sender() -> assertions.Template:
+    """The real ``app.py`` wiring path, deployment mode, with a real-shaped SES identity ARN.
+
+    Exercises ``DeploymentIdentities.from_context`` -> ``ChorusSenderStack`` end to end -- the
+    same path a real ``cdk deploy`` takes -- rather than constructing the stack directly, so a
+    future break in the *wiring* (not just the stack's own fallback logic) is caught here too.
+    """
+
+    from infra.cdk.app import build_app as _build_app
+
+    context = {
+        "environment": "demo",
+        "account": _TEST_ACCOUNT,
+        "network_availability_zones": "us-east-1a,us-east-1b",
+        "demo_access_secret_arn": (
+            f"arn:aws:secretsmanager:us-east-1:{_TEST_ACCOUNT}:secret:test-demo-access"
+        ),
+        "cursor_signing_secret_arn": (
+            f"arn:aws:secretsmanager:us-east-1:{_TEST_ACCOUNT}:secret:test-cursor-signing"
+        ),
+        "destination_registry_secret_arn": (
+            f"arn:aws:secretsmanager:us-east-1:{_TEST_ACCOUNT}:secret:test-destination-registry"
+        ),
+        "ses_identity_arn": _TEST_SES_IDENTITY_ARN,
+    }
+    deployment_app = _build_app(offline=False, context=context)
+    return assertions.Template.from_stack(_stack(deployment_app, "AmbientChorusSender"))
+
+
+def test_app_py_passes_the_configured_ses_identity_arn_to_sender(
+    deployment_mode_sender: assertions.Template,
+) -> None:
+    """The context value flows through ``identities.ses_identity_arn`` -- app.py needed no
+    change, since ``ChorusSenderStack`` already receives the whole ``identities`` object; the
+    fallback line in the stack itself is what was missing."""
+
+    grant = statement(deployment_mode_sender, "SendThroughConfiguredIdentityOnly")
+    resources = grant["Resource"]
+    resources = resources if isinstance(resources, list) else [resources]
+    assert _TEST_SES_IDENTITY_ARN in resources
+
+
+def test_the_ses_grant_still_names_the_configuration_set_alongside_the_identity(
+    deployment_mode_sender: assertions.Template,
+) -> None:
+    """Adding the identity resource must not have dropped the pre-existing configuration-set
+    resource the grant already needed."""
+
+    grant = statement(deployment_mode_sender, "SendThroughConfiguredIdentityOnly")
+    resources = grant["Resource"]
+    resources = resources if isinstance(resources, list) else [resources]
+    assert len(resources) == 2
+    assert any("configuration-set" in str(r) for r in resources)
+    assert any(str(r) == _TEST_SES_IDENTITY_ARN for r in resources)
+
+
+def test_no_wildcard_ses_resource_is_introduced_by_the_identity_wiring(
+    deployment_mode_sender: assertions.Template,
+) -> None:
+    """The repair adds one named resource; it must not have widened the grant to ``"*"`` or to
+    every SES resource in the account."""
+
+    grant = statement(deployment_mode_sender, "SendThroughConfiguredIdentityOnly")
+    resources = grant["Resource"]
+    resources = resources if isinstance(resources, list) else [resources]
+    assert "*" not in resources
+    for resource in resources:
+        assert str(resource) != f"arn:aws:ses:us-east-1:{_TEST_ACCOUNT}:*"
+
+    for statement_ in statements(deployment_mode_sender):
+        if statement_.get("Effect") != "Allow":
+            continue
+        if not any(a.startswith("ses:") for a in actions_of(statement_)):
+            continue
+        allowed = statement_["Resource"]
+        allowed = allowed if isinstance(allowed, list) else [allowed]
+        assert "*" not in allowed

@@ -15,9 +15,21 @@ that could impersonate the person the whole edge exists to require.
 ``POST /demo/clock/advance`` moves the demo's one logical clock and invokes the **same** watcher
 with the **same** ``CommitmentDueEvent``, plus a ``trigger=DEMO_CLOCK`` audit field. It does not
 mutate a commitment, and it cannot: this route holds no repository write path to ``COMMITMENT#``
--- it holds a clock and the watcher use case, and every field of the event it hands over is
-re-verified against the strongly loaded row before anything moves
+-- it holds a clock and the watcher, and every field of the event it hands over is re-verified
+against the strongly loaded row before anything moves
 ([ADR-028](../../../../docs/adr/ADR-028-deadline-watcher-and-scheduler-boundary.md) § 5).
+
+**This endpoint is synchronous, and that is a contract rather than an implementation detail.**
+Its response carries ``watcher_outcome`` and ``commitment_status``, so a presenter who advances
+the clock is told what the watcher decided -- not that a decision was scheduled. Deployed, that
+means the API invokes the watcher's ``live`` alias with ``InvocationType="RequestResponse"`` and
+parses its answer (deployment contract § 8.1); routing this through the asynchronous worker to
+avoid that grant would change what the endpoint promises, so it is not done.
+
+Both the clock and the watcher are ports here. Locally they are the process-local logical clock
+and the in-process use case; deployed they are the durable ``NS#DEMO#CLOCK`` row
+([ADR-029](../../../../docs/adr/ADR-029-deployed-demo-clock-authority.md)) and one synchronous
+invocation. The route branches on neither.
 """
 
 from __future__ import annotations
@@ -39,6 +51,11 @@ from chorus.application.commands.verify_commitment import (
 )
 from chorus.application.services.commitment_schedule import due_event
 from chorus.domain.ids import CaseId, CommitmentId, EvidenceItemId, Sha256Digest
+from chorus.ports.demo_clock import (
+    DemoClockConflictError,
+    DemoClockNotAdvancedError,
+    DemoClockUnavailableError,
+)
 from chorus_api.dependencies import (
     ApiContainer,
     DemoActor,
@@ -186,7 +203,18 @@ async def advance_demo_clock(
     if clock is None or watcher is None:
         raise HTTPException(status_code=503, detail="The demo clock is not enabled.")
 
-    logical_now = clock.advance(timedelta(seconds=body.advance_seconds))
+    try:
+        logical_now = await clock.advance(timedelta(seconds=body.advance_seconds))
+    except DemoClockNotAdvancedError as error:
+        raise HTTPException(status_code=422, detail="The clock only moves forward.") from error
+    except DemoClockConflictError as error:
+        # Definite and deterministic: the store evaluated the guard and refused, so nothing was
+        # written. Another advance moved the clock first; reload and decide again.
+        raise HTTPException(status_code=409, detail="The demo clock moved.") from error
+    except DemoClockUnavailableError as error:
+        # Fails closed. There is no fallback to a process-local clock, to the system clock, or
+        # to any instant this process could invent (ADR-029 § 4).
+        raise HTTPException(status_code=503, detail="The demo clock is unavailable.") from error
     commitment = await container.read_commitment(
         case_id=CaseId(body.case_id), commitment_id=CommitmentId(body.commitment_id)
     )

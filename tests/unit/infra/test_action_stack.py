@@ -17,43 +17,106 @@ that point unnoticed.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cache
 from typing import Any
 
 import pytest
-from aws_cdk import App, assertions
+from aws_cdk import App, Stack, assertions
+from infra.cdk.app import build_app
 from infra.cdk.config import CdkBuildConfig
 from infra.cdk.stacks import ChorusAgentStack
 from infra.cdk.stacks.agents import (
     AGENTCORE_SERVICE_PRINCIPAL,
-    DENIED_DATA_PLANE_ACTIONS,
+    DENIED_DATASTORE_ACTIONS,
+    DENIED_EVIDENCE_OBJECT_ACTIONS,
+    DENIED_OBJECT_MUTATION_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
+    INFERENCE_PROFILE_ARN_CONDITION_KEY,
+    NOVA_2_LITE_BASE_MODEL_ID,
+    US_INFERENCE_PROFILE_DESTINATION_REGIONS,
 )
 
 POLICY_TYPE = "AWS::IAM::Policy"
 ROLE_TYPE = "AWS::IAM::Role"
 
+MONITOR_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-monitor-a1b2c3d4"
+)
+INVESTIGATOR_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-investigator-e5f6"
+)
+ACTION_PROFILE_ARN = (
+    "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/chorus-action-99887766"
+)
+PROFILE_ARNS = {
+    "monitor_model_profile_arn": MONITOR_PROFILE_ARN,
+    "investigator_model_profile_arn": INVESTIGATOR_PROFILE_ARN,
+    "action_model_profile_arn": ACTION_PROFILE_ARN,
+}
+
 
 def template(**kwargs: object) -> assertions.Template:
+    """The Agents stack synthesized **alone**, with no network and no artifact bucket.
+
+    Macro B made the three application inference profiles resources of this stack rather than
+    context-supplied ARNs, and they -- like the runtimes -- are created only when the VPC,
+    subnets, security groups and artifact bucket are all supplied. So an isolated synthesis has
+    roles, log groups and every deny, but no profile and therefore no model grant. That is the
+    right shape for the boundary assertions below, which are about what the role may *not* do;
+    the model-grant assertions use :func:`runtime_template` instead.
+    """
+
     app = App()
     stack = ChorusAgentStack(app, "TestAgents", config=CdkBuildConfig(), **kwargs)  # type: ignore[arg-type]
     return assertions.Template.from_stack(stack)
 
 
-def statements() -> list[Mapping[str, Any]]:
-    policies = template().find_resources(POLICY_TYPE)
+@cache
+def runtime_template() -> assertions.Template:
+    """The Agents stack as it synthesizes in the real app, where the profiles exist."""
+
+    app = build_app(offline=True, context={"environment": "demo", "namespace": "DEMO"})
+    stack = next(
+        child
+        for child in app.node.children
+        if isinstance(child, Stack) and child.stack_name == "AmbientChorusAgents"
+    )
+    return assertions.Template.from_stack(stack)
+
+
+def _statements_of(built: assertions.Template) -> list[Mapping[str, Any]]:
     found: list[Mapping[str, Any]] = []
-    for policy in policies.values():
+    for policy in built.find_resources(POLICY_TYPE).values():
         found.extend(policy["Properties"]["PolicyDocument"]["Statement"])
     return found
+
+
+def statements() -> list[Mapping[str, Any]]:
+    return _statements_of(template())
 
 
 def statement(sid: str) -> Mapping[str, Any]:
     return next(item for item in statements() if item.get("Sid") == sid)
 
 
+def runtime_statement(sid: str) -> Mapping[str, Any]:
+    return next(item for item in _statements_of(runtime_template()) if item.get("Sid") == sid)
+
+
 def actions_of(sid: str) -> set[str]:
     action = statement(sid)["Action"]
     return {action} if isinstance(action, str) else set(action)
+
+
+def runtime_actions_of(sid: str) -> set[str]:
+    action = runtime_statement(sid)["Action"]
+    return {action} if isinstance(action, str) else set(action)
+
+
+def profile_attr(agent: str) -> dict[str, Any]:
+    """The generated ARN reference for one agent's application inference profile."""
+
+    return {"Fn::GetAtt": [f"{agent.capitalize()}InferenceProfile", "InferenceProfileArn"]}
 
 
 def test_the_action_role_exists_and_is_assumable_only_by_agentcore() -> None:
@@ -71,14 +134,18 @@ def test_the_action_role_exists_and_is_assumable_only_by_agentcore() -> None:
 
 
 def test_the_role_may_invoke_only_its_own_inference_profile() -> None:
-    allowed = statement("InvokeActionInferenceProfileOnly")
+    allowed = runtime_statement("InvokeActionInferenceProfileOnly")
 
     assert allowed["Effect"] == "Allow"
-    assert set(allowed["Action"]) == {
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream",
+    # Macro B Chunk 2: exactly ONE model action. ``structured_output`` -> ``stream`` ->
+    # ``converse_stream`` (streaming defaults to True and no runtime disables it), so
+    # ``ConverseStream`` is the only Bedrock call any runtime makes and
+    # ``bedrock:InvokeModel`` would be an unused grant.
+    assert runtime_actions_of("InvokeActionInferenceProfileOnly") == {
+        "bedrock:InvokeModelWithResponseStream"
     }
-    assert "application-inference-profile/chorus-action" in str(allowed["Resource"])
+    # The generated attribute of this stack's own profile resource -- never a name-built ARN.
+    assert allowed["Resource"] == profile_attr("action")
     assert allowed["Resource"] != "*"
 
 
@@ -89,10 +156,29 @@ def test_the_role_cannot_invoke_another_agents_profile() -> None:
     Investigator ran" in the one place that is still true after a compromise.
     """
 
-    resource = str(statement("InvokeActionInferenceProfileOnly")["Resource"])
+    profile = str(runtime_statement("InvokeActionInferenceProfileOnly")["Resource"])
+    assert "MonitorInferenceProfile" not in profile
+    assert "InvestigatorInferenceProfile" not in profile
 
-    assert "chorus-monitor" not in resource
-    assert "chorus-investigator" not in resource
+    # The FM grant is condition-bound to the Action profile, never another agent's.
+    fm = runtime_statement("InvokeActionFoundationModelsViaProfileOnly")
+    bound = fm["Condition"]["StringEquals"][INFERENCE_PROFILE_ARN_CONDITION_KEY]
+    assert bound == profile_attr("action")
+    assert "MonitorInferenceProfile" not in str(fm)
+    assert "InvestigatorInferenceProfile" not in str(fm)
+
+
+def test_the_action_fm_grant_covers_the_three_frozen_us_regions_without_an_account() -> None:
+    fm = runtime_statement("InvokeActionFoundationModelsViaProfileOnly")
+
+    assert runtime_actions_of("InvokeActionFoundationModelsViaProfileOnly") == {
+        "bedrock:InvokeModelWithResponseStream"
+    }
+    assert set(fm["Resource"]) == {
+        f"arn:aws:bedrock:{region}::foundation-model/{NOVA_2_LITE_BASE_MODEL_ID}"
+        for region in US_INFERENCE_PROFILE_DESTINATION_REGIONS
+    }
+    assert all("111122223333" not in arn for arn in fm["Resource"])
 
 
 def test_the_role_writes_only_to_its_own_log_group() -> None:
@@ -109,11 +195,12 @@ def test_the_role_writes_only_to_its_own_log_group() -> None:
     assert "ActionRuntimeLogGroup" in str(allowed["Resource"])
 
 
-@pytest.mark.parametrize("action", sorted(DENIED_DATA_PLANE_ACTIONS))
+@pytest.mark.parametrize("action", sorted(DENIED_DATASTORE_ACTIONS))
 def test_every_data_store_action_is_explicitly_denied(action: str) -> None:
     denied = statement("DenyEveryDataStoreForAction")
 
     assert denied["Effect"] == "Deny"
+    assert denied["Resource"] == "*"
     assert action in denied["Action"]
 
 
@@ -148,9 +235,46 @@ def test_the_role_can_never_read_core_shareable_or_audit() -> None:
 
 
 def test_the_role_can_never_read_or_write_either_evidence_bucket() -> None:
-    denied = actions_of("DenyEveryDataStoreForAction")
+    """SS 6: the evidence ``GetObject`` deny is scoped to the two buckets, never to ``*``."""
 
-    assert {"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"} <= denied
+    denied = statement("DenyEvidenceObjectAccessForAction")
+
+    assert denied["Effect"] == "Deny"
+    assert set(denied["Action"]) == set(DENIED_EVIDENCE_OBJECT_ACTIONS)
+    assert {"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"} <= set(
+        denied["Action"]
+    )
+    rendered = str(denied["Resource"])
+    assert "chorus-private-evidence" in rendered and "chorus-export-evidence" in rendered
+    assert denied["Resource"] != "*"
+
+    mutation = statement("DenyObjectMutationForAction")
+    assert mutation["Resource"] == "*"
+    assert set(mutation["Action"]) == set(DENIED_OBJECT_MUTATION_ACTIONS)
+    assert "s3:GetObject" not in mutation["Action"]
+
+
+def test_the_action_runtime_reads_its_own_artifact_and_no_deny_overrides_it() -> None:
+    """ALLOW own artifact object; the deny split is what keeps it reachable (I8)."""
+
+    document = template(artifact_bucket_arn="arn:aws:s3:::chorus-agent-artifacts").find_resources(
+        POLICY_TYPE
+    )
+    items = [
+        item
+        for policy in document.values()
+        for item in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    allow = next(item for item in items if item.get("Sid") == "ReadOwnActionArtifact")
+    assert allow["Resource"] == "arn:aws:s3:::chorus-agent-artifacts/action/*"
+
+    for item in items:
+        if item["Effect"] != "Deny":
+            continue
+        acts = item["Action"] if isinstance(item["Action"], list) else [item["Action"]]
+        if "s3:GetObject" in acts:
+            assert item["Resource"] != "*"
+            assert "chorus-agent-artifacts" not in str(item["Resource"])
 
 
 def test_the_role_can_never_send_email() -> None:

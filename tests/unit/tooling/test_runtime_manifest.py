@@ -68,21 +68,26 @@ def test_every_allowlisted_file_exists_and_every_runtime_file_is_allowlisted(
     artifact = manifest["artifact"]
     assert isinstance(artifact, dict)
     declared = {str(item) for item in artifact["include"]}
-    for relative in declared:
+    root_entrypoint = str(artifact["root_entrypoint"])
+    for relative in declared | {root_entrypoint}:
         assert (REPOSITORY_ROOT / relative).is_file(), f"{relative} is declared but absent"
 
-    # Scoped to *this* runtime's own package plus the shared ``runtimes`` package marker.
-    # A repository-wide sweep would fail the Monitor's manifest for a file that belongs to a
-    # different artifact, which says nothing about whether the Monitor's allowlist has drifted.
-    # Each runtime's manifest test owns its own package, and the union is what covers the tree.
+    # The direct-code entrypoint ships once, at the archive root as `main.py`, so it is declared
+    # separately rather than in `include` -- and it is still declared, which is the point.
+    assert root_entrypoint not in declared
+
+    # Scoped to *this* runtime's own package plus the shared ``runtimes`` package marker and the
+    # transport binding all three artifacts carry. A repository-wide sweep would fail the
+    # Monitor's manifest for a file that belongs to a different artifact, which says nothing
+    # about whether the Monitor's allowlist has drifted. Each runtime's manifest test owns its
+    # own package, and the union is what covers the tree.
+    shipped = declared | {root_entrypoint}
     on_disk = {
         path.relative_to(REPOSITORY_ROOT).as_posix()
         for path in (REPOSITORY_ROOT / "runtimes" / "monitor").rglob("*.py")
         if "__pycache__" not in path.parts
-    } | {"runtimes/__init__.py"}
-    assert on_disk <= declared, (
-        f"runtime source not in the artifact allowlist: {on_disk - declared}"
-    )
+    } | {"runtimes/__init__.py", "runtimes/server.py"}
+    assert on_disk <= shipped, f"runtime source not in the artifact allowlist: {on_disk - shipped}"
 
 
 def test_the_declared_limits_match_the_constants_the_runtime_uses(
@@ -136,7 +141,7 @@ def test_the_declared_dependencies_are_the_ones_the_artifact_imports(
     dependencies = manifest["dependencies"]
     assert isinstance(dependencies, dict)
     declared = {str(item).split(">")[0].split("=")[0].strip() for item in dependencies["required"]}
-    assert declared == {"strands-agents", "pydantic", "botocore"}
+    assert declared == {"strands-agents", "pydantic", "botocore", "uvicorn"}
 
 
 def test_the_remaining_phase_eleven_work_is_recorded_rather_than_implied(
@@ -144,18 +149,63 @@ def test_the_remaining_phase_eleven_work_is_recorded_rather_than_implied(
 ) -> None:
     """Two honest markers. Flipping either without doing the work breaks this test."""
 
+    import importlib
+
     phase = manifest["phase_11"]
+    artifact = manifest["artifact"]
     assert isinstance(phase, dict)
-    assert phase["server_binding"] == "NOT_IMPLEMENTED"
+    assert isinstance(artifact, dict)
+    assert phase["server_binding"] == "IMPLEMENTED"
     assert phase["live_evaluation"] == "NOT_RUN"
 
-    # `server_binding` stays NOT_IMPLEMENTED while the official server SDK is absent. If it is
-    # ever installed, this fails and the marker has to be revisited deliberately.
+    # `IMPLEMENTED` is a claim about a file that exists and is bound to this runtime's handler,
+    # so it is checked rather than read.
+    root = str(artifact["root_entrypoint"])
+    assert (REPOSITORY_ROOT / root).is_file()
+    module = importlib.import_module(root.removesuffix(".py").replace("/", "."))
+    assert module.app.handler is runtime_entrypoint.handle
+    assert module.app.contract_error is runtime_entrypoint.RuntimeContractError
+    assert module.app.budget_error is runtime_entrypoint.RuntimeBudgetExceededError
+
+
+def test_the_binding_is_the_smallest_one_and_depends_on_no_agentcore_sdk() -> None:
+    """The reason the official server SDK is not used, stated as the invariant it actually is.
+
+    The claim is about what the **binding depends on**, not about what happens to be installed:
+    the transport is a bare ASGI application on ``uvicorn``, which is already inside the
+    artifact's locked dependency closure and therefore costs no wheel. Somebody installing
+    ``bedrock-agentcore`` for an unrelated reason is not a defect; the server importing it would
+    be, because that is the dependency this choice exists to avoid.
+    """
+
+    import ast
     import importlib.util
 
-    assert importlib.util.find_spec("bedrock_agentcore") is None, (
-        "the AgentCore server SDK is now installed; bind the entrypoint and update the manifest"
-    )
+    assert importlib.util.find_spec("uvicorn") is not None
+
+    binding_sources = [REPOSITORY_ROOT / "runtimes" / "server.py"] + [
+        REPOSITORY_ROOT / "runtimes" / agent / "main.py"
+        for agent in ("monitor", "investigator", "action")
+    ]
+    for path in binding_sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported.add(node.module)
+        assert not any(name.startswith("bedrock_agentcore") for name in imported), path.name
+
+    for agent in ("monitor", "investigator", "action"):
+        document = tomllib.loads(
+            (REPOSITORY_ROOT / "runtimes" / agent / "runtime.toml").read_text(encoding="utf-8")
+        )
+        declared = {
+            str(item).split(">")[0].split("=")[0].strip()
+            for item in document["dependencies"]["required"]
+        }
+        assert "bedrock-agentcore" not in declared
 
 
 def test_the_manual_live_evaluation_command_exists_and_names_its_gate() -> None:

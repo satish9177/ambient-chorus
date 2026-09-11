@@ -50,6 +50,7 @@ from chorus.domain.ids import (
     Sha256Digest,
 )
 from chorus.domain.time import Clock, epoch_seconds_ceiling, format_utc
+from chorus.ports.demo_reset import PartitionRegistrationPort
 from chorus.ports.errors import (
     IdempotencyConflictError,
     NotFoundError,
@@ -70,6 +71,7 @@ from chorus.ports.idempotency import (
 from chorus.ports.records import MessageFeedEntry
 from chorus.ports.repositories import CoreRepositoryPort, IdempotencyRepositoryPort
 from chorus.ports.scopes import NamespaceScope
+from chorus.ports.storage import PutItem
 from chorus.ports.unit_of_work import TransactionPlan, UnitOfWork
 from chorus.privacy.canonical import hash_value
 
@@ -331,6 +333,24 @@ class ApplicationOperations:
     unit_of_work: UnitOfWork
     clock: Clock
     ids: IdGenerator
+    partition_registrar: PartitionRegistrationPort | None = None
+    """Deployed demo only: records the new ``OPERATION`` partition in the reset inventory **in
+    the same transaction** as its first row, so a crash can never leave the partition durable
+    and unregistered ([11-frontend-and-demo.md] § 3). ``None`` everywhere else -- nothing is
+    appended and the transaction is byte-for-byte what it was."""
+
+    def _register_operation_partition(self, operation_put: PutItem) -> tuple[PutItem, ...]:
+        """The reset-inventory marker for a newly created operation partition, or ``()``.
+
+        The partition key is read off the ``stage_create_operation`` ``PutItem`` this
+        transaction already carries -- no key builder, no infrastructure import. The marker is
+        a create-only ``PutItem`` the caller appends to the same transaction, so operation row
+        and marker commit together or not at all.
+        """
+
+        if self.partition_registrar is None:
+            return ()
+        return (self.partition_registrar.registration_operation(operation_put.key.partition_key),)
 
     async def create(
         self,
@@ -356,10 +376,11 @@ class ApplicationOperations:
             now=self.clock.now(),
         )
         scope = NamespaceScope(namespace=namespace)
+        operation_put = self.core.stage_create_operation(scope, operation)
         await self.unit_of_work.commit(
             TransactionPlan(
                 name="create-operation",
-                operations=(self.core.stage_create_operation(scope, operation),),
+                operations=(operation_put, *self._register_operation_partition(operation_put)),
                 audit_required=False,
             )
         )
@@ -485,16 +506,20 @@ class ApplicationOperations:
             ),
             EntityRef(entity_type=INVOCATION_ENTITY_TYPE, entity_id=invocation_id),
         )
+        operation_put = self.core.stage_create_operation(
+            NamespaceScope(namespace=namespace), operation
+        )
         plan = TransactionPlan(
             name="create-operation",
             operations=(
-                self.core.stage_create_operation(NamespaceScope(namespace=namespace), operation),
+                operation_put,
                 self.idempotency.stage_complete(
                     reservation.record,
                     result_entity_refs=refs,
                     response_status=202,
                     now=now,
                 ),
+                *self._register_operation_partition(operation_put),
             ),
             audit_required=False,
             commit_proof=self.idempotency.completion_proof(reservation.record),

@@ -256,15 +256,19 @@ def test_every_allowlisted_file_exists_and_every_runtime_file_is_allowlisted(
     artifact = manifest["artifact"]
     assert isinstance(artifact, dict)
     declared = {str(item) for item in artifact["include"]}
-    for relative in declared:
+    root_entrypoint = str(artifact["root_entrypoint"])
+    for relative in declared | {root_entrypoint}:
         assert (REPOSITORY_ROOT / relative).is_file(), f"{relative} is declared but absent"
 
+    # The direct-code entrypoint ships once, at the archive root as `main.py`, so it is declared
+    # separately rather than in `include` -- and it is still declared, which is the point.
+    assert root_entrypoint not in declared
+    shipped = declared | {root_entrypoint}
     on_disk = {path.relative_to(REPOSITORY_ROOT).as_posix() for path in runtime_sources()} | {
-        "runtimes/__init__.py"
+        "runtimes/__init__.py",
+        "runtimes/server.py",
     }
-    assert on_disk <= declared, (
-        f"runtime source not in the artifact allowlist: {on_disk - declared}"
-    )
+    assert on_disk <= shipped, f"runtime source not in the artifact allowlist: {on_disk - shipped}"
 
 
 def test_the_manifest_names_this_runtime(manifest: dict[str, object]) -> None:
@@ -293,12 +297,28 @@ def test_the_declared_entrypoint_is_importable_and_has_the_declared_shape(
 
 
 def test_the_phase_eleven_markers_stay_honest(manifest: dict[str, object]) -> None:
-    """They must say ``NOT_IMPLEMENTED`` for exactly as long as that is true."""
+    """Each marker says what is true, and the binding one is now backed by a running server.
+
+    ``server_binding`` may read ``IMPLEMENTED`` only while the entrypoint it names exists, is
+    importable, and is bound to *this* runtime's handler. ``live_evaluation`` stays ``NOT_RUN``
+    until the gated scenarios have actually been run against a real model.
+    """
+
+    import importlib
 
     phase = manifest["phase_11"]
+    artifact = manifest["artifact"]
     assert isinstance(phase, dict)
-    assert phase["server_binding"] == "NOT_IMPLEMENTED"
+    assert isinstance(artifact, dict)
+    assert phase["server_binding"] == "IMPLEMENTED"
     assert phase["live_evaluation"] == "NOT_RUN"
+
+    root = str(artifact["root_entrypoint"])
+    assert (REPOSITORY_ROOT / root).is_file()
+    module = importlib.import_module(root.removesuffix(".py").replace("/", "."))
+    assert module.app.handler is runtime_entrypoint.handle
+    assert module.app.contract_error is runtime_entrypoint.RuntimeContractError
+    assert module.app.budget_error is runtime_entrypoint.RuntimeBudgetExceededError
 
 
 def test_the_timeout_hierarchy_is_ordered_across_all_three_rungs() -> None:

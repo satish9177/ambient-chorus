@@ -15,16 +15,20 @@ look early and a fired schedule look unfired.
 ``PENDING -> DUE`` and stops: both outcomes still require a contributor, so a presenter can make
 a deadline arrive and cannot make a promise kept.
 
-Durability, stated plainly
----------------------------
-ADR-028 § 5 places the logical clock in the **demo manifest partition**. That partition is in
-the frozen persistence mapping and nothing creates it yet -- the demo manifest and its reset lock
-arrive with the demo deployment. This implementation is therefore process-local: it is the same
-object the watcher's ``Clock`` slot takes, with the same monotonic rule, and what it is missing
-is the durable row. A restart resets it to its seed, which for a single-presenter demo is a
-visible inconvenience rather than a correctness problem -- and the watcher's own step-4
-comparison is against the *commitment row*, so a reset clock makes the watcher refuse an early
-firing, never accept a wrong one.
+Durability, and which environments this one is for
+--------------------------------------------------
+This clock is **process-local**, and that is now a statement about where it may be used rather
+than a limitation it apologises for.
+[ADR-029](../../../../docs/adr/ADR-029-deployed-demo-clock-authority.md) supersedes ADR-028 § 5
+on where the deployed clock lives: it is a durable Shareable row at the exact literal partition
+``NS#DEMO#CLOCK``, read strongly and moved by one guarded compare-and-swap
+(:class:`chorus.infrastructure.dynamodb.demo_clock.DynamoDbDemoClockStore`). In a deployed
+system the watcher is a separate Lambda from the API that advanced the clock, so a process-local
+clock there is not merely non-durable -- it is *a different clock*, in a different process.
+
+So this remains the ``test``/``development`` adapter and the local demo's, where one process
+holds the whole system and a restart resetting the clock to its seed is a visible inconvenience
+rather than a correctness problem. It is never constructed in a deployed ``demo`` composition.
 """
 
 from __future__ import annotations
@@ -48,12 +52,18 @@ class LogicalDemoClock:
     def now(self) -> datetime:
         return self.instant
 
-    def advance(self, delta: timedelta) -> datetime:
+    async def advance(self, delta: timedelta) -> datetime:
         """Move time forward by a non-negative delta, and record that it happened.
 
         A negative or zero delta is refused rather than ignored: "advance the clock by nothing"
         is a request that reads as successful and changes nothing, and a presenter watching a
         deadline that did not arrive deserves the error instead.
+
+        ``async`` although nothing here awaits, so this and the deployed
+        :class:`~chorus.infrastructure.persistent_clock.PersistentDemoClock` satisfy one
+        :class:`~chorus.ports.demo_clock.DemoClockPort`. The deployed advance is a strongly
+        consistent read followed by a conditional write, and a route that had to know which
+        clock it was holding would be a route with a branch on the deployment.
         """
 
         if delta <= timedelta(0):
@@ -62,11 +72,11 @@ class LogicalDemoClock:
         self.advances.append(delta)
         return self.instant
 
-    def advance_to(self, instant: datetime) -> datetime:
+    async def advance_to(self, instant: datetime) -> datetime:
         """Move time forward to an exact instant, refusing anything at or before now."""
 
         require_utc(instant)
-        return self.advance(instant - self.instant)
+        return await self.advance(instant - self.instant)
 
 
 __all__ = ["LogicalDemoClock"]

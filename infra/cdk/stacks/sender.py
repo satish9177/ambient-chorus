@@ -40,18 +40,40 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import RemovalPolicy, Stack, Tags
+from aws_cdk import CfnOutput, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_dynamodb as dynamodb
+from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_ses as ses
 from constructs import Construct
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import CdkBuildConfig, DeploymentIdentities
+from infra.cdk.lambda_support import (
+    ResourceNames,
+    chorus_lambda,
+    load_lambda_manifest,
+    sender_environment,
+)
+from infra.cdk.network_support import vpc_eni_policy_statements
 
 EXECUTION_KEY_PREFIX = "NS#*#EXECUTION#*"
 """The execution's own partition, and the only Shareable prefix this role may write."""
+
+DEMO_CLOCK_PARTITION = "NS#DEMO#CLOCK"
+"""The **exact literal** partition of the deployed demo clock (ADR-029 § 1-2, amended § 2 P1).
+
+Not a pattern, and deliberately not ``NS#*#CLOCK*``: ``DEMO`` is the only namespace a deployed
+clock exists in, and a wildcard would authorize a clock in a namespace no deployment has.
+
+The sender needs no *new read grant* for it: ``ReadShareable`` below is already an unrestricted
+read of the whole Shareable table, so it already reaches this one item -- reading the same
+authoritative clock the compiled view, the proposal, the approval, and the execution are all
+stamped against, so a send's own business timestamps and freshness comparisons (``_expired``
+against the fence's ``expires_at``) agree with the rest of the case timeline (P1). What is new
+is the explicit write refusal below.
+"""
 
 FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#ACTION#*",
@@ -60,6 +82,7 @@ FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#VIEW#*",
     "NS#*#VIEW_CURRENT#*",
     "NS#*#CASE#*",
+    DEMO_CLOCK_PARTITION,
 )
 """Every Shareable prefix the sender must never write, denied by ``ForAnyValue``.
 
@@ -72,6 +95,11 @@ acceptable.
 of the action case *projection*, which the application worker runs -- the sender's send-outcome
 transaction never writes one. A sender that could write a locator could point a reply at an
 execution it chose (ADR-026 § 3).
+
+``NS#DEMO#CLOCK`` joins the list in the Phase 11 batch 4 repair (P1). The sender reads the demo
+clock through the unrestricted ``ReadShareable`` grant it already holds; this is the positive
+half's explicit negative -- a sender that could move logical time could make its own fence and
+freshness checks pass.
 """
 
 READ_ACTIONS = ("dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query")
@@ -137,8 +165,15 @@ class ChorusSenderStack(Stack):
         compiler_function_arn: str | None = None,
         destination_registry_secret_arn: str | None = None,
         ses_identity_arn: str | None = None,
+        identities: DeploymentIdentities | None = None,
+        offline_synth: bool = True,
+        vpc: ec2.IVpc | None = None,
+        vpc_subnets: ec2.SubnetSelection | None = None,
+        vpc_subnet_arns: list[str] | None = None,
+        security_group: ec2.ISecurityGroup | None = None,
+        env: Environment | None = None,
     ) -> None:
-        super().__init__(scope, construct_id)
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)
@@ -174,6 +209,24 @@ class ChorusSenderStack(Stack):
             description="External sender: one approved message, one deliberate SES attempt.",
         )
         self.role_arn_literal = f"arn:aws:iam::{self.account}:role/{self.role_name}"
+
+        identities = identities or DeploymentIdentities(environment=config.environment)
+        # Batch 5 always wires the destination-registry secret identity (deployment contract
+        # SS 19): the same ARN feeds both the sender function's environment and the sender role's
+        # exact ``GetSecretValue`` grant. An explicit constructor argument still wins.
+        destination_registry_secret_arn = (
+            destination_registry_secret_arn or identities.destination_registry_secret_arn
+        )
+        # The verified SES sending identity's ARN, deployment-config-carried like the secret
+        # identities above (never hardcoded): an explicit constructor argument still wins.
+        ses_identity_arn = ses_identity_arn or identities.ses_identity_arn
+        # The compiler ARN the sender invokes for both halves of the fence. The **actual**
+        # compiler ``Function`` ARN when the Compiler stack passed one (review P2-2); the
+        # deterministic literal only as an isolated-synthesis fallback.
+        compiler_function_arn = compiler_function_arn or (
+            f"arn:aws:lambda:{config.aws_region}:{self.account}:function:"
+            f"chorus-compiler-{config.environment}"
+        )
         self._grant_boundary(
             tables=tables,
             buckets=buckets,
@@ -182,6 +235,51 @@ class ChorusSenderStack(Stack):
             destination_registry_secret_arn=destination_registry_secret_arn,
             ses_identity_arn=ses_identity_arn,
         )
+
+        # I2 -> compute (deployment contract SS 14, SS 18). The sender Lambda under the
+        # pre-existing role and log group. Its environment carries the destination-registry
+        # **secret identity** (an ARN, never the address or the registry contents) and the
+        # compiler ARN it invokes for the fence; no model, no scheduler, no SES address.
+        self.function_name = f"chorus-sender-{config.environment}"
+        self.function_arn_literal = (
+            f"arn:aws:lambda:{config.aws_region}:{self.account}:function:{self.function_name}"
+        )
+        self.function = chorus_lambda(
+            self,
+            "SenderFunction",
+            config=config,
+            manifest=load_lambda_manifest("sender"),
+            role=self.role,
+            environment=sender_environment(
+                config=config,
+                names=ResourceNames.for_config(config),
+                compiler_function_arn=compiler_function_arn,
+                destination_registry_secret_arn=destination_registry_secret_arn,
+            ),
+            log_group=self.log_group,
+            offline_synth=offline_synth,
+            vpc=vpc,
+            vpc_subnets=vpc_subnets,
+            security_groups=[security_group] if security_group is not None else None,
+        )
+        self.function_arn = self.function.function_arn
+
+        # I16 -> VPC attachment (deployment contract §§ 2, 14-17). The sender goes inside the
+        # isolated network: it holds the destination secret and the only SES send grant. No
+        # ``AWSLambdaVPCAccessExecutionRole`` (explicit ``role=``); the exact ENI permissions
+        # are the two inline statements below, bound to this function's ARN and the two
+        # isolated subnets.
+        # The ENI grant names the sender's **deterministic function ARN literal**, not the
+        # ``Fn::GetAtt`` on the resource -- routing the role's policy through the function it is
+        # attached to would be a ``role -> function -> role`` cycle.
+        if vpc is not None and vpc_subnet_arns is not None:
+            for eni_statement in vpc_eni_policy_statements(
+                function_arn=self.function_arn_literal, subnet_arns=vpc_subnet_arns
+            ):
+                self.role.add_to_policy(eni_statement)
+
+        CfnOutput(self, "SenderFunctionName", value=self.function.function_name)
+        CfnOutput(self, "SenderFunctionArn", value=self.function.function_arn)
 
     def _grant_boundary(
         self,
@@ -298,10 +396,13 @@ class ChorusSenderStack(Stack):
             iam.PolicyStatement(
                 sid="DenyAllCoreAccess",
                 effect=iam.Effect.DENY,
-                actions=["dynamodb:*"],
+                not_actions=["dynamodb:ConditionCheckItem"],
                 resources=[tables.core.table_arn, f"{tables.core.table_arn}/*"],
             )
         )
+        from infra.cdk.reset_support import grant_demo_reset_condition
+
+        grant_demo_reset_condition(self.role, tables.core.table_arn, deny_other_conditions=True)
         self.role.add_to_policy(
             iam.PolicyStatement(
                 sid="DenyEvidenceObjects",

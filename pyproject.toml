@@ -19,6 +19,7 @@ dependencies = [
   # a golden test, and PNG filter selection and deflate output belong to the encoder build
   # rather than to the format -- so a floating version is a golden hash that changes without a
   # review. It is also the one parser this system points at untrusted bytes.
+  "mangum>=0.19,<1",
   "pillow==12.3.0",
   "pydantic>=2.12,<3",
   "pydantic-settings>=2.10,<3",

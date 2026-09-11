@@ -68,8 +68,22 @@ class LambdaCompilerInvoker:
         return body
 
 
-def create_lambda_client(*, region_name: str, endpoint_url: str | None = None) -> Any:
-    """The pinned single-attempt Lambda client, constructed only where one is really needed."""
+def create_lambda_client(
+    *,
+    region_name: str,
+    endpoint_url: str | None = None,
+    connect_timeout: float | None = None,
+    read_timeout: float | None = None,
+) -> Any:
+    """The pinned single-attempt Lambda client, constructed only where one is really needed.
+
+    ``connect_timeout`` / ``read_timeout`` are the **caller-specific** transport deadlines
+    (review P2-9). They are passed explicitly by each composition from
+    :mod:`chorus.infrastructure.lambdas.transport_budgets` so a synchronous caller times out
+    deterministically before its own Lambda is hard-terminated, and a slow-but-successful callee
+    is not clipped by botocore's shorter default. ``None`` keeps the botocore default -- used
+    only where no synchronous caller is waiting.
+    """
 
     import boto3
     from botocore.config import Config
@@ -78,7 +92,11 @@ def create_lambda_client(*, region_name: str, endpoint_url: str | None = None) -
         LAMBDA_SERVICE_NAME,
         region_name=region_name,
         endpoint_url=endpoint_url,
-        config=Config(retries=SINGLE_ATTEMPT_RETRIES),
+        config=Config(
+            retries=SINGLE_ATTEMPT_RETRIES,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+        ),
     )
 
 

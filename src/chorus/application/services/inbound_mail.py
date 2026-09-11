@@ -67,14 +67,15 @@ import json
 import re
 import secrets
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email import message_from_bytes
 from email.message import Message
 from email.policy import compat32
+from email.utils import parseaddr
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Protocol
+from typing import Any
 
 from chorus.application.services.action_grounding import normalize
 from chorus.application.services.action_renderer import TEMPLATE_VERSION, render_preview
@@ -96,6 +97,7 @@ from chorus.ports.errors import NotFoundError
 from chorus.ports.inbound_mail import (
     InboundMailTransportAuthenticator,
     InboundMailTransportContext,
+    InboundRawMessageReader,
 )
 from chorus.ports.objects import MAX_INBOUND_REPLY_BYTES
 from chorus.ports.records import OutboundMessageLocator, SafeInboundMailConfiguration
@@ -218,17 +220,11 @@ class InboundReplyRejected(Exception):
         return self.rejection.value
 
 
-class InboundRawMessageReader(Protocol):
-    """Fetch the raw MIME the receipt action stored, by the bucket and key it names.
-
-    A port because the deployed source is the SES receipt bucket, which Phase 11 builds, and the
-    local source is a reviewed fixture. Neither the bucket nor the key is caller-supplied at the
-    application boundary: both are read out of the authenticated receipt envelope.
-    """
-
-    async def read(self, *, bucket: str, key: str) -> bytes:
-        """Return the raw bytes, or raise ``NotFoundError``."""
-        ...
+# ``InboundRawMessageReader`` is the port for fetching the raw MIME the receipt action stored.
+# It lives in :mod:`chorus.ports.inbound_mail` so an infrastructure adapter (the deployed S3
+# reader) can implement it without importing an application service -- the import-linter
+# forbids ``infrastructure -> application`` and it is right to. Re-exported here so existing
+# importers of this module are unaffected.
 
 
 # ---------------------------------------------------------------------------------------
@@ -274,6 +270,8 @@ class DecodedReceipt:
     """The subject is read **for length only and never persisted** (ADR-026 § 5)."""
     source: str
     destination: str
+    recipients: tuple[str, ...] = ()
+    correspondent_address: str = ""
     bucket_name: str
     object_key: str
     headers_truncated: bool
@@ -296,6 +294,11 @@ class DecodedReceipt:
         if len(deduplicated) > MAX_MESSAGE_IDS:
             raise InboundReplyRejected(InboundReplyRejection.REPLY_TOO_MANY_REFERENCES)
         return deduplicated
+
+    def with_thread_references(
+        self, *, in_reply_to: tuple[str, ...], references: tuple[str, ...]
+    ) -> DecodedReceipt:
+        return replace(self, in_reply_to=in_reply_to, references=references)
 
 
 def _text(mapping: Mapping[str, Any], name: str) -> str:
@@ -365,33 +368,83 @@ def decode_receipt_envelope(envelope: Mapping[str, Any]) -> DecodedReceipt:
     headers = _mapping(mail, "commonHeaders")
     action = _mapping(receipt, "action")
 
+    if action.get("type") != "S3":
+        raise InboundReplyRejected(InboundReplyRejection.MALFORMED_ENVELOPE)
+
     truncated = mail.get("headersTruncated")
     if not isinstance(truncated, bool):
         raise InboundReplyRejected(InboundReplyRejection.MALFORMED_ENVELOPE)
+
+    recipients_raw = receipt.get("recipients")
+    if (
+        not isinstance(recipients_raw, list)
+        or not recipients_raw
+        or not all(isinstance(item, str) and item for item in recipients_raw)
+    ):
+        raise InboundReplyRejected(InboundReplyRejection.MALFORMED_ENVELOPE)
+    recipients = tuple(recipients_raw)
 
     destinations = mail.get("destination")
     if not isinstance(destinations, list) or not all(
         isinstance(item, str) for item in destinations
     ):
         raise InboundReplyRejected(InboundReplyRejection.MALFORMED_ENVELOPE)
-    if len(destinations) != 1:
-        # A delivery addressed to more than our own inbound mailbox is not solely ours, and the
-        # comparison § 3 makes has no single value to make. Refused with the recipient code
-        # rather than the malformed one, because the envelope is well formed and the *routing*
-        # is what disqualifies it.
-        raise InboundReplyRejected(InboundReplyRejection.REPLY_RECIPIENT_NOT_OURS)
+    destination = destinations[0] if destinations else ""
+
+    from_raw = headers.get("from")
+    if isinstance(from_raw, str):
+        from_list = [from_raw]
+    elif isinstance(from_raw, list) and all(isinstance(item, str) for item in from_raw):
+        from_list = from_raw
+    else:
+        raise InboundReplyRejected(InboundReplyRejection.MALFORMED_ENVELOPE)
+
+    if not from_list or len(from_list) != 1:
+        raise InboundReplyRejected(InboundReplyRejection.MALFORMED_ENVELOPE)
+
+    _, parsed_from = parseaddr(from_list[0])
+    correspondent_address = parsed_from.strip().lower()
+    if not correspondent_address or "@" not in correspondent_address:
+        raise InboundReplyRejected(InboundReplyRejection.MALFORMED_ENVELOPE)
 
     subject = headers.get("subject")
     if subject is not None and not isinstance(subject, str):
         raise InboundReplyRejected(InboundReplyRejection.MALFORMED_ENVELOPE)
 
+    # Thread references come from ``mail.headers`` -- the full ``[{name, value}]`` list
+    # (ADR-030 § 4). They are **not** ``commonHeaders`` fields: SES's ``commonHeaders`` carries a
+    # fixed set and ``inReplyTo``/``references`` are not in it (ADR-030 § Context), so reading
+    # them there returns ``None`` on every real delivery. When ``mail.headers`` also lacks them,
+    # the attester's pinned-bytes fallback (§ 4) parses them from the hashed MIME instead --
+    # never a second fetch, never the body.
+    header_in_reply_to: list[str] = []
+    header_references: list[str] = []
+    mail_headers = mail.get("headers")
+    if isinstance(mail_headers, list):
+        for entry in mail_headers:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            value = entry.get("value")
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            if name.lower() == "in-reply-to":
+                header_in_reply_to.append(value)
+            elif name.lower() == "references":
+                header_references.append(value)
+
+    in_reply_to = _message_ids(header_in_reply_to) if header_in_reply_to else ()
+    references = _message_ids(header_references) if header_references else ()
+
     return DecodedReceipt(
         message_id=_text(headers, "messageId"),
-        in_reply_to=_message_ids(headers.get("inReplyTo")),
-        references=_message_ids(headers.get("references")),
+        in_reply_to=in_reply_to,
+        references=references,
         subject_length=len(subject or ""),
         source=_text(mail, "source"),
-        destination=destinations[0],
+        destination=destination,
+        recipients=recipients,
+        correspondent_address=correspondent_address,
         bucket_name=_text(action, "bucketName"),
         object_key=_text(action, "objectKey"),
         headers_truncated=truncated,
@@ -760,6 +813,15 @@ class InboundMailAttester:
         _refuse_attachments(message)
         reply_text = _plain_text(message)
 
+        if not receipt.in_reply_to and not receipt.references:
+            raw_in_reply_to = _message_ids(message.get_all("In-Reply-To"))
+            raw_references = _message_ids(message.get_all("References"))
+            if raw_in_reply_to or raw_references:
+                receipt = receipt.with_thread_references(
+                    in_reply_to=raw_in_reply_to,
+                    references=raw_references,
+                )
+
         locator = await self._correlate(receipt)
         outbound_text = await self._regenerate_outbound(locator)
         extracted = strip_quoted_outbound(reply_text, outbound_text)
@@ -778,8 +840,8 @@ class InboundMailAttester:
             inbound_message_id_hash=Sha256Digest(
                 f"sha256:{sha256(receipt.message_id.encode('utf-8')).hexdigest()}"
             ),
-            sender_address_digest=address_digest(locator.namespace, receipt.source),
-            recipient_address_digest=address_digest(locator.namespace, receipt.destination),
+            sender_address_digest=address_digest(locator.namespace, receipt.correspondent_address),
+            recipient_address_digest=self._config.inbound_address_digest,
             transport=context.transport,
             verdicts=receipt.verdicts,
             received_at=receipt.received_at,
@@ -875,11 +937,17 @@ class InboundMailAttester:
             or locator.routing_token != destination.routing_token
         ):
             raise InboundReplyRejected(InboundReplyRejection.REPLY_SENDER_NOT_DESTINATION)
-        sender = address_digest(locator.namespace, receipt.source)
+        sender = address_digest(locator.namespace, receipt.correspondent_address)
         if not hmac.compare_digest(sender.value, self._config.destination_address_digest.value):
             raise InboundReplyRejected(InboundReplyRejection.REPLY_SENDER_NOT_DESTINATION)
-        recipient = address_digest(locator.namespace, receipt.destination)
-        if not hmac.compare_digest(recipient.value, self._config.inbound_address_digest.value):
+        matches_recipient = any(
+            hmac.compare_digest(
+                address_digest(locator.namespace, recipient).value,
+                self._config.inbound_address_digest.value,
+            )
+            for recipient in receipt.recipients
+        )
+        if not matches_recipient:
             raise InboundReplyRejected(InboundReplyRejection.REPLY_RECIPIENT_NOT_OURS)
 
     async def _regenerate_outbound(self, locator: OutboundMessageLocator) -> str:

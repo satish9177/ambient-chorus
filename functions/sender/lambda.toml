@@ -1,0 +1,32 @@
+# Deployment manifest for the sender Lambda (deployment contract SS 14, SS 18).
+#
+# Runs `functions.sender.handler.handler` -- one approved message, one deliberate SES attempt.
+# See `functions/api/lambda.toml` for the shared manifest contract.
+
+[function]
+name = "chorus-sender"
+handler = "functions.sender.handler.handler"
+description = "External sender: one approved message, one deliberate SES attempt."
+
+[runtime]
+architecture = "x86_64"
+python_version = "3.12"
+# 90 s. The send path invokes the compiler fence synchronously (~seconds, ~20 s client read
+# timeout) and then makes exactly one deliberate SES attempt whose read timeout is pinned to
+# the send-authorization fence's maximum life (60 s). Note per ADR-025: an SES request that has
+# already started is NOT recalled when the fence expires -- the read timeout only bounds how
+# long that one in-flight request may run, and duplicate prevention comes from the execution's
+# APPROVED -> SENDING compare-and-swap, never from the fence. 90 s covers acquire + one attempt
+# + release with no room for a second attempt. The worker out-waits this at 105 s
+# (chorus.infrastructure.lambdas.transport_budgets) so a slow-but-successful send is not clipped.
+timeout_seconds = 90
+# 512 MiB: Pydantic v2 + boto3, no image work and no Core repository in the object graph.
+memory_mb = 512
+
+[artifact]
+first_party = [
+  "functions/__init__.py",
+  "functions/envelope.py",
+  "functions/sender",
+  "src/chorus",
+]

@@ -184,6 +184,8 @@ def build_receipt_envelope(
     spam: str = "PASS",
     virus: str = "PASS",
     headers_truncated: bool = False,
+    recipients: list[str] | None = None,
+    from_header: list[str] | None = None,
 ) -> dict[str, Any]:
     """The shape SES publishes for a received message, verdicts and receipt action included.
 
@@ -191,6 +193,9 @@ def build_receipt_envelope(
     could only produce ``PASS`` would leave ``INBOUND_VERDICT_FAILED`` untested, and that gate is
     the one that turns "who wrote this" from a header into a fact.
     """
+
+    effective_from = from_header or [source]
+    effective_recipients = recipients or [destination]
 
     return {
         "notificationType": "Received",
@@ -200,14 +205,25 @@ def build_receipt_envelope(
             "messageId": message_id.strip("<>"),
             "destination": [destination],
             "headersTruncated": headers_truncated,
+            "headers": [
+                {"name": "Message-ID", "value": message_id},
+                {"name": "In-Reply-To", "value": in_reply_to},
+                {"name": "References", "value": in_reply_to},
+                {"name": "From", "value": effective_from[0]},
+                {"name": "To", "value": destination},
+                {"name": "Subject", "value": subject},
+            ],
             "commonHeaders": {
                 "messageId": message_id,
                 "inReplyTo": in_reply_to,
                 "references": [in_reply_to],
                 "subject": subject,
+                "from": effective_from,
+                "to": [destination],
             },
         },
         "receipt": {
+            "recipients": effective_recipients,
             "spfVerdict": {"status": spf},
             "dkimVerdict": {"status": dkim},
             "dmarcVerdict": {"status": dmarc},

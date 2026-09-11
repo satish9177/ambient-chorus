@@ -127,8 +127,6 @@ from chorus.infrastructure.fixtures.synthetic_feed import (
 )
 from chorus.infrastructure.local.demo_classification import is_reportable_message
 from chorus.infrastructure.local.demo_clock import LogicalDemoClock
-from chorus.infrastructure.local.objects import InMemoryObjectStore
-from chorus.infrastructure.local.scheduler import InMemoryDeadlineScheduler
 from chorus.ports.ambient import AmbientMessage
 from chorus.ports.errors import IdempotencyConflictError, NotFoundError, PersistenceConflictError
 from chorus.ports.objects import private_evidence_key
@@ -229,6 +227,47 @@ class NamespaceStorePurge(Protocol):
     async def namespace_items(self, namespace: str) -> tuple[StoredItem, ...]: ...
 
 
+@runtime_checkable
+class DemoEvidenceObjects(Protocol):
+    """The evidence-object surface the seed and its verification need.
+
+    Implemented by :class:`~chorus.infrastructure.local.objects.InMemoryObjectStore` for the
+    local path and by a thin SSE-KMS-writing shim over
+    :class:`~chorus.infrastructure.s3.objects.S3ObjectStore` for the deployed one, so
+    :meth:`DemoResetService.seed_only` is genuinely one implementation across both.
+    """
+
+    def purge_namespace(self, namespace: Namespace) -> int: ...
+
+    def seed_private_evidence(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        evidence_id: EvidenceItemId,
+        content: bytes,
+        media_type: str,
+    ) -> str: ...
+
+    async def load_private_evidence(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        evidence_id: EvidenceItemId,
+    ) -> bytes: ...
+
+
+@runtime_checkable
+class SupportsSchedulePurge(Protocol):
+    """Clear the demo's recorded one-time schedules. ``InMemoryDeadlineScheduler.reset`` locally;
+    a manifest-driven ``DeleteSchedule`` sweep on the ``chorus-{env}`` group when deployed."""
+
+    def reset(self) -> None: ...
+
+
 PERSONA_BY_PSEUDONYM: dict[str, str] = {
     "resident-a": "resident_a",
     "resident-b": "resident_b",
@@ -259,13 +298,14 @@ class DemoResetService:
     """The generator ``ingest_messages`` assigns message identifiers from. Rewound before every
     re-seed so replaying the same corpus after a purge yields the same identifiers -- which is
     what keeps :func:`predict_demo_case_id` in step with the live Monitor run."""
-    scheduler: InMemoryDeadlineScheduler
-    """The local one-time deadline scheduler. Its recorded schedules are progressed demo state
-    and are cleared on every real reset."""
-    outbox_dir: Path
-    """The filesystem outbox the local sender writes to. Its ``*.json`` attempts are send state
-    and are cleared on every real reset."""
-    objects: InMemoryObjectStore
+    scheduler: SupportsSchedulePurge
+    """The one-time deadline scheduler whose recorded schedules are progressed demo state and
+    are cleared on every real reset -- ``InMemoryDeadlineScheduler`` locally, a manifest-driven
+    ``DeleteSchedule`` sweep when deployed."""
+    outbox_dir: Path | None
+    """The filesystem outbox the local sender writes to (``None`` when deployed -- SES has no
+    outbox). Its ``*.json`` attempts are send state and are cleared on every real reset."""
+    objects: DemoEvidenceObjects
     demo_clock: LogicalDemoClock
     clock: Clock
     namespace: Namespace
@@ -327,18 +367,22 @@ class DemoResetService:
         # 4. Bounded local cleanup.
         deleted = await self._purge_namespace()
 
-        # 5-6. Restore the frozen clock and rewind the deterministic id generator *before* any
-        #      seed entity is constructed, so its timestamps and ids are identical run to run.
-        self._reset_clock()
-        self.message_ids.reset()
+        # 5-9. Restore the clock, rewind the id generator, seed, and verify.
+        await self.seed_only()
 
-        # 7-9. Seed, then verify both objects and the full EvidenceItem provenance.
-        await self._seed_community_and_contributors()
-        message_result = await self._ingest_corpus()
-        await self._seed_evidence_objects()
-        expected_item = self._expected_signal_evidence_item(message_result)
-        await self._seed_signal_evidence_item(expected_item)
-        await self._verify_seeded_evidence(expected_item)
+        result = self.build_result(namespace=namespace, seed_version=seed_version, deleted=deleted)
+        if idempotency_key is not None:
+            self._receipts[idempotency_key] = (request_fingerprint, result)
+        return result
+
+    def build_result(self, *, namespace: str, seed_version: str, deleted: int) -> DemoResetResult:
+        """The frozen ``DemoResetResult`` receipt, built from the seeded state.
+
+        One implementation of the receipt contract for both the local and the deployed reset
+        ([08-api-design.md](../../../docs/architecture/08-api-design.md) § Ownership): the
+        deployed :class:`~chorus.composition.deployed_demo_reset.DeployedDemoReset` calls this
+        after :meth:`seed_only`, so a replay and a first run produce byte-identical fields.
+        """
 
         contributors = tuple(
             ResetContributor(
@@ -362,7 +406,7 @@ class DemoResetService:
             contributors=len(contributors),
             evidence=len(evidence),
         )
-        result = DemoResetResult(
+        return DemoResetResult(
             reset_id=self.reset_ids.new_uuid(),
             namespace=namespace,
             seed_version=seed_version,
@@ -376,9 +420,32 @@ class DemoResetService:
             replayed=False,
             audit_event_id=self.reset_ids.new_uuid(),
         )
-        if idempotency_key is not None:
-            self._receipts[idempotency_key] = (request_fingerprint, result)
-        return result
+
+    async def seed_only(self) -> tuple[MessageId, ...]:
+        """Steps 5-9 of the frozen sequence: restore the clock, rewind the id generator, seed
+        the fixed community / contributors / corpus / evidence, and verify both objects and the
+        full ``EvidenceItem`` provenance.
+
+        Self-contained so the deployed reset can run its own bounded purge and clock reseed and
+        then call exactly this -- there is one seed implementation, not two
+        ([08-api-design.md](../../../docs/architecture/08-api-design.md) § Ownership). It
+        re-validates the fixture snapshot and re-derives the predicted case identity first;
+        both are pure, so a caller that already did them pays only microseconds.
+        """
+
+        self._validate_frozen_fixture_snapshot()
+        self.demo_case_id = predict_demo_case_id(
+            self.adapter, namespace=self.namespace, community_id=self.community_id
+        )
+        self._reset_clock()
+        self.message_ids.reset()
+        await self._seed_community_and_contributors()
+        message_result = await self._ingest_corpus()
+        await self._seed_evidence_objects()
+        expected_item = self._expected_signal_evidence_item(message_result)
+        await self._seed_signal_evidence_item(expected_item)
+        await self._verify_seeded_evidence(expected_item)
+        return message_result
 
     # -- guards ----------------------------------------------------------------------------
 
@@ -432,7 +499,7 @@ class DemoResetService:
         # field names.
         self.objects.purge_namespace(self.namespace)
         self.scheduler.reset()
-        if self.outbox_dir.is_dir():
+        if self.outbox_dir is not None and self.outbox_dir.is_dir():
             for attempt in self.outbox_dir.glob("*.json"):
                 attempt.unlink()
         return deleted
@@ -682,18 +749,18 @@ class DemoResetService:
         for fixture in self.adapter.evidence_fixtures:
             if not fixture.ingested_with_feed:
                 continue
-            key = private_evidence_key(
-                namespace=self.namespace,
-                community_id=self.community_id,
-                case_id=self.demo_case_id,
-                evidence_id=fixture.evidence_id,
-            )
-            stored = self.objects.private.get(key)
-            if stored is None:
-                raise IntegrityError("DEMO_RESET_EVIDENCE_OBJECT_MISSING")
-            if len(stored.content) != fixture.byte_length:
+            try:
+                content = await self.objects.load_private_evidence(
+                    namespace=self.namespace,
+                    community_id=self.community_id,
+                    case_id=self.demo_case_id,
+                    evidence_id=fixture.evidence_id,
+                )
+            except NotFoundError as error:
+                raise IntegrityError("DEMO_RESET_EVIDENCE_OBJECT_MISSING") from error
+            if len(content) != fixture.byte_length:
                 raise IntegrityError("DEMO_RESET_EVIDENCE_OBJECT_LENGTH")
-            if _digest_of(stored.content) != fixture.sha256.value:
+            if _digest_of(content) != fixture.sha256.value:
                 raise IntegrityError("DEMO_RESET_EVIDENCE_OBJECT_DIGEST")
 
         scope = CaseScope(

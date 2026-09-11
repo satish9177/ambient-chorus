@@ -66,6 +66,10 @@ from chorus.infrastructure.dynamodb.driver import DynamoDbStorageDriver
 from chorus.infrastructure.dynamodb.idempotency import IdempotencyRepository
 from chorus.infrastructure.dynamodb.shareable import ShareableRepository
 from chorus.infrastructure.dynamodb.unit_of_work import StorageUnitOfWork
+from chorus.infrastructure.lambdas.transport_budgets import (
+    SENDER_COMPILER_CONNECT_TIMEOUT_SECONDS,
+    SENDER_COMPILER_READ_TIMEOUT_SECONDS,
+)
 from chorus.infrastructure.local.sender import FilesystemOutboxSender
 from chorus.infrastructure.ses.sender import SESV2_SERVICE_NAME, SesV2EmailSender
 from chorus.ports.clock import Clock
@@ -126,6 +130,12 @@ class SenderSettings:
     """Everything the composition root needs, and nothing it could decide policy from."""
 
     region: str
+    namespace: str
+    """Deployment configuration, not a caller field. The demo clock's partition is the exact
+    literal ``NS#{namespace}#CLOCK``, so a namespace an invocation could choose would be a
+    partition the sender's ``ReadShareable`` grant reaches only by accident of being
+    unrestricted -- the clock adapter still names the deployment's own namespace, never one a
+    request supplies."""
     core_table: str
     shareable_table: str
     audit_table: str
@@ -212,12 +222,37 @@ def build_send_authorization(
             # than at the first send.
             raise ValueError("a deployed sender needs the compiler function ARN")
         invoker = LambdaCompilerInvoker(
+            # A fence acquire/release is a couple of DynamoDB writes; this client fails fast if
+            # the compiler is unreachable and stays well inside the sender's SES budget (P2-9).
             client=create_lambda_client(
-                region_name=settings.region, endpoint_url=settings.lambda_endpoint
+                region_name=settings.region,
+                endpoint_url=settings.lambda_endpoint,
+                connect_timeout=SENDER_COMPILER_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=SENDER_COMPILER_READ_TIMEOUT_SECONDS,
             ),
             function_name=settings.compiler_function_arn,
         )
     return CompilerSendAuthorization(invoker=invoker)
+
+
+def build_sender_driver(settings: SenderSettings) -> DynamoDbStorageDriver:
+    """The sender's one storage handle, over all three tables.
+
+    Factored out so a deployed composition can share it with a second use of the same tables
+    -- the read-only demo-clock store (P1) -- rather than opening a second boto3 client for the
+    identical grant.
+    """
+
+    return DynamoDbStorageDriver(
+        client=create_dynamodb_client(
+            region_name=settings.region, endpoint_url=settings.dynamodb_endpoint
+        ),
+        table_names={
+            TableName.CORE: settings.core_table,
+            TableName.SHAREABLE: settings.shareable_table,
+            TableName.AUDIT: settings.audit_table,
+        },
+    )
 
 
 def build_send_action(
@@ -230,6 +265,7 @@ def build_send_action(
     core: CoreRepositoryPort | None = None,
     shareable: ShareableRepositoryPort | None = None,
     invoker: CompilerInvokerPort | None = None,
+    driver: DynamoDbStorageDriver | None = None,
 ) -> SendAction:
     """Construct the send use case over deployed adapters.
 
@@ -240,16 +276,7 @@ def build_send_action(
     with Core genuinely unreachable.
     """
 
-    driver = DynamoDbStorageDriver(
-        client=create_dynamodb_client(
-            region_name=settings.region, endpoint_url=settings.dynamodb_endpoint
-        ),
-        table_names={
-            TableName.CORE: settings.core_table,
-            TableName.SHAREABLE: settings.shareable_table,
-            TableName.AUDIT: settings.audit_table,
-        },
-    )
+    driver = driver or build_sender_driver(settings)
     cursors = SignedCursorCodec(secret=settings.cursor_secret)
     shareable_repository = shareable or ShareableRepository(driver=driver, cursors=cursors)
     # Constructed **only** on the local branch. On the deployed one there is deliberately no
@@ -290,4 +317,5 @@ __all__ = [
     "build_email_sender",
     "build_send_action",
     "build_send_authorization",
+    "build_sender_driver",
 ]

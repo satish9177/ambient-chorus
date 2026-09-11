@@ -34,15 +34,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import RemovalPolicy, Stack, Tags
+from aws_cdk import CfnOutput, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_dynamodb as dynamodb
+from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from constructs import Construct
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import CdkBuildConfig, DeploymentIdentities
+from infra.cdk.lambda_support import (
+    ResourceNames,
+    chorus_lambda,
+    compiler_environment,
+    load_lambda_manifest,
+)
+from infra.cdk.network_support import vpc_eni_policy_statements
 
 VIEW_KEY_PREFIXES = ("NS#*#VIEW#*", "NS#*#VIEW_CURRENT#*")
 """The only Shareable partitions the compiler may write.
@@ -52,8 +60,49 @@ locators, and -- because the compiler's Shareable writes are confined to these t
 the compile idempotency record as well.
 """
 
+SHAREABLE_READ_KEY_PREFIXES = (
+    "NS#*#VIEW#*",
+    "NS#*#VIEW_CURRENT#*",
+    "NS#*#ACTION#*",
+    "NS#*#ACTION_CURRENT#*",
+)
+"""The safe/shareable partitions the send-authorization service reads to compile a send.
+
+``CompilerSendAuthorization`` runs *inside* the compiler Lambda and, before it can acquire the
+send fence, it reloads the shareable side of the case: ``load_view`` (``VIEW#``),
+``load_current_view_pointer`` (``VIEW_CURRENT#``), ``load_current_action_pointer``
+(``ACTION_CURRENT#``), ``load_proposal`` and ``load_approval`` (both ``ACTION#``). ``CompileView``
+reads the first two. Without this grant every one of those calls is ``AccessDenied`` in the
+deployed system and no send can ever be authorized (deployment contract SS 8.2).
+
+``EXECUTION#`` is deliberately excluded -- the compiler never loads an execution, the sender
+loads its own -- and so is ``CASE#`` on the Shareable table, whose partitions are the watcher's.
+The prefixes are distinct literals: ``NS#*#VIEW#*`` matches neither ``VIEW_CURRENT`` nor
+``EXECUTION``, and ``NS#*#ACTION#*`` matches neither ``ACTION_CURRENT`` nor ``EXECUTION``.
+"""
+
 CASE_KEY_PREFIX = "NS#*#CASE#*"
 """Case partitions. The compiler reads these and condition-checks them; it never writes one."""
+
+DEMO_CLOCK_PARTITION = "NS#DEMO#CLOCK"
+"""The **exact literal** partition of the deployed demo clock (ADR-029 § 1-2, amended § 2 P1).
+
+Not a pattern, and deliberately not ``NS#*#CLOCK*``: ``DEMO`` is the only namespace a deployed
+clock exists in, and a wildcard would authorize a clock in a namespace no deployment has. A
+policy containing one fails review, and a template test asserts its absence.
+
+The compiler is the deterministic authority over a view's ``generated_at``, ``expires_at``, and
+every freshness comparison the send fence makes against a view, an approval, or a mandate --
+all case-world facts, stamped and judged against the **same** authoritative clock the rest of
+the case timeline uses (P1). A compiler running on wall-clock time would stamp a view with an
+instant the rest of the system's business timestamps disagree with by however far the demo
+clock has been advanced.
+"""
+
+DEMO_CLOCK_READ_ACTION = "dynamodb:GetItem"
+"""One item, one direct read. The compiler never queries or scans the clock partition, and it
+is denied every write on it (ADR-029 § 2): no ``PutItem``, no ``UpdateItem``, no ``DeleteItem``,
+no ``advance``, no reset, no reseed."""
 
 FENCE_KEY_PREFIX = "NS#*#FENCE#*"
 """The send fence's own partition.
@@ -164,8 +213,15 @@ class ChorusCompilerStack(Stack):
         config: CdkBuildConfig,
         tables: CompilerTables,
         buckets: CompilerBuckets,
+        identities: DeploymentIdentities | None = None,
+        offline_synth: bool = True,
+        vpc: ec2.IVpc | None = None,
+        vpc_subnets: ec2.SubnetSelection | None = None,
+        vpc_subnet_arns: list[str] | None = None,
+        security_group: ec2.ISecurityGroup | None = None,
+        env: Environment | None = None,
     ) -> None:
-        super().__init__(scope, construct_id)
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)
@@ -192,6 +248,56 @@ class ChorusCompilerStack(Stack):
         # depends on it -- and the buckets must exist before the principal that writes them.
         self.role_arn_literal = f"arn:aws:iam::{self.account}:role/{self.role_name}"
         self._grant_boundary(tables=tables, buckets=buckets)
+
+        # I2 -> compute (deployment contract SS 14, SS 16 stage 6). The deterministic compiler
+        # Lambda, under the pre-existing role above and logging to the pre-existing group. Its
+        # environment carries the two evidence KMS key ARNs it needs for ``SSEKMSKeyId`` (SS 9)
+        # and nothing secret. ``function.function_arn`` is the actual resource ARN a consumer
+        # stack should name (review P2-2); ``function_arn_literal`` remains only as the
+        # deterministic fallback an isolated single-stack synthesis uses.
+        _ = identities  # the compiler carries no AgentCore identity (review P2-8)
+        self.function_name = f"chorus-compiler-{config.environment}"
+        self.function_arn_literal = (
+            f"arn:aws:lambda:{config.aws_region}:{self.account}:function:{self.function_name}"
+        )
+        self.function = chorus_lambda(
+            self,
+            "CompilerFunction",
+            config=config,
+            manifest=load_lambda_manifest("compiler"),
+            role=self.role,
+            environment=compiler_environment(
+                config=config,
+                names=ResourceNames.for_config(config),
+                private_evidence_key_arn=buckets.private_key.key_arn,
+                export_evidence_key_arn=buckets.export_key.key_arn,
+            ),
+            log_group=self.log_group,
+            offline_synth=offline_synth,
+            vpc=vpc,
+            vpc_subnets=vpc_subnets,
+            security_groups=[security_group] if security_group is not None else None,
+        )
+        self.function_arn = self.function.function_arn
+
+        # I16 -> VPC attachment (deployment contract §§ 2, 14-17). The compiler is one of the
+        # three functions that go inside the isolated network -- it holds the private-bucket and
+        # private-key reach, so its network reachability should match its data reach. With an
+        # explicit ``role=`` CDK attaches no ``AWSLambdaVPCAccessExecutionRole``; the exact ENI
+        # permissions are the two inline statements below, bound to this function's ARN and the
+        # two isolated subnets.
+        # The ENI grant names the compiler's **deterministic function ARN literal**, not the
+        # ``Fn::GetAtt`` on the resource: routing the role's policy through the function it is
+        # attached to would be a ``role -> function -> role`` cycle. The physical name is fixed
+        # (``chorus-compiler-{env}``), so the literal resolves to the same ARN.
+        if vpc is not None and vpc_subnet_arns is not None:
+            for eni_statement in vpc_eni_policy_statements(
+                function_arn=self.function_arn_literal, subnet_arns=vpc_subnet_arns
+            ):
+                self.role.add_to_policy(eni_statement)
+
+        CfnOutput(self, "CompilerFunctionName", value=self.function.function_name)
+        CfnOutput(self, "CompilerFunctionArn", value=self.function.function_arn)
 
     def _grant_boundary(self, *, tables: CompilerTables, buckets: CompilerBuckets) -> None:
         """Attach the complete allow list and the three explicit denies, in one place.
@@ -263,6 +369,42 @@ class ChorusCompilerStack(Stack):
                 },
             )
         )
+        # Read-only authority over the safe/shareable records the send-authorization service
+        # reloads before it acquires the fence. Read actions only: no ``PutItem`` here, so the
+        # compiler still creates a view and nothing else on this table, and the ``ACTION#`` /
+        # ``ACTION_CURRENT#`` partitions it may now read it still cannot write.
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadShareableViewAndActionPrefixes",
+                effect=iam.Effect.ALLOW,
+                actions=list(READ_ACTIONS),
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {
+                        "dynamodb:LeadingKeys": list(SHAREABLE_READ_KEY_PREFIXES)
+                    }
+                },
+            )
+        )
+        # P1 (Phase 11 batch 4 repair). A strongly consistent read, and only that, of the one
+        # authoritative logical clock -- so a compiled view's ``generated_at``/``expires_at``
+        # and every freshness comparison the send fence makes are stamped against the same
+        # case-world timeline as the proposal, the approval, and the execution. No write of any
+        # form: the deny below backs this with an explicit refusal rather than mere absence.
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadDemoClockItemOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[DEMO_CLOCK_READ_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
+                },
+            )
+        )
+        from infra.cdk.reset_support import grant_demo_reset_condition
+
+        grant_demo_reset_condition(self.role, tables.core.table_arn)
         self.role.add_to_policy(
             iam.PolicyStatement(
                 sid="AppendAudit",
@@ -323,6 +465,22 @@ class ChorusCompilerStack(Stack):
                 actions=list(DENIED_CASE_WRITE_ACTIONS),
                 resources=[tables.core.table_arn],
                 conditions={"ForAnyValue:StringLike": {"dynamodb:LeadingKeys": [CASE_KEY_PREFIX]}},
+            )
+        )
+        # P1. The read grant above is the compiler's entire clock authority. Denied rather than
+        # merely ungranted, so a later widening of a Shareable write statement still fails
+        # closed -- and because "the compiler cannot mutate the clock" is exactly the kind of
+        # sentence an explicit deny, not an absent grant, is what makes provable from the
+        # template (ADR-029 § 2).
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DenyCompilerDemoClockWrites",
+                effect=iam.Effect.DENY,
+                actions=[*DENIED_CASE_WRITE_ACTIONS, CONDITION_CHECK_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAnyValue:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
+                },
             )
         )
         self.role.add_to_policy(

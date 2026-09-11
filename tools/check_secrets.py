@@ -10,7 +10,16 @@ PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"(?i)(?:secret_access_key|api_key|access_token)\s*[:=]\s*['\"][^'\"]{8,}"),
 )
-IGNORED_PARTS = {".git", ".local", ".tools", ".venv", "node_modules", "cdk.out"}
+IGNORED_PARTS = {".git", ".local", ".tools", ".venv", "node_modules", "cdk.out", "build", "dist"}
+"""Directories that hold no source-controlled file.
+
+``build`` is on the list because the AgentCore artifact build unpacks the locked dependency set
+under ``build/agentcore/``, and third-party packages ship credential-shaped *example* text --
+``botocore``'s IAM and STS example documents, ``cryptography``'s SSH key parser. Scanning them
+reports a vendored wheel's documentation as a committed secret, which is a false positive that
+teaches a reader to ignore this check. What the check is for is source under version control,
+and every ignored name here is a build or tool directory Git does not track.
+"""
 
 
 def findings(root: Path) -> list[str]:

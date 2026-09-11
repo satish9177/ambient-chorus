@@ -65,6 +65,13 @@ MAX_REPLY_TEXT_LENGTH: Final = 8 * 1024
 """Matches the stored ``extracted_text`` bound, so the offsets are always addressable."""
 
 ObligorStr = Annotated[str, StringConstraints(min_length=1, max_length=120)]
+DestinationLabelStr = Annotated[str, StringConstraints(min_length=1, max_length=120)]
+"""The safe organization label of the correspondent, bounded exactly like the obligor it feeds.
+
+Same bound as :data:`ObligorStr` on purpose: check 4 compares the two for normalized equality,
+so a label the obligor field could not hold would be a check nothing could ever pass.
+"""
+
 ActionTextStr = Annotated[str, StringConstraints(min_length=1, max_length=500)]
 ReplyTextStr = Annotated[str, StringConstraints(max_length=MAX_REPLY_TEXT_LENGTH)]
 """Deliberately admits the empty string.
@@ -125,13 +132,29 @@ class ProposedCommitmentDraft(StrictModel):
 
 
 class CommitmentExtractionInput(StrictModel):
-    """The complete extraction payload: one case identifier and one reply's text.
+    """The complete extraction payload: two identifiers, one safe label, one reply's text.
 
     Not the case, not other evidence, not facts, not mandates, not contributor data. The model
     that reads a stranger's email is given nothing else to leak (ADR-027 § 1).
 
     ``reply_text`` is delimited as untrusted **data**. A reply written as an instruction to a
     system is still a record of what somebody wrote.
+
+    Why the destination label is here
+    ---------------------------------
+    Check 4 requires ``normalize(obligor)`` to equal the normalized safe ``display_label`` of the
+    correlated destination -- a value the correlation established and the reply never states. The
+    frozen demo reply says "We will restore elevator B to service by 2030-01-14."; it does not
+    contain "Property Management". A model given only the reply therefore **cannot** satisfy
+    check 4 except by accident, which would make live extraction fail on correct answers.
+
+    So the already-safe label is supplied as input. It is non-secret by design (§ 13 of the Phase
+    11 deployment contract classes it a safe environment variable beside the registry version and
+    the routing token), it names no mailbox, and it carries no address, token, or registry
+    record. **Supplying it does not make the model authoritative**: check 4 still compares the
+    model's restatement against the value deterministic code holds, so the model can only agree
+    with a fact already established or be rejected. What changes is that agreeing is now
+    possible.
     """
 
     schema_version: Literal["commitment-extraction-input/v1"] = (
@@ -139,6 +162,13 @@ class CommitmentExtractionInput(StrictModel):
     )
     case_id: UUID
     source_evidence_id: UUID
+    destination_display_label: DestinationLabelStr
+    """The safe organization label the extraction's ``obligor`` must restate.
+
+    Required and non-empty, so a deployment that has not configured one fails at payload
+    construction -- before a model is invoked -- rather than producing a candidate that check 4
+    would reject for a reason nobody could act on.
+    """
     reply_text: ReplyTextStr
 
 
@@ -166,6 +196,7 @@ __all__ = [
     "MAX_SPAN_LENGTH",
     "CommitmentExtractionInput",
     "CommitmentExtractionOutput",
+    "DestinationLabelStr",
     "ProposedCommitmentDraft",
     "SourceSpan",
 ]

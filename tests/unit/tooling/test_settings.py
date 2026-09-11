@@ -56,13 +56,21 @@ def test_the_demo_environment_still_requires_the_demo_namespace() -> None:
         Settings(environment="demo", namespace="LOCAL_DEVELOPER", agent_mode="agentcore")
 
 
-def test_the_demo_namespace_rule_is_satisfied_by_demo() -> None:
-    """With ``DEMO`` the namespace rule stops firing; the remaining demo rules are unrelated."""
+def test_the_demo_environment_requires_agentcore_mode() -> None:
+    with pytest.raises(ValidationError, match="demo environment requires agentcore mode"):
+        Settings(environment="demo", namespace="DEMO", agent_mode="fake")
 
-    with pytest.raises(ValidationError) as raised:
-        Settings(environment="demo", namespace="DEMO", agent_mode="agentcore")
 
-    assert "DEMO namespace" not in str(raised.value)
+def test_the_global_demo_contract_is_only_namespace_and_agent_mode() -> None:
+    """Review P2-8: the "and all six runtime/profile ARNs" clause moved into the worker's own
+    settings mapper. A bare ``demo`` + ``DEMO`` + ``agentcore`` ``Settings`` now constructs --
+    the API, compiler, sender, and watcher never invoke an agent and no longer carry six ARNs
+    just to pass a global validator."""
+
+    settings = Settings(environment="demo", namespace="DEMO", agent_mode="agentcore")
+
+    assert settings.environment.value == "demo"
+    assert settings.monitor_runtime_arn is None  # not required at the global level any more
 
 
 def test_the_sending_identity_is_configuration_and_not_an_address() -> None:

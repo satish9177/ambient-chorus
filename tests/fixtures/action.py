@@ -53,6 +53,7 @@ from chorus.domain.ids import (
 from chorus.domain.state import CaseTransitionContext, transition_case
 from chorus.infrastructure.dynamodb.unit_of_work import StorageUnitOfWork
 from chorus.infrastructure.local.action_agent import ScriptedActionAgent
+from chorus.ports.demo_clock import DemoClockStorePort
 from chorus.ports.idempotency import IdempotentCommand
 from chorus.ports.operations import ProposeActionOperationJob
 from chorus.ports.records import StoredShareableView
@@ -296,7 +297,12 @@ class ActionHarness:
 
     # -- use case --------------------------------------------------------------------------
 
-    def propose_action(self, *, ids: IdGenerator | None = None) -> ProposeAction:
+    def propose_action(
+        self,
+        *,
+        ids: IdGenerator | None = None,
+        freshness_clock: DemoClockStorePort | None = None,
+    ) -> ProposeAction:
         return ProposeAction(
             core=self.compile.core,
             shareable=self.compile.shareable,
@@ -309,6 +315,7 @@ class ActionHarness:
             destination=self.compile.stored_destination(),
             from_identity_id=FROM_IDENTITY_ID,
             purpose=Purpose.REQUEST_ELEVATOR_REPAIR_AND_RESPONSE,
+            freshness_clock=freshness_clock,
         )
 
     def read_current_action(self) -> ReadCurrentAction:

@@ -1,5 +1,11 @@
 # Frontend and deterministic demo architecture
 
+**Phase 11 reset correction:** [ADR-031](../adr/ADR-031-demo-reset-mutation-interlock.md)
+requires atomic normal-mutation fencing, registration/discovery of all Monitor-created cases,
+and refusal while an external-attempt reservation is unresolved. Reset rechecks durable replay
+under its lock and salts seed transaction tokens with its durable reset generation. The reset
+ZIP includes the frozen corpus as package-relative data; no checkout is required.
+
 ## Frontend decisions
 
 The web app is React with strict TypeScript and Vite. TanStack Query owns server state, caching, mutation invalidation, polling, and retries. Native `fetch` is wrapped by one typed client generated with `openapi-typescript` from FastAPI's checked OpenAPI artifact. Component-local `useState` handles selection/forms; React Context holds only access-token session and selected seeded persona. No Redux, Zustand, component framework, websocket, or client-side policy logic.

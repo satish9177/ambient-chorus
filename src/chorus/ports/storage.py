@@ -70,6 +70,23 @@ class AttributeAtMostNumber:
     value: int
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AttributeLessThanNumber:
+    """True when the numeric attribute exists and is strictly less than ``value``.
+
+    Strictness is the whole point of it being its own variant rather than
+    :class:`AttributeAtMostNumber` with an off-by-one value. The deployed demo clock's forward
+    rule is "the new reading is *later* than the stored one"
+    ([ADR-029](../../../docs/adr/ADR-029-deployed-demo-clock-authority.md) SS 3), so an advance
+    to the instant already stored must be refused by the store rather than by the caller. An
+    arithmetic ``value - 1`` would express the same thing only for as long as the attribute's
+    unit never changed, which is exactly the kind of guarantee a condition should not depend on.
+    """
+
+    name: str
+    value: int
+
+
 @dataclass(frozen=True, slots=True)
 class AllOf:
     conditions: tuple[ItemCondition, ...]
@@ -94,6 +111,7 @@ type ItemCondition = (
     | AttributeEqualsString
     | AttributeEqualsNumber
     | AttributeAtMostNumber
+    | AttributeLessThanNumber
     | AllOf
     | AnyOf
 )
