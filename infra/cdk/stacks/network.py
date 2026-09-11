@@ -243,12 +243,12 @@ class ChorusNetworkStack(Stack):
                 endpoint_sg.add_ingress_rule(
                     peer=workload_sg,
                     connection=ec2.Port.tcp(HTTPS_PORT),
-                    description=f"{workload_key} -> {spec.logical_id}",
+                    description=f"{workload_key} to {spec.logical_id}",
                 )
                 workload_sg.add_egress_rule(
                     peer=endpoint_sg,
                     connection=ec2.Port.tcp(HTTPS_PORT),
-                    description=f"{workload_key} -> {spec.logical_id}",
+                    description=f"{workload_key} to {spec.logical_id}",
                 )
 
             endpoint = ec2.InterfaceVpcEndpoint(
@@ -290,13 +290,13 @@ class ChorusNetworkStack(Stack):
             self.workload_security_groups[workload_key].add_egress_rule(
                 peer=ec2.Peer.prefix_list(MANAGED_PREFIX_LIST_S3),
                 connection=ec2.Port.tcp(HTTPS_PORT),
-                description=f"{workload_key} -> S3 gateway endpoint",
+                description=f"{workload_key} to S3 gateway endpoint",
             )
         for workload_key in GATEWAY_DYNAMODB_REACHABLE_BY:
             self.workload_security_groups[workload_key].add_egress_rule(
                 peer=ec2.Peer.prefix_list(MANAGED_PREFIX_LIST_DYNAMODB),
                 connection=ec2.Port.tcp(HTTPS_PORT),
-                description=f"{workload_key} -> DynamoDB gateway endpoint",
+                description=f"{workload_key} to DynamoDB gateway endpoint",
             )
 
         self._attach_s3_endpoint_policy()

@@ -11,6 +11,7 @@ gateway endpoints, HTTPS-only endpoint ingress, and no unrestricted workload egr
 from __future__ import annotations
 
 import json
+import re
 from functools import cache
 from typing import Any
 
@@ -489,3 +490,50 @@ def test_no_runtime_sg_has_egress_to_dynamodb_or_other_endpoint_sg() -> None:
                 assert dest_sg == bedrock_sg_logical_id, (
                     f"{sg_name} has unexpected egress to SG {dest_sg}"
                 )
+
+
+# -- rule description character set (live deploy failure, Macro C canary) ----------------
+#
+# A live ``cdk deploy`` of this stack was rejected by CloudFormation: several
+# ``AWS::EC2::SecurityGroupIngress``/``Egress`` resources carried a ``Description`` built from
+# ``f"{workload_key} -> {spec.logical_id}"`` -- the ASCII arrow ``->`` reads as an arrow but is
+# a hyphen plus a literal ``>``, and EC2 does not accept ``>`` in a rule description. Per the
+# EC2 API reference (``IpRange.Description``): "Allowed characters are a-z, A-Z, 0-9, spaces,
+# and ._-:/()#,@[]+=&;{}!$*" -- up to 255 characters. Neither ``<`` nor ``>`` is in that set, so
+# this was never a Unicode problem; it was one plain ASCII character EC2 happens to reject. The
+# repair replaced every arrow with the word "to". This test sweeps every synthesized rule so a
+# future description can't reintroduce a character EC2 will refuse at deploy time -- something
+# ``cdk synth`` alone never catches, because synthesis performs no server-side validation.
+
+_EC2_RULE_DESCRIPTION_RE = re.compile(r"^[A-Za-z0-9 ._\-:/()#,@\[\]+=&;{}!$*]*$")
+_EC2_RULE_DESCRIPTION_MAX_LENGTH = 255
+
+
+def _rule_descriptions() -> list[str]:
+    return [
+        props["Description"]
+        for props in (*_all_ingress_rules(), *_all_egress_rules())
+        if props.get("Description")
+    ]
+
+
+def test_every_security_group_rule_description_is_ec2_accepted_ascii() -> None:
+    descriptions = _rule_descriptions()
+    assert descriptions  # every endpoint/gateway rule in this stack carries one
+    for description in descriptions:
+        assert len(description) < _EC2_RULE_DESCRIPTION_MAX_LENGTH, (
+            f"rule description too long ({len(description)} chars): {description!r}"
+        )
+        assert _EC2_RULE_DESCRIPTION_RE.match(description), (
+            f"rule description has an EC2-rejected character: {description!r}"
+        )
+
+
+def test_no_rule_description_uses_an_arrow_dash_or_smart_punctuation() -> None:
+    """The specific character classes that triggered or could plausibly recur: the ASCII ``>``
+    misread as an arrow, real Unicode arrows/dashes, and smart quotes -- none are EC2-legal."""
+
+    banned = ("->", "<-", "→", "←", "–", "—", "‘", "’", "“", "”")  # noqa: RUF001
+    for description in _rule_descriptions():
+        for token in banned:
+            assert token not in description, f"{token!r} found in rule description {description!r}"
