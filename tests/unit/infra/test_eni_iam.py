@@ -7,11 +7,22 @@ made it un-matchable and the function never attached. The repaired shape:
 
 * the service-side Allow is split by action and carries **no** ``SourceFunctionArn``:
   ``AllowCreateVpcEni`` (Create, ``*``, no condition -- AWS service limitation),
-  ``AllowManageVpcEni`` (Delete/Assign/Unassign, ``*``, ``ec2:Subnet`` = the two isolated
-  subnets), ``AllowDescribeVpcEni`` (Describe*, ``*``, no condition);
+  ``AllowManageVpcEni`` (Delete/Assign/Unassign, ``*``, no condition), ``AllowDescribeVpcEni``
+  (Describe*, ``*``, no condition);
 * ``DenyVpcEniFromFunctionCode`` denies all six actions when ``lambda:SourceFunctionArn`` =
   this exact function -- fires only for the function's own code, never for service-side
   management.
+
+``AllowManageVpcEni`` was originally conditioned on ``StringEquals ec2:Subnet`` = the two
+isolated subnet ARNs. A Macro C live canary against a real ``AmbientChorusReset`` deploy proved
+that assumption wrong: ``DeleteNetworkInterface`` calls Lambda's own service makes while
+attaching a VPC-attached function never carry an ``ec2:Subnet`` key in their authorization
+context (decoded via ``sts:DecodeAuthorizationMessage`` -- only ``aws:Region``/``Service``/
+``Resource``/``Type``/``Account``/``ARN``/``ID`` were present), so the condition could never
+match and silently blocked Lambda's own ENI cleanup with an implicit deny. The repair drops the
+condition, matching the unconditioned shape AWS's own ``AWSLambdaVPCAccessExecutionRole`` uses
+for exactly these three actions; ``DenyVpcEniFromFunctionCode`` remains the actual boundary that
+keeps a function's own code from reaching the EC2 ENI API.
 
 Read off the synthesized IAM for the four VPC roles and the two non-VPC roles.
 """
@@ -112,15 +123,17 @@ def test_create_eni_is_unconditioned_and_documented_as_a_service_limitation() ->
         assert "Condition" not in create  # no ineffective ec2:Subnet on Create
 
 
-def test_manage_eni_is_scoped_to_the_two_isolated_subnets() -> None:
+def test_manage_eni_is_unconditioned_and_documented_as_a_live_proven_repair() -> None:
+    """Macro C live canary: ``ec2:Subnet`` never appears in the authorization context of
+    Lambda's own service-side ``DeleteNetworkInterface`` call, so a ``StringEquals ec2:Subnet``
+    condition here is unmatchable and silently blocks VPC-attached function creation -- proven
+    live via ``sts:DecodeAuthorizationMessage`` against a real deploy, not asserted offline."""
+
     for role_prefix, (stack_name, _fn) in ROLE_HAS_ENI.items():
         manage = _by_sid(stack_name, role_prefix)["AllowManageVpcEni"]
         assert _actions(manage) == MANAGE
         assert manage["Resource"] == "*"
-        subnets = manage["Condition"]["StringEquals"]["ec2:Subnet"]
-        assert len(subnets) == 2
-        assert all("AmbientChorusNetwork" in json.dumps(s) for s in subnets)
-        assert "SourceFunctionArn" not in json.dumps(manage["Condition"])
+        assert "Condition" not in manage  # no ineffective ec2:Subnet on Delete/Assign/Unassign
 
 
 def test_describe_eni_is_unconditioned() -> None:
@@ -171,11 +184,25 @@ def test_no_role_gets_the_ec2_wildcard_or_the_managed_vpc_policy() -> None:
 
 
 def test_no_unsupported_condition_is_asserted_merely_to_look_narrow() -> None:
-    """Review R1-C item 9: ``ec2:Subnet`` appears only on the manage actions that support it,
-    never on Create or the Describes."""
+    """Review R1-C item 9, repaired by the Macro C live canary: none of the three service-side
+    Allow statements carries a condition EC2 will not actually evaluate against Lambda's own
+    ENI calls -- ``ec2:Subnet`` included, now that it is proven unmatchable there too."""
 
     for role_prefix, (stack_name, _fn) in ROLE_HAS_ENI.items():
         by_sid = _by_sid(stack_name, role_prefix)
         assert "Condition" not in by_sid["AllowCreateVpcEni"]
         assert "Condition" not in by_sid["AllowDescribeVpcEni"]
-        assert "ec2:Subnet" in json.dumps(by_sid["AllowManageVpcEni"]["Condition"])
+        assert "Condition" not in by_sid["AllowManageVpcEni"]
+
+
+def test_deny_vpc_eni_from_function_code_still_present_after_the_manage_repair() -> None:
+    """The ``AllowManageVpcEni`` repair removes a condition on the Allow; it must not have
+    touched the Deny that is the actual function-code boundary."""
+
+    for role_prefix, (stack_name, function_name) in ROLE_HAS_ENI.items():
+        deny = _by_sid(stack_name, role_prefix)["DenyVpcEniFromFunctionCode"]
+        assert deny["Effect"] == "Deny"
+        assert _actions(deny) == ALL_ENI
+        assert deny["Resource"] == "*"
+        assert "SourceFunctionArn" in json.dumps(deny["Condition"])
+        assert function_name in json.dumps(deny["Condition"])

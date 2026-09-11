@@ -322,8 +322,15 @@ def vpc_eni_policy_statements(
       condition**. Lambda's Hyperplane creation is a service operation; a subnet condition here
       is ineffective, and this is an AWS service limitation, not a narrowing skipped;
     * ``AllowManageVpcEni`` -- ``DeleteNetworkInterface`` / ``AssignPrivateIpAddresses`` /
-      ``UnassignPrivateIpAddresses`` on ``Resource: "*"``, ``Condition StringEquals ec2:Subnet``
-      = the two isolated subnet ARNs (supported for actions that act on an existing ENI);
+      ``UnassignPrivateIpAddresses`` on ``Resource: "*"``, **no condition** (Macro C live canary,
+      decoded via ``sts:DecodeAuthorizationMessage``): Lambda's own service-side
+      ``DeleteNetworkInterface`` call during VPC-attached function creation never presents an
+      ``ec2:Subnet`` key in its authorization context (only ``aws:Region``/``Service``/
+      ``Resource``/``Type``/``Account``/``ARN``/``ID``), so a ``StringEquals ec2:Subnet``
+      condition here can never match and silently blocks Lambda's own ENI cleanup with an
+      implicit deny -- not a narrowing that held, an always-false condition. This mirrors the
+      unconditioned shape AWS's own ``AWSLambdaVPCAccessExecutionRole`` uses for exactly these
+      three actions;
     * ``AllowDescribeVpcEni`` -- ``DescribeNetworkInterfaces`` / ``DescribeSubnets`` on
       ``Resource: "*"``, unconditioned;
     * ``DenyVpcEniFromFunctionCode`` -- all six actions, ``Effect: DENY``, ``Condition
@@ -348,7 +355,6 @@ def vpc_eni_policy_statements(
             effect=iam.Effect.ALLOW,
             actions=list(ENI_MANAGE_ACTIONS),
             resources=["*"],
-            conditions={"StringEquals": {"ec2:Subnet": subnet_arns}},
         ),
         iam.PolicyStatement(
             sid="AllowDescribeVpcEni",
