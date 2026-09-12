@@ -13,17 +13,22 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
+from unittest import mock
 
 import pytest
 from aws_cdk import App, Stack, assertions
+from aws_cdk import aws_lambda as lambda_
 from infra.cdk.app import build_app
+from infra.cdk.lambda_support import OFFLINE_PLACEHOLDER_CODE_DIR
+from infra.cdk.runtime_support import RuntimeArtifactLocation
 from infra.cdk.stacks.sender import (
     EXECUTION_KEY_PREFIX,
     FORBIDDEN_WRITE_PREFIXES,
     SES_SEND_ACTION,
 )
+from tools.build_runtime_artifacts import load_manifest as _load_runtime_manifest
 
 POLICY_TYPE = "AWS::IAM::Policy"
 WRITE_ACTIONS = ("dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem")
@@ -349,15 +354,61 @@ def test_the_application_may_write_the_execution_prefix(app: App) -> None:
 
 _TEST_ACCOUNT = "111111111111"  # synthetic, never the real deployment account
 _TEST_SES_IDENTITY_ARN = f"arn:aws:ses:us-east-1:{_TEST_ACCOUNT}:identity/verified@example.com"
+_SYNTHETIC_RUNTIME_ARTIFACT_SHA256 = "0" * 64
+_SYNTHETIC_RUNTIME_ARTIFACT_OBJECT_KEY = "{agent}/TEST-SYNTHETIC-NOT-DEPLOYABLE.zip"
+
+
+def _synthetic_runtime_artifact_location(
+    agent: str, *, bucket_name: str, offline: bool, output_root: object = None
+) -> RuntimeArtifactLocation:
+    """Stand-in for ``runtime_artifact_location`` inside the ``deployment_mode_sender`` fixture.
+
+    A clean checkout has no ``build/agentcore/artifacts.json`` -- correctly, since that function
+    fails closed for a real deploy without one. This fixture is not exercising that guarantee (it
+    is covered elsewhere); it only needs ``build_app(offline=False, ...)`` to construct
+    ``AmbientChorusAgents`` as a side effect of reaching the sender's real wiring path. The
+    ``deployed_name`` still comes from the real, checked-in ``runtime.toml`` manifest so the
+    synthetic location differs from a real one only in the parts that depend on a local build.
+    """
+
+    del offline, output_root
+    return RuntimeArtifactLocation(
+        agent=agent,
+        bucket_name=bucket_name,
+        object_key=_SYNTHETIC_RUNTIME_ARTIFACT_OBJECT_KEY.format(agent=agent),
+        sha256=_SYNTHETIC_RUNTIME_ARTIFACT_SHA256,
+        deployed_name=_load_runtime_manifest(agent).deployed_name,
+    )
+
+
+def _synthetic_lambda_asset_code(function_name: str, *, offline: bool) -> lambda_.Code:
+    """Stand-in for ``lambda_asset_code`` inside the ``deployment_mode_sender`` fixture.
+
+    Same reasoning as ``_synthetic_runtime_artifact_location``: a clean checkout has no
+    ``build/lambda/*.zip`` either, and this fixture is not the place that proves deployment mode
+    fails closed without one (that is ``test_deploy_guards.py``). It reuses the already-tracked,
+    clearly-named offline placeholder code directory rather than inventing a new fixture.
+    """
+
+    del function_name, offline
+    return lambda_.Code.from_asset(str(OFFLINE_PLACEHOLDER_CODE_DIR))
 
 
 @pytest.fixture(scope="module")
-def deployment_mode_sender() -> assertions.Template:
+def deployment_mode_sender() -> Iterator[assertions.Template]:
     """The real ``app.py`` wiring path, deployment mode, with a real-shaped SES identity ARN.
 
     Exercises ``DeploymentIdentities.from_context`` -> ``ChorusSenderStack`` end to end -- the
     same path a real ``cdk deploy`` takes -- rather than constructing the stack directly, so a
     future break in the *wiring* (not just the stack's own fallback logic) is caught here too.
+
+    ``build_app(offline=False, ...)`` also constructs ``AmbientChorusAgents`` and the other
+    compute stacks, which in deployment mode resolve real, built deployment artifacts (AgentCore
+    runtime ZIPs, Lambda ZIPs) and fail closed when those are absent -- as they deliberately are
+    on a clean checkout. Those two artifact-resolution points are unrelated to the SES identity
+    wiring this fixture exists to prove, so they are patched here with deterministic synthetic
+    stand-ins; the identity validation path itself (``DeploymentIdentities.from_context`` with
+    ``offline=False``) is untouched.
     """
 
     from infra.cdk.app import build_app as _build_app
@@ -377,8 +428,18 @@ def deployment_mode_sender() -> assertions.Template:
         ),
         "ses_identity_arn": _TEST_SES_IDENTITY_ARN,
     }
-    deployment_app = _build_app(offline=False, context=context)
-    return assertions.Template.from_stack(_stack(deployment_app, "AmbientChorusSender"))
+    with (
+        mock.patch(
+            "infra.cdk.stacks.agents.runtime_artifact_location",
+            side_effect=_synthetic_runtime_artifact_location,
+        ),
+        mock.patch(
+            "infra.cdk.lambda_support.lambda_asset_code",
+            side_effect=_synthetic_lambda_asset_code,
+        ),
+    ):
+        deployment_app = _build_app(offline=False, context=context)
+        yield assertions.Template.from_stack(_stack(deployment_app, "AmbientChorusSender"))
 
 
 def test_app_py_passes_the_configured_ses_identity_arn_to_sender(
