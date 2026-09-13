@@ -34,6 +34,53 @@ This is **compile, don't filter**. CHORUS does not give an LLM private data and 
 
 The AWS stack is Python 3.12, FastAPI, Pydantic v2, Strands Agents, Amazon Bedrock with Nova 2 Lite, Bedrock AgentCore Runtime, DynamoDB, S3, SES, EventBridge Scheduler, Lambda, CloudWatch, React, TypeScript, Vite, AWS CDK v2, `uv`, and `npm`. Nova 2 Lite and AgentCore are code-complete but not yet live — see the status note above.
 
+## Judge Quickstart (local, no AWS)
+
+This runs the checked-in local composition
+([`src/chorus/composition/local.py`](src/chorus/composition/local.py)) — the same production
+application and privacy-compiler code as the deployed stack, wired to local/in-memory adapters
+instead of AWS. It is a separate build from the seven CDK stacks independently deployed and
+verified live in `us-east-1` described in the status note above; this quickstart never calls
+that deployment and needs no AWS account.
+
+**No AWS credentials. No AgentCore. No Bedrock Nova.** The Monitor, Investigator, and Action
+agents run as deterministic, fixture-driven fake adapters shipped in
+[`src/chorus/infrastructure/local/`](src/chorus/infrastructure/local/) (`LexicalFakeMonitorAgent`,
+`CautiousFakeInvestigatorAgent`, `CautiousFakeActionAgent`, `LiteralSpanCommitmentExtractor`) —
+not live models, and not to be described as one. Storage is in-memory, the "sender" writes to a
+local filesystem outbox instead of calling SES, and the scheduler/clock are in-process stand-ins.
+
+Prerequisites: Python 3.12, `uv`, Node.js, npm. No Docker, no AWS account, no `.env`.
+
+```text
+uv sync --frozen
+npm ci
+uv run chorus-api serve --port 8080            # terminal A — leave running
+npm run dev --workspace @ambient-chorus/web    # terminal B — leave running
+```
+
+Open the URL Vite prints (default `http://127.0.0.1:5173`) and click through in order:
+
+1. **Reset demo** — seeds the frozen `elevator/v1` fixture corpus (24 messages, 4 residents).
+2. **Detect pattern** — runs the fake Monitor agent; open the case it surfaces.
+3. **Propose mandates**, then use the persona selector to step through each resident and decide
+   their own mandate (Resident B intentionally narrows one fact to `INTERNAL_ONLY`).
+4. **Run investigation** — the fake Investigator agent flags the contradiction; the private panel
+   still legitimately shows the sentinel private fact.
+5. **Compile shareable view** — the deterministic privacy compiler excludes the private facts;
+   the shareable panel does not contain them.
+6. **Propose action**, switch persona to `case_approver`, **Approve**, then **Execute / send** —
+   this writes to the local outbox file, not SES.
+7. **Deliver reply** (a fixture manager reply) → a commitment appears `PENDING`; **Advance clock
+   past due date** → `DUE`; switch to the affected resident and mark **Missed**.
+8. The case returns to **Ready for action**, not **Resolved** — `ACTIONED != RESOLVED` is the
+   point of the demo.
+
+This is the same sequence exercised automatically by
+[`apps/web/tests/hero.spec.ts`](apps/web/tests/hero.spec.ts) (UI) and
+[`tests/smoke/test_local_hero_flow.py`](tests/smoke/test_local_hero_flow.py) (backend-only);
+running either is optional verification, not a substitute for watching the flow in a browser.
+
 ## Engineering source of truth
 
 Start with [docs/README.md](docs/README.md). It defines the document precedence, frozen decisions, reading order, ADR index, and implementation-plan entry point. [AGENTS.md](AGENTS.md) contains mandatory instructions for coding agents.
