@@ -86,11 +86,38 @@ def _translate(error: Exception, entity_ref: str) -> Exception:
 
 @dataclass(slots=True)
 class S3ObjectStore:
-    """Reads private evidence, heads and writes export derivatives. Nothing else."""
+    """Reads private evidence, heads and writes export derivatives. Nothing else.
+
+    Every write this adapter performs names its bucket's **exact** KMS key. The deployed bucket
+    policy denies ``s3:PutObject`` when ``s3:x-amz-server-side-encryption-aws-kms-key-id`` is
+    absent or not the configured key ARN, and an absent condition key does not equal the value,
+    so a write that set only ``ServerSideEncryption="aws:kms"`` returned ``AccessDenied`` for
+    every private and export object (deployment contract SS 9). The key ARNs arrive as deployment
+    configuration (``CHORUS_PRIVATE_EVIDENCE_KEY_ARN`` / ``CHORUS_EXPORT_EVIDENCE_KEY_ARN``, from
+    CDK outputs) and are kept **separate**: the private writer can never reach for the export
+    key and the export writer can never reach for the private key, which is the property two
+    keys exist to provide.
+
+    The two ARNs are required. A store constructed without them fails closed at construction
+    rather than silently falling back to the bucket's default key -- the local in-memory adapter
+    is what a run without AWS uses, not this one with a blank key.
+    """
 
     client: S3Client
     private_bucket: str
     export_bucket: str
+    private_kms_key_id: str
+    export_kms_key_id: str
+
+    def __post_init__(self) -> None:
+        if not self.private_kms_key_id or not self.private_kms_key_id.strip():
+            raise ValueError("S3ObjectStore requires the private evidence KMS key ARN")
+        if not self.export_kms_key_id or not self.export_kms_key_id.strip():
+            raise ValueError("S3ObjectStore requires the export evidence KMS key ARN")
+        if self.private_kms_key_id == self.export_kms_key_id:
+            # The private/export separation is enforced by two keys. One value for both would
+            # collapse the two boundaries this adapter is built to keep apart.
+            raise ValueError("the private and export evidence KMS keys must not be the same")
 
     async def load_private_evidence(
         self,
@@ -129,6 +156,52 @@ class S3ObjectStore:
         if len(content) > MAX_EVIDENCE_SOURCE_BYTES:
             raise ExternalDependencyError("PRIVATE_EVIDENCE_OBJECT", retryable=False)
         return bytes(content)
+
+    def purge_namespace(self, namespace: Namespace) -> int:
+        """Not used deployed: the demo reset purges ``ns/DEMO/`` through the dedicated
+        prefix-bounded :class:`~chorus.infrastructure.demo_reset_purge.S3DemoObjectPrefixPurge`,
+        so this adapter never sweeps a namespace. Present only to satisfy the shared
+        ``DemoEvidenceObjects`` shape."""
+
+        raise NotImplementedError(
+            "S3ObjectStore does not purge a namespace; use S3DemoObjectPrefixPurge"
+        )
+
+    def seed_private_evidence(
+        self,
+        *,
+        namespace: Namespace,
+        community_id: CommunityId,
+        case_id: CaseId,
+        evidence_id: EvidenceItemId,
+        content: bytes,
+        media_type: str,
+    ) -> str:
+        """Place one fixture evidence object where ingestion would have written it, SSE-KMS.
+
+        Used only by the deployed demo reset (review R2), to reseed the two frozen fixture
+        evidence objects after the bounded ``ns/DEMO/`` prefix purge. It names the private
+        bucket's exact KMS key ARN as ``SSEKMSKeyId``, exactly like every other write this
+        adapter performs -- the bucket policy denies a write that does not (deployment contract
+        § 9). Overwrites deliberately (no ``IfNoneMatch``): the purge removed the prior object
+        and the content is content-addressed by the fixture digest anyway.
+        """
+
+        key = private_evidence_key(
+            namespace=namespace,
+            community_id=community_id,
+            case_id=case_id,
+            evidence_id=evidence_id,
+        )
+        self.client.put_object(
+            Bucket=self.private_bucket,
+            Key=key,
+            Body=content,
+            ContentType=media_type,
+            ServerSideEncryption="aws:kms",
+            SSEKMSKeyId=self.private_kms_key_id,
+        )
+        return key
 
     async def head_inbound_reply(
         self,
@@ -194,6 +267,7 @@ class S3ObjectStore:
                 Body=content,
                 ContentType=INBOUND_REPLY_MEDIA_TYPE,
                 ServerSideEncryption="aws:kms",
+                SSEKMSKeyId=self.private_kms_key_id,
                 ChecksumAlgorithm="SHA256",
                 Metadata={DIGEST_METADATA_KEY: raw_sha256.value},
                 IfNoneMatch="*",
@@ -279,6 +353,7 @@ class S3ObjectStore:
                 Body=content,
                 ContentType=media_type,
                 ServerSideEncryption="aws:kms",
+                SSEKMSKeyId=self.export_kms_key_id,
                 ChecksumAlgorithm="SHA256",
                 Metadata={DIGEST_METADATA_KEY: derivative_sha256.value},
                 # Create-if-absent. A head-then-put pair is not a create: two compilers

@@ -104,18 +104,22 @@ class ScriptedCommitmentExtractor:
 class LiteralSpanCommitmentExtractor:
     """Cite the first ISO date in the reply and the sentence containing it, or propose nothing.
 
-    Deliberately literal. It restates the obligor as the configured safe label rather than
-    reading one out of the reply, which is not cheating: check 4 compares the model's value with
-    that label anyway, so a stand-in that guessed would only ever be wrong. And it restates the
-    action as the cited sentence, which the grounding check will accept precisely because every
-    token in it came from the reply.
+    Deliberately literal. It restates the obligor as the safe label **the payload carries**
+    rather than reading one out of the reply, which is not cheating: check 4 compares the model's
+    value with that label anyway, so a stand-in that guessed would only ever be wrong. And it
+    restates the action as the cited sentence, which the grounding check will accept precisely
+    because every token in it came from the reply.
+
+    The label used to arrive out-of-band, on this dataclass. It now comes from
+    ``CommitmentExtractionInput`` -- the same field the live prompt renders -- so this stand-in
+    is answering the same question a deployed model is asked, from the same input, rather than
+    from a value only a local fake could see.
 
     What it cannot do is more interesting than what it does: it has no field for a status, a
     case state, a destination, or a verification method, so there is nothing for this stand-in
     to overreach with even if it tried.
     """
 
-    destination_label: str
     invocations: list[CommitmentExtractionInvocation] = field(default_factory=list)
 
     async def invoke_commitment_extraction(
@@ -149,7 +153,7 @@ class LiteralSpanCommitmentExtractor:
                     obligor_span=SourceSpan(start=start, end=min(end, start + 40)),
                     action_span=SourceSpan(start=start, end=end),
                     due_date_span=SourceSpan(start=match.start(), end=match.end()),
-                    obligor=self.destination_label,
+                    obligor=payload.destination_display_label,
                     action_text=text[start:end].strip(),
                     # Advisory and never read. It is deliberately the plain midnight instant
                     # rather than the derived end of day, so a test that read it instead of the

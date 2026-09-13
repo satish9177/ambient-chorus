@@ -18,6 +18,7 @@ import anyio
 from anyio import CapacityLimiter
 from botocore.exceptions import BotoCoreError, ClientError
 
+from chorus.domain.ids import IdGenerator, Uuid4Generator
 from chorus.infrastructure.dynamodb.attributes import (
     AttributeMap,
     decode_item,
@@ -94,6 +95,7 @@ class DynamoDbStorageDriver:
     client: DynamoDbClient
     table_names: Mapping[TableName, str]
     limiter: CapacityLimiter = field(default_factory=lambda: CapacityLimiter(DEFAULT_THREAD_LIMIT))
+    write_ids: IdGenerator = field(default_factory=Uuid4Generator)
 
     def _table(self, table: TableName) -> str:
         name = self.table_names.get(table)
@@ -208,6 +210,15 @@ class DynamoDbStorageDriver:
         return QueryResult(items=items, last_evaluated_sort_key=last_sort_key)
 
     async def write_item(self, operation: PutItem | DeleteItem) -> None:
+        from chorus.infrastructure.dynamodb.demo_mutation import fence_operations
+
+        fenced = fence_operations((operation,))
+        if fenced != (operation,):
+            # Independent calls to this conditional primitive must re-evaluate the condition.
+            # Capture one transport identity here; explicit command transactions retain
+            # their separate retry identity. Botocore's hidden retries remain disabled.
+            await self.transact_write(fenced, client_request_token=str(self.write_ids.new_uuid()))
+            return
         table = self._table(operation.key.table)
         rendered = render_condition(operation.condition)
         arguments: dict[str, object] = {
@@ -261,6 +272,10 @@ class DynamoDbStorageDriver:
     async def transact_write(
         self, operations: tuple[WriteOperation, ...], *, client_request_token: str
     ) -> None:
+        from chorus.infrastructure.dynamodb.demo_mutation import fence_operations, transaction_token
+
+        operations = fence_operations(operations)
+        client_request_token = transaction_token(client_request_token)
         if not operations:
             raise ValueError("a transaction requires at least one operation")
         if len(operations) > TRANSACTION_MAX_OPERATIONS:

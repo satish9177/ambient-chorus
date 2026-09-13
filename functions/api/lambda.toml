@@ -1,0 +1,43 @@
+# Deployment manifest for the API Lambda (deployment contract SS 14, SS 11).
+#
+# The API Lambda runs `functions.api.handler.handler` behind API Gateway HTTP API payload v2.
+# This file declares what the deployment artifact *is*: which first-party trees ship, which
+# module answers an invocation, and the runtime budget the function is created with. It is read
+# by `tools/build_lambda_artifacts.py` and asserted by `tests/unit/tooling/test_lambda_build.py`
+# and `tests/unit/infra/test_lambda_functions.py`, so a function that quietly grew an import or
+# a budget it should not have fails before deployment rather than after it.
+
+[function]
+name = "chorus-api"
+handler = "functions.api.handler.handler"
+description = "FastAPI request path behind API Gateway HTTP API payload v2."
+
+[runtime]
+# x86_64, not ARM64: no Lambda architecture is frozen (deployment contract SS 7), the dependency
+# closure (pydantic-core, pillow, cryptography-free) has the widest wheel coverage on x86_64,
+# and this is the least risky choice for the existing closure. AgentCore's ARM64 decision is
+# untouched -- it is a different artifact with a different, frozen egress boundary.
+architecture = "x86_64"
+python_version = "3.12"
+# 29 s is one second under API Gateway HTTP API's 30 s hard integration timeout: the presenter
+# waits on this call and it fans out synchronously to the compiler (compile route) and the
+# watcher (`POST /v1/demo/clock/advance`). Those two calls use a 25 s client read timeout
+# (chorus.infrastructure.lambdas.transport_budgets), so a slow downstream raises a typed
+# dependency failure inside this budget rather than being cut off by a Lambda hard-termination.
+timeout_seconds = 29
+# 512 MiB: FastAPI + Pydantic v2 + boto3 clients, no image work (that is the compiler's).
+memory_mb = 512
+
+[artifact]
+# First-party trees, copied into the archive with source-root prefixes stripped so the deployed
+# import graph matches the repository: `src/chorus` -> `chorus/`, `apps/api/chorus_api` ->
+# `chorus_api/`, `functions/**` unchanged. The Lambda runtime puts the archive root on sys.path,
+# so `import functions.api.handler`, `import chorus_api.main`, and `import chorus...` all resolve
+# from the archive and from nowhere else.
+first_party = [
+  "functions/__init__.py",
+  "functions/envelope.py",
+  "functions/api",
+  "apps/api/chorus_api",
+  "src/chorus",
+]

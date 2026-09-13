@@ -1,0 +1,29 @@
+# Deployment manifest for the asynchronous operation worker Lambda (deployment contract SS 14).
+#
+# Runs `functions.worker.handler.handler`. The API dispatches every agent-invoking operation
+# here with `InvocationType="Event"` and returns 202. See `functions/api/lambda.toml` for the
+# shared manifest contract.
+
+[function]
+name = "chorus-worker"
+handler = "functions.worker.handler.handler"
+description = "Asynchronous operation worker: agents, compiler, sender, and commitment schedules."
+
+[runtime]
+architecture = "x86_64"
+python_version = "3.12"
+# 120 s > `CHORUS_AGENT_TIMEOUT_SECONDS` (90 s outermost rung): one operation waits synchronously
+# on one AgentCore invocation and then, for SEND_ACTION, on the sender function -- so the Lambda
+# timeout must exceed the application's own agent wait plus overhead, and no more. It is not the
+# AgentCore runtime budget (60-75 s); it is the wall the synchronous wait sits inside.
+timeout_seconds = 120
+# 1024 MiB: Pydantic v2 + boto3 + the five operation object graphs held for one invocation.
+memory_mb = 1024
+
+[artifact]
+first_party = [
+  "functions/__init__.py",
+  "functions/envelope.py",
+  "functions/worker",
+  "src/chorus",
+]

@@ -61,13 +61,13 @@ from chorus.application.commands.reconcile_send_outcome import (
     ReconciliationRefusedError,
 )
 from chorus.application.commands.send_action import (
-    SendAction,
     SendActionCommand,
     SendActionResult,
     SendDeniedError,
 )
 from chorus.application.errors import ApplicationError
 from chorus.application.operations import ApplicationOperations
+from chorus.application.send_contract import SendActionRunner
 from chorus.domain.entities import (
     ActionExecutionState,
     ApplicationOperation,
@@ -77,6 +77,7 @@ from chorus.domain.entities import (
 from chorus.domain.errors import DomainError, StateTransitionError
 from chorus.ports.errors import PersistenceError, PersistenceErrorCode
 from chorus.ports.operations import SendActionOperationJob
+from chorus.ports.repositories import ShareableRepositoryPort
 
 INTERNAL_ERROR_CODE = "INTERNAL_ERROR"
 
@@ -97,7 +98,21 @@ class SendActionOperationWorker:
     """Run one send operation to a terminal status, then project what happened."""
 
     operations: ApplicationOperations
-    send_action: SendAction
+    send_action: SendActionRunner
+    """The sender: :class:`~chorus.application.commands.send_action.SendAction` in a local
+    composition, and :class:`~chorus.application.send_contract.RemoteSendAction` -- one
+    synchronous invocation of the sender Lambda -- in a deployed one. Typed as the runner
+    protocol because the deployed sender is a separate principal with a total Core deny, the
+    only SES grant, and the destination secret, none of which may sit in this process."""
+
+    shareable: ShareableRepositoryPort
+    """The worker's own read handle onto the execution row.
+
+    Held here rather than reached for through ``send_action``, because the resume path has to
+    read the execution's state *before* deciding whether a send may be attempted at all -- and
+    in a deployed topology the sender is behind a Lambda boundary while this read is an
+    ordinary Shareable ``GetItem`` the worker's role already grants."""
+
     project: ProjectActionOutcome
     reconcile: ReconcileSendOutcome
 
@@ -201,9 +216,7 @@ class SendActionOperationWorker:
         """
 
         command = self._command(job)
-        execution = await self.send_action.shareable.load_execution(
-            command.action_scope, job.execution_id
-        )
+        execution = await self.shareable.load_execution(command.action_scope, job.execution_id)
         if execution.state is ActionExecutionState.APPROVED:
             return await self._run(job, operation)
         if execution.state in {

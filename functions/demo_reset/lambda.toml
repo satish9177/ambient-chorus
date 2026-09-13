@@ -1,0 +1,36 @@
+# Deployment manifest for the dedicated demo reset Lambda (deployment contract §§ 12, 19-26).
+#
+# Runs `functions.demo_reset.handler.handler` -- the operator-only deterministic demo
+# restoration. Not a request-path function: it has its own narrow role
+# (`chorus-demo-reset-{env}`), its own log group, and no public route of any kind. See
+# `functions/api/lambda.toml` for the shared manifest contract.
+#
+# It is in `tools/build_lambda_artifacts.py`'s `FUNCTION_DIRS` and is packaged, secret-gated,
+# ELF-verified, and isolated-import-proven exactly like the five request-path functions -- a
+# normal fresh build now produces six ZIPs. Deployment-capable synth fails closed without
+# `build/lambda/chorus-demo-reset.zip`; explicit offline synth uses the placeholder code.
+
+[function]
+name = "chorus-demo-reset"
+handler = "functions.demo_reset.handler.handler"
+description = "Operator-only deterministic demo restoration: manifest-driven bounded reset."
+
+[runtime]
+architecture = "x86_64"
+python_version = "3.12"
+# 120 s. A full reset enumerates the DEMO namespace's partitions, bounded-deletes their rows,
+# purges the ns/DEMO/ object prefixes, deletes the DEMO schedules, and performs the one fenced
+# clock reseed. None of it is model or network heavy; 120 s is generous headroom for a
+# deterministic operator action that runs at most a few times a demo.
+timeout_seconds = 120
+# 1024 MiB: boto3 + Pydantic v2 + the reset object graph held for one invocation.
+memory_mb = 1024
+
+[artifact]
+first_party = [
+  "functions/__init__.py",
+  "functions/envelope.py",
+  "functions/demo_reset",
+  "src/chorus",
+  "demo/fixtures/elevator-v1",
+]

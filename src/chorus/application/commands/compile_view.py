@@ -295,7 +295,16 @@ class CompileView:
             requested_facts=len(command.requested_facts),
             requested_evidence=len(command.requested_evidence_ids),
         )
-        candidates = await self._prepare_evidence(scope, command, state)
+        from chorus.application.services.demo_side_effect import demo_side_effect
+
+        async with demo_side_effect(
+            key=key,
+            repository=self.idempotency,
+            unit_of_work=self.unit_of_work,
+            clock=self.clock,
+            ids=self.ids,
+        ):
+            candidates = await self._prepare_evidence(scope, command, state)
 
         context = CompileContext(
             case=state.case,

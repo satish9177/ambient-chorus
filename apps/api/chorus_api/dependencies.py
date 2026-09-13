@@ -7,11 +7,14 @@ case rather than for a repository.
 Access control here is the Phase 3 half of the frozen demo model. The actor header selects one
 seeded persona from a fixed set and every route states which personas may use it.
 
-Bearer-token validation against Secrets Manager is **not implemented**. It belongs to the
-deployed demo in Phase 11, and nothing in this module or in :func:`~chorus_api.main.build_app`
-substitutes for it: there is no placeholder token check, because a check that accepts anything
-would read as authentication in review while providing none. Until Phase 11 lands, the actor
-header alone selects a persona, and that is only sound behind a trusted local boundary.
+Bearer-token validation against Secrets Manager is the deployed half, and it is a *container
+field* rather than a hard-wired middleware: :attr:`ApiContainer.access` holds a
+:class:`~chorus.ports.access.DemoAccessVerifierPort` in the deployed composition and ``None`` in
+the local one, and :func:`~chorus_api.main.build_app` installs the check only where a verifier
+exists. There is still no placeholder token check, because a check that accepts anything would
+read as authentication in review while providing none -- so behind a trusted local boundary the
+actor header alone selects a persona, exactly as before, and in the deployed demo the token is
+required first.
 """
 
 from __future__ import annotations
@@ -25,7 +28,6 @@ from typing import Annotated
 from fastapi import Header, HTTPException, Request
 
 from chorus.application.commands.approve_action import ApproveAction
-from chorus.application.commands.compile_view import CompileView
 from chorus.application.commands.decide_mandate import DecideMandate
 from chorus.application.commands.ingest_external_reply import (
     IngestExternalReply,
@@ -34,8 +36,8 @@ from chorus.application.commands.ingest_external_reply import (
 from chorus.application.commands.ingest_messages import IngestMessages
 from chorus.application.commands.invalidate_action import InvalidateAction
 from chorus.application.commands.propose_mandates import ProposeMandates
-from chorus.application.commands.record_commitment_due import RecordCommitmentDue
 from chorus.application.commands.verify_commitment import VerifyCommitment
+from chorus.application.compile_contract import CompileViewRunner
 from chorus.application.operations import ApplicationOperations
 from chorus.application.queries.audit_page import ReadCaseAudit
 from chorus.application.queries.case_surface import ReadCaseSurface
@@ -44,6 +46,7 @@ from chorus.application.queries.feed import ReadAmbientFeed
 from chorus.application.queries.investigation import ReadInvestigation
 from chorus.application.queries.mandates import ReadMandateThread
 from chorus.application.services.inbound_mail import InboundMailAttester
+from chorus.application.watcher_contract import CommitmentWatcher
 from chorus.composition.demo_reset import DemoResetService
 from chorus.domain.entities import Commitment
 from chorus.domain.ids import (
@@ -56,7 +59,9 @@ from chorus.domain.ids import (
     Sha256Digest,
 )
 from chorus.infrastructure.fixtures.inbound_delivery import DemoReplyDeliverySource
-from chorus.infrastructure.local.demo_clock import LogicalDemoClock
+from chorus.infrastructure.persistent_clock import ScopedLogicalClock
+from chorus.ports.access import DemoAccessVerifierPort
+from chorus.ports.demo_clock import DemoClockPort, DemoClockStorePort
 from chorus.ports.operations import OperationDispatchPort
 from chorus.ports.records import StoredSafeDestination
 from chorus.ports.repositories import ShareableRepositoryPort
@@ -110,6 +115,20 @@ class InboundReplySurface:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RequestLogicalTime:
+    """The durable clock, and the slot one request's reading is bound into.
+
+    Both together or neither: a store with no scope is a read nothing can use, and a scope with
+    no store is a clock nothing ever binds -- which raises on the first ``now()`` rather than
+    quietly returning something. Grouping them is what makes "the deployed API has one
+    authoritative clock" a single field to wire and a single field to assert.
+    """
+
+    store: DemoClockStorePort
+    scope: ScopedLogicalClock
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ApiContainer:
     """Everything the Phase 3 and Phase 4 routes are allowed to reach."""
 
@@ -130,7 +149,16 @@ class ApiContainer:
     propose_mandates: ProposeMandates
     decide_mandate: DecideMandate
     read_mandate_thread: ReadMandateThread
-    compile_view: CompileView
+    compile_view: CompileViewRunner
+    """The deterministic privacy compiler, in-process locally and behind one synchronous
+    invocation when deployed.
+
+    Typed as the runner protocol because the deployed request path is *denied* every write on
+    the view partitions -- the compiler is the sole creator of views by IAM and not by
+    convention -- so an in-process compiler here could only fail, and only in an account
+    (deployment contract SS 8.1).
+    """
+
     read_current_action: ReadCurrentAction
     """The Phase-7 safe preview read path.
 
@@ -159,13 +187,47 @@ class ApiContainer:
     no verifier mints artifacts nothing accepts, and a verifier with no attester accepts nothing.
     """
 
-    record_commitment_due: RecordCommitmentDue | None = None
-    demo_clock: LogicalDemoClock | None = None
+    record_commitment_due: CommitmentWatcher | None = None
+    """The watcher, in-process locally and behind one synchronous invocation when deployed.
+
+    Typed as the protocol rather than as :class:`RecordCommitmentDue` because the deployed API
+    holds no Shareable case-write path, no unit of work, and no audit repository -- it holds
+    ``lambda:InvokeFunction`` on the watcher's ``live`` alias and
+    :class:`~chorus.application.watcher_contract.RemoteRecordCommitmentDue`. Both reach the
+    **same** watcher application logic, which is what ADR-028 SS 5 requires: a second
+    implementation for the demo path would make the early-firing comparison mean two different
+    things on the two paths.
+    """
+
+    demo_clock: DemoClockPort | None = None
     """The demo's one logical clock, or ``None`` outside the demo.
 
     The route that advances it holds no repository write path to ``COMMITMENT#``: it holds this
-    clock and the watcher use case, and the watcher re-verifies every field of the event it is
-    handed against the strongly loaded row.
+    clock and the watcher, and the watcher re-verifies every field of the event it is handed
+    against the strongly loaded row.
+
+    Locally this is the process-local
+    :class:`~chorus.infrastructure.local.demo_clock.LogicalDemoClock`; deployed it is
+    :class:`~chorus.infrastructure.persistent_clock.PersistentDemoClock` over the durable
+    ``NS#DEMO#CLOCK`` row (ADR-029). One port, so the route never branches on the deployment.
+    """
+
+    access: DemoAccessVerifierPort | None = None
+    """The deployed demo access boundary, or ``None`` behind a trusted local boundary.
+
+    ``None`` means the token check is not installed at all rather than installed permissively:
+    :func:`~chorus_api.main.build_app` adds the middleware only when a verifier is present, so
+    there is no code path in which a check runs and accepts everything.
+    """
+
+    logical_time: RequestLogicalTime | None = None
+    """The durable clock the deployed API binds once per request, or ``None`` locally.
+
+    Deployed, every timestamp a request writes has to name the same authoritative logical
+    instant, and that instant cannot come from a process-local object in a system where the
+    watcher runs in a different Lambda. So the deployed composition supplies the store, one
+    strongly consistent read happens per request, and the reading is bound for that request's
+    duration (:class:`~chorus.infrastructure.persistent_clock.ScopedLogicalClock`).
     """
 
     commitments: ShareableRepositoryPort | None = None

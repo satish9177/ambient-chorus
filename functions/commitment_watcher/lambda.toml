@@ -1,0 +1,34 @@
+# Deployment manifest for the commitment watcher Lambda (deployment contract SS 14, SS 22).
+#
+# Runs `functions.commitment_watcher.handler.handler` -- one RecordCommitmentDue for both
+# callers (EventBridge Scheduler and the demo-clock route). The deployed function name is
+# `chorus-commitment-watcher-{env}` and MUST NOT change: its `:live` alias ARN is a frozen
+# identity already named by the API role, the scheduler execution role, and
+# `CHORUS_WATCHER_FUNCTION_ARN` semantics (deployment contract SS 4, SS 22). This function also
+# gets a published Version and an Alias named exactly `live`.
+# See `functions/api/lambda.toml` for the shared manifest contract.
+
+[function]
+name = "chorus-commitment-watcher"
+handler = "functions.commitment_watcher.handler.handler"
+description = "Commitment watcher: one edge, one Shareable partition, nothing else."
+
+[runtime]
+architecture = "x86_64"
+python_version = "3.12"
+# 24 s. A strongly consistent clock read, one strong commitment reload, and at most one
+# compare-and-swap -- DynamoDB only, sub-second in practice. Set BELOW the API's 25 s client
+# read timeout for its `POST /v1/demo/clock/advance` invoke of this function
+# (chorus.infrastructure.lambdas.transport_budgets), so a stuck watcher self-terminates before
+# the API gives up. The EventBridge Scheduler caller has its own frozen RetryPolicy and DLQ.
+timeout_seconds = 24
+# 512 MiB: the smallest object graph in the system.
+memory_mb = 512
+
+[artifact]
+first_party = [
+  "functions/__init__.py",
+  "functions/envelope.py",
+  "functions/commitment_watcher",
+  "src/chorus",
+]

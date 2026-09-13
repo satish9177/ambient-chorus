@@ -33,6 +33,8 @@ def _receipt(*, in_reply_to: tuple[str, ...], references: tuple[str, ...]) -> De
         subject_length=10,
         source="manager@chorus.invalid",
         destination="chorus-replies@chorus.invalid",
+        recipients=("chorus-replies@chorus.invalid",),
+        correspondent_address="manager@chorus.invalid",
         bucket_name="bucket",
         object_key="key",
         headers_truncated=False,

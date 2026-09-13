@@ -50,7 +50,7 @@ Lambda async delivery may repeat; the operation/input hash and underlying comman
 | Method/path | Role | Sync result | State guard / idempotency |
 |---|---|---|---|
 | `POST /demo/reset` | presenter admin | 200 reset receipt | environment=demo/development, namespace exactly `DEMO`, confirmation; idempotent seed version |
-| `POST /demo/clock/advance` | presenter admin | 202 operation | demo clock enabled; monotonic logical time; same due event ID |
+| `POST /demo/clock/advance` | presenter admin | 200 clock + watcher outcome | demo clock enabled; monotonic logical time; same due event ID |
 | `POST /ingest/messages` | presenter admin/synthetic adapter | 202 monitor operation | channel-message uniqueness; content-bound key |
 | `GET /feed` | presenter/admin | 200 page | namespace/community isolation |
 | `GET /operations/{operation_id}` | initiating role/presenter | 200 status | actor/case visibility |

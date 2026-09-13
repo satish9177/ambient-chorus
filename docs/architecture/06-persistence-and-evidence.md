@@ -1,5 +1,12 @@
 # DynamoDB persistence and S3 evidence design
 
+**Phase 11 reset correction:** [ADR-031](../adr/ADR-031-demo-reset-mutation-interlock.md)
+adds one atomic storage-level reset-lock condition to normal DEMO transactions (including
+single-item writes), beyond the domain participant counts below. New cases also atomically
+register four case-world roots. Existing contextual idempotency reservations record active
+external attempts; reset refuses these before purge. These are command records, not pending
+evidence authority. The sender/watcher Core deny now permits only the reset-lock condition.
+
 ## Decision
 
 Use three on-demand DynamoDB tables divided by trust boundary, not one global single table and not one table per entity:
@@ -43,7 +50,7 @@ All application gets/queries include a namespace prefix. Repositories construct 
 | Application operation | `NS#n#OPERATION#o` | `OPERATION` | status/result refs only; direct poll get; demo TTL |
 | Evidence root | `NS#n#COMM#c` | `EVIDENCE_ROOT#{root_sha256}` | dedupe/forward lineage |
 | Evidence root ID locator | `NS#n#COMM#c` | `EVIDENCE_ROOT_ID#{root_id}` | immutable create-only pointer to `root_sha256`; written in the root's own transaction ([ADR-017](../adr/ADR-017-evidence-root-id-locator.md)) |
-| Demo manifest/reset lock | `NS#DEMO` | `DEMO_MANIFEST#{seed_version}` / `DEMO_RESET_LOCK` | exact partition roots, object prefixes, schedules |
+| Demo manifest/reset lock | `NS#DEMO` | `DEMO_MANIFEST#{seed_version}` / `DEMO_RESET_LOCK` | exact partition roots, object prefixes, schedules. The logical clock is **not** here: [ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md) moves it to the Shareable table so the watcher, whose Core item reads and writes remain denied, can read it |
 | Case root | `NS#n#CASE#k` | `CASE` | aggregate/version/state |
 | Report | `NS#n#CASE#k` | `REPORT#r` | private |
 | Fact | `NS#n#CASE#k` | `FACT#f` | private |
@@ -66,6 +73,7 @@ Entity-type partition prefixes deliberately support IAM `dynamodb:LeadingKeys`; 
 
 | Item | PK | SK | Mutability |
 |---|---|---|---|
+| Demo logical clock | `NS#DEMO#CLOCK` | `DEMO_CLOCK` | monotonic; replaced only by a version-guarded compare-and-swap from the application. Read-only to the watcher, which holds no write action on this prefix ([ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md)). Exists in `demo` only |
 | View | `NS#n#VIEW#v` | `VIEW` | immutable; compiler write only |
 | Current view pointer | `NS#n#VIEW_CURRENT#k` | `CURRENT` | compiler conditional replace; `{view_id,hash,case_version,authorization_version,expires_at}`. The application may `ConditionCheckItem` this row and may never write it ([ADR-022](../adr/ADR-022-action-draft-preview-and-transaction.md) § 7) |
 | View history index | `NS#n#VIEW_CURRENT#k` | `HISTORY#{generated_at}#{view_id}` | immutable compiler-written safe locator |
@@ -107,7 +115,7 @@ Every action/approval/execution endpoint is nested under `/cases/{case_id}` and 
 | per source fact | `fact_id`, requested scope, outcome, reason codes, generated export fact IDs, transformation rule ID where one applied |
 | per source evidence | source evidence ID, safe evidence ref ID, opaque export handle ID, `derivative_sha256`, outcome and reason codes |
 
-It holds identifiers, codes, versions, and digests. It holds **no** raw private text, report summary, fact value, evidence bytes, prompt, or completion. This is the only place private identifiers are written outside Core, and the Audit table is the only table that can hold it: the compiler's Core grant is the send fence alone, and the Shareable zone forbids private identifiers in externally bound items.
+It holds identifiers, codes, versions, and digests. It holds **no** raw private text, report summary, fact value, evidence bytes, prompt, or completion. This is the only place private identifiers are written outside Core, and the Audit table is the only table that can hold it: the compiler's Core write grant is the send fence alone, and the Shareable zone forbids private identifiers in externally bound items.
 
 `AuditEvent` is unchanged. It stays the small append-only decision event and references this row through its existing entity references; `AuditDetails` is not widened to duplicate the projection, and there is no per-fact `AuditEvent` — a hundred requested facts is reachable at the frozen per-case limits, and a hundred audit participants would not fit in one transaction. A codec test asserts that the largest legal projection at those maxima stays safely inside the 400 KiB item limit.
 

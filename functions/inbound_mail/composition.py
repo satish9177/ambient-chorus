@@ -83,6 +83,17 @@ class InboundMailSettings:
     inbound_config: SafeInboundMailConfiguration
     from_identity_id: str
     cursor_secret: bytes
+    private_evidence_key_arn: str | None = None
+    export_evidence_key_arn: str | None = None
+    """The exact KMS key ARN each evidence bucket is encrypted under, from CDK outputs
+    (``CHORUS_PRIVATE_EVIDENCE_KEY_ARN`` / ``CHORUS_EXPORT_EVIDENCE_KEY_ARN``).
+
+    Both are passed even though this entry point writes private evidence only: ``S3ObjectStore``
+    owns both configured buckets and their keys, and it is not this repair's place to narrow the
+    adapter. Required for a deployed composition and refused when absent (below). Each is sent as
+    ``SSEKMSKeyId`` and the deployed bucket policy denies a write that omits or misnames it, so a
+    composition with no key ARN would fail every raw-MIME write in an account and nowhere else.
+    """
     template_version: str = TEMPLATE_VERSION
     dynamodb_endpoint: str | None = None
 
@@ -130,6 +141,15 @@ def build_inbound_mail(
         },
     )
     cursors = SignedCursorCodec(secret=settings.cursor_secret)
+    private_key_arn = settings.private_evidence_key_arn
+    export_key_arn = settings.export_evidence_key_arn
+    if not private_key_arn or not export_key_arn:
+        # Refused rather than defaulted, the same way the deployed sender refuses a missing
+        # compiler ARN: a raw-MIME write with no configured key ARN is denied by the deployed
+        # bucket policy, so the composition must fail here and not at the first delivery.
+        raise ValueError(
+            "a deployed inbound mail entry point needs the private and export evidence KMS key ARNs"
+        )
     core_repository = core or CoreRepository(driver=driver, cursors=cursors)
     shareable_repository = shareable or ShareableRepository(driver=driver, cursors=cursors)
     generator = ids or Uuid4Generator()
@@ -159,6 +179,8 @@ def build_inbound_mail(
                 client=create_s3_client(region_name=settings.region),
                 private_bucket=settings.private_evidence_bucket,
                 export_bucket=settings.export_evidence_bucket,
+                private_kms_key_id=private_key_arn,
+                export_kms_key_id=export_key_arn,
             ),
             unit_of_work=unit_of_work,
             clock=clock,

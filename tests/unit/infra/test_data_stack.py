@@ -130,12 +130,32 @@ def test_no_cache_cluster_or_extra_resource_type_is_created() -> None:
 
 
 def test_exactly_two_evidence_buckets_and_two_keys_are_created() -> None:
-    """One key per bucket. A shared key would collapse two boundaries into one grant."""
+    """One key per *evidence* bucket. A shared key would collapse two boundaries into one grant.
+
+    Three buckets now synthesize, and the count stays two keys deliberately. The third bucket is
+    the AgentCore artifact bucket (deployment contract § 6), which holds agent **code** rather
+    than evidence, is encrypted with SSE-S3, and therefore adds no customer-managed key -- the
+    frozen cost inventory (§ 18) names exactly three keys in the whole system, and none of them
+    is an artifact key.
+    """
 
     built = template(CdkBuildConfig())
 
-    built.resource_count_is("AWS::S3::Bucket", 2)
+    built.resource_count_is("AWS::S3::Bucket", 3)
     built.resource_count_is("AWS::KMS::Key", 2)
+
+    encryption_by_name = {
+        resource["Properties"]["BucketName"]: resource["Properties"]["BucketEncryption"]
+        for resource in built.find_resources("AWS::S3::Bucket").values()
+    }
+    for name, encryption in encryption_by_name.items():
+        algorithm = encryption["ServerSideEncryptionConfiguration"][0][
+            "ServerSideEncryptionByDefault"
+        ]["SSEAlgorithm"]
+        if "agent-artifacts" in name:
+            assert algorithm == "AES256", "the artifact bucket is SSE-S3, never a third CMK"
+        else:
+            assert algorithm == "aws:kms", f"{name} must stay SSE-KMS"
 
 
 def test_bucket_names_follow_the_frozen_convention() -> None:
@@ -148,6 +168,7 @@ def test_bucket_names_follow_the_frozen_convention() -> None:
     assert names == {
         "chorus-private-evidence-development",
         "chorus-export-evidence-development",
+        "chorus-agent-artifacts-development",
     }
 
 
@@ -185,10 +206,14 @@ def test_each_table_is_tagged_with_its_trust_zone() -> None:
 
 
 def test_the_application_synthesizes_every_declared_stack() -> None:
-    assembly = build_app().synth()
+    assembly = build_app(offline=True).synth()
 
     assert {stack.stack_name for stack in assembly.stacks} == {
         "AmbientChorusFoundation",
+        # Phase 11 Macro A: the dedicated isolated network is foundational (deployment
+        # contract §§ 6-9, 16). It references only ARN literals, so it takes no dependency on
+        # Data and stays first in the DAG.
+        "AmbientChorusNetwork",
         "AmbientChorusData",
         "AmbientChorusAgents",
         "AmbientChorusCompiler",
@@ -205,6 +230,14 @@ def test_the_application_synthesizes_every_declared_stack() -> None:
         # until now -- ``Share: R/W(commitment/case projection)`` mislocated the case row into a
         # table the watcher is denied outright (ADR-028 § 6). Deployed by Phase 11.
         "AmbientChorusWatcher",
+        # Phase 11 Macro B: the inbound SES receipt transport -- receipt rule set + rule with a
+        # single S3Action carrying its own TopicArn, the SNS topic and its resource policy, and
+        # the isolated inbound reply Lambda (deployment contract § 10, DAG stage 10; ADR-030).
+        "AmbientChorusInbound",
+        # Phase 11 Macro A: the dedicated reset authority and the base observability stack
+        # (deployment contract §§ 12, 19-30).
+        "AmbientChorusReset",
+        "AmbientChorusObservability",
     }
 
 

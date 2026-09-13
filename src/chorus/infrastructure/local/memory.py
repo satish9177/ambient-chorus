@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Final
 
+from chorus.domain.ids import IdGenerator, Uuid4Generator
 from chorus.domain.time import Clock, SystemClock
 from chorus.infrastructure.dynamodb.codec import require_addressed_item
 from chorus.ports.errors import (
@@ -38,6 +39,7 @@ from chorus.ports.storage import (
     AttributeAtMostNumber,
     AttributeEqualsNumber,
     AttributeEqualsString,
+    AttributeLessThanNumber,
     CheckItem,
     DeleteItem,
     ItemCondition,
@@ -98,6 +100,11 @@ def _evaluate(condition: ItemCondition, item: StoredItem | None) -> bool:
                 return False
             stored = item.get(name)
             return isinstance(stored, int) and not isinstance(stored, bool) and stored <= value
+        case AttributeLessThanNumber(name=name, value=value):
+            if item is None:
+                return False
+            stored = item.get(name)
+            return isinstance(stored, int) and not isinstance(stored, bool) and stored < value
         case AllOf(conditions):
             return all(_evaluate(inner, item) for inner in conditions)
         case AnyOf(conditions):
@@ -129,6 +136,7 @@ class InMemoryStorageDriver:
 
     stale_eventual_reads: bool = False
     clock: Clock = field(default_factory=SystemClock)
+    write_ids: IdGenerator = field(default_factory=Uuid4Generator)
     _current: dict[_Address, StoredItem] = field(default_factory=dict, init=False)
     _previous: dict[_Address, StoredItem | None] = field(default_factory=dict, init=False)
     _tokens: dict[str, tuple[datetime, tuple[WriteOperation, ...]]] = field(
@@ -252,6 +260,13 @@ class InMemoryStorageDriver:
         return QueryResult(items=items, last_evaluated_sort_key=last_key)
 
     async def write_item(self, operation: PutItem | DeleteItem) -> None:
+        from chorus.infrastructure.dynamodb.demo_mutation import fence_operations
+
+        fenced = fence_operations((operation,))
+        if fenced != (operation,):
+            # Match the real driver's per-call conditional-write semantics, not command replay.
+            await self.transact_write(fenced, client_request_token=str(self.write_ids.new_uuid()))
+            return
         _require_addressed_item(operation)
         address = self._address(operation.key)
         if not _evaluate(operation.condition, self._current.get(address)):
@@ -264,6 +279,10 @@ class InMemoryStorageDriver:
     async def transact_write(
         self, operations: tuple[WriteOperation, ...], *, client_request_token: str
     ) -> None:
+        from chorus.infrastructure.dynamodb.demo_mutation import fence_operations, transaction_token
+
+        operations = fence_operations(operations)
+        client_request_token = transaction_token(client_request_token)
         if not operations:
             raise ValueError("a transaction requires at least one operation")
         if len(operations) > TRANSACTION_MAX_OPERATIONS:

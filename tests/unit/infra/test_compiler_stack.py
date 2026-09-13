@@ -23,12 +23,13 @@ from infra.cdk.stacks.compiler import (
     DENIED_MODEL_ACTIONS,
     DENIED_OBJECT_ACTIONS,
     DENIED_SIDE_EFFECT_ACTIONS,
+    SHAREABLE_READ_KEY_PREFIXES,
 )
 
 
 @pytest.fixture(scope="module")
 def app() -> App:
-    return build_app()
+    return build_app(offline=True)
 
 
 @pytest.fixture(scope="module")
@@ -76,10 +77,27 @@ def actions(item: dict[str, Any]) -> set[str]:
 # -- the compiler's grants ----------------------------------------------------------------
 
 
-def test_the_compiler_deploys_no_function_resource(compiler: Template) -> None:
-    """Phase 6 synthesizes the identity; Phase 11 deploys the thing that assumes it."""
+def test_the_compiler_deploys_exactly_one_function_under_its_own_role(
+    compiler: Template,
+) -> None:
+    """Phase 11 batch 5 adds the compiler Lambda beside the identity Phase 6 synthesized.
 
-    assert compiler.find_resources("AWS::Lambda::Function") == {}
+    One ``Function``, Python 3.12 / x86_64, running the already-implemented production handler,
+    and referencing the **pre-existing** compiler role rather than a CDK-generated default
+    (deployment contract SS 14, SS 42). It invokes no Lambda and creates no default log group.
+    """
+
+    functions = compiler.find_resources("AWS::Lambda::Function")
+    assert len(functions) == 1
+    props = next(iter(functions.values()))["Properties"]
+    assert props["Runtime"] == "python3.12"
+    assert props["Architectures"] == ["x86_64"]
+    assert props["Handler"] == "functions.compiler.handler.handler"
+    assert props["FunctionName"] == "chorus-compiler-development"
+    assert props["Role"]["Fn::GetAtt"][0].startswith("CompilerRole")
+    assert props["LoggingConfig"]["LogGroup"]["Ref"].startswith("CompilerLogGroup")
+    # exactly one role in the stack -- no second default execution role
+    assert len(compiler.find_resources("AWS::IAM::Role")) == 1
 
 
 def core_statements(template: Template) -> list[dict[str, Any]]:
@@ -340,6 +358,166 @@ def test_the_compiler_cannot_invoke_a_model(compiler: Template) -> None:
     assert not any(action.startswith("ses:") for action in granted)
 
 
+# -- I6: the compiler's Shareable read authority for send authorization ------------------
+
+
+def shareable_statements(template: Template) -> list[dict[str, Any]]:
+    """Every statement that names the Shareable table, allow or deny."""
+
+    return [
+        item for item in statements(template) if "ShareableTable" in json.dumps(item["Resource"])
+    ]
+
+
+def test_the_compiler_reads_the_safe_view_and_action_shareable_prefixes(
+    compiler: Template,
+) -> None:
+    """SS 8.2: ``CompilerSendAuthorization`` reloads the shareable side before the fence.
+
+    ``load_view``/``load_current_view_pointer``/``load_current_action_pointer``/
+    ``load_proposal``/``load_approval`` all read one of these four partitions, and every one is
+    ``AccessDenied`` without this grant -- which makes a send impossible in the deployed system.
+    """
+
+    read = statement(compiler, "ReadShareableViewAndActionPrefixes")
+
+    assert read["Effect"] == "Allow"
+    assert actions(read) == {"dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query"}
+    assert leading_keys(read) == [
+        "NS#*#VIEW#*",
+        "NS#*#VIEW_CURRENT#*",
+        "NS#*#ACTION#*",
+        "NS#*#ACTION_CURRENT#*",
+    ]
+    assert leading_keys(read) == list(SHAREABLE_READ_KEY_PREFIXES)
+    assert not actions(read) & WRITE_ACTIONS
+
+
+def test_the_compiler_shareable_read_excludes_execution_and_case_partitions(
+    compiler: Template,
+) -> None:
+    """``EXECUTION#`` is the sender's to load; Shareable ``CASE#`` is the watcher's.
+
+    Neither prefix is granted, and the literals cannot reach them by accident: ``NS#*#ACTION#*``
+    requires the ``#ACTION#`` delimiter, which ``NS#DEMO#EXECUTION#...`` does not contain.
+    """
+
+    for item in shareable_statements(compiler):
+        if item["Effect"] != "Allow":
+            continue
+        for prefix in leading_keys(item):
+            assert not prefix.startswith("NS#*#EXECUTION#")
+            assert not prefix.startswith("NS#*#CASE#")
+
+
+def test_no_shareable_write_grant_reaches_beyond_the_view_prefixes(compiler: Template) -> None:
+    """The read grant widens no write: the only Shareable write is still ``VIEW``/``VIEW_CURRENT``.
+
+    An exhaustive sweep rather than a spot check -- a future statement that granted a write on
+    ``ACTION#`` or ``EXECUTION#`` would have to pass this and could not.
+    """
+
+    for item in shareable_statements(compiler):
+        if item["Effect"] != "Allow":
+            continue
+        granted = actions(item) & WRITE_ACTIONS
+        if not granted:
+            continue
+        prefixes = leading_keys(item)
+        assert prefixes, f"{item['Sid']} grants {granted} on Shareable with no LeadingKeys"
+        assert all(
+            prefix.startswith(("NS#*#VIEW#", "NS#*#VIEW_CURRENT#")) for prefix in prefixes
+        ), f"{item['Sid']} grants {granted} outside the view prefixes: {prefixes}"
+
+
+def test_the_shareable_read_grant_adds_no_core_authority(compiler: Template) -> None:
+    """I6 touches the Shareable table only. Core reads/writes are exactly as before.
+
+    One Core read grant (``ReadPrivateCore``), one Core write grant (``WriteSendFenceOnly``),
+    two read-only condition checks -- and no statement the read repair added names Core.
+    """
+
+    read = statement(compiler, "ReadShareableViewAndActionPrefixes")
+    assert "CoreTable" not in json.dumps(read["Resource"])
+
+    core_allows = [item for item in core_statements(compiler) if item["Effect"] == "Allow"]
+    sids = {item["Sid"] for item in core_allows}
+    assert sids == {
+        "ReadPrivateCore",
+        "ConditionCheckCaseVersion",
+        "ConditionCheckSendFence",
+        "ConditionCheckDemoResetLock",
+        "WriteSendFenceOnly",
+    }
+
+
+# -- P1 (Phase 11 batch 4 repair): the compiler's clock read, and only a read --------------
+
+
+def test_the_compiler_may_strongly_read_the_demo_clock_item(compiler: Template) -> None:
+    """A compiled view's ``generated_at``/``expires_at`` and every freshness comparison the
+    send fence makes must be stamped against the same authoritative clock the rest of the
+    case timeline uses, or a caller comparing a view's expiry against logical time is
+    comparing two different clocks.
+    """
+
+    grant = statement(compiler, "ReadDemoClockItemOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions(grant) == {"dynamodb:GetItem"}
+    assert grant["Condition"]["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == [
+        "NS#DEMO#CLOCK"
+    ]
+
+
+def test_the_compiler_holds_no_write_of_any_form_on_the_clock(compiler: Template) -> None:
+    deny = statement(compiler, "DenyCompilerDemoClockWrites")
+    assert deny["Effect"] == "Deny"
+    assert {"dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"} <= actions(deny)
+    assert deny["Condition"]["ForAnyValue:StringLike"]["dynamodb:LeadingKeys"] == ["NS#DEMO#CLOCK"]
+
+    for item in shareable_statements(compiler):
+        if item["Effect"] != "Allow":
+            continue
+        prefixes = leading_keys(item)
+        if "NS#DEMO#CLOCK" in prefixes:
+            assert actions(item) == {"dynamodb:GetItem"}, (
+                f"{item['Sid']} grants {actions(item)} on the clock partition"
+            )
+
+
+def test_no_clock_grant_on_the_compiler_is_a_wildcard(compiler: Template) -> None:
+    """ADR-029 § 2: there is no ``NS#*#CLOCK*``, and a policy containing one fails review."""
+
+    for item in statements(compiler):
+        for block in ("ForAllValues:StringLike", "ForAnyValue:StringLike"):
+            keys = item.get("Condition", {}).get(block, {}).get("dynamodb:LeadingKeys", [])
+            for key in keys if isinstance(keys, list) else [keys]:
+                if "CLOCK" in key:
+                    assert key == "NS#DEMO#CLOCK"
+
+
+def test_the_shareable_read_grant_does_not_reintroduce_a_model_or_ses_path(
+    compiler: Template,
+) -> None:
+    """Preserved invariant: the compiler decides policy, it never asks a model and never sends.
+
+    Restated here beside the I6 change so a future edit to the read grant that also loosened
+    the deny is caught in the same file.
+    """
+
+    assert actions(statement(compiler, "DenyModelAccess")) == set(DENIED_MODEL_ACTIONS)
+    assert "bedrock-agentcore:InvokeAgentRuntime" in actions(statement(compiler, "DenyModelAccess"))
+    assert actions(statement(compiler, "DenySideEffects")) == set(DENIED_SIDE_EFFECT_ACTIONS)
+
+    granted = {
+        action
+        for item in statements(compiler)
+        if item["Effect"] == "Allow"
+        for action in actions(item)
+    }
+    assert not any(action.startswith(("bedrock", "ses:", "sesv2:")) for action in granted)
+
+
 # -- the buckets --------------------------------------------------------------------------
 
 
@@ -367,15 +545,33 @@ def test_each_evidence_bucket_blocks_public_access_and_disables_acls(
     assert encryption["ServerSideEncryptionByDefault"]["SSEAlgorithm"] == "aws:kms"
 
 
+def _evidence_buckets(data: Template) -> dict[str, Any]:
+    """The two evidence buckets, excluding the AgentCore artifact bucket.
+
+    The artifact bucket (deployment contract § 6) holds agent code rather than evidence: it is
+    SSE-S3 with no customer key, carries no expiry rule, and is deliberately outside every
+    property the evidence buckets are asserted for below.
+    """
+
+    return {
+        name: resource
+        for name, resource in data.find_resources("AWS::S3::Bucket").items()
+        if "evidence" in resource["Properties"]["BucketName"]
+    }
+
+
 def test_the_two_buckets_use_two_different_keys(data: Template) -> None:
     keys = set(data.find_resources("AWS::KMS::Key"))
     assert len(keys) == 2
+
+    evidence = _evidence_buckets(data)
+    assert len(evidence) == 2
 
     encryption = {
         name: resource["Properties"]["BucketEncryption"]["ServerSideEncryptionConfiguration"][0][
             "ServerSideEncryptionByDefault"
         ]["KMSMasterKeyID"]
-        for name, resource in data.find_resources("AWS::S3::Bucket").items()
+        for name, resource in evidence.items()
     }
     assert len({json.dumps(value, sort_keys=True) for value in encryption.values()}) == 2
 
@@ -383,21 +579,33 @@ def test_the_two_buckets_use_two_different_keys(data: Template) -> None:
 def test_every_bucket_policy_denies_insecure_transport_and_unencrypted_writes(
     data: Template,
 ) -> None:
+    evidence_logical_ids = set(_evidence_buckets(data))
+
     for policy in data.find_resources("AWS::S3::BucketPolicy").values():
-        sids = {item.get("Sid") for item in policy["Properties"]["PolicyDocument"]["Statement"]}
-        assert "DenyUnencryptedObjectUploads" in sids
-        assert "DenyWrongKmsKey" in sids
-        effects = {
-            item.get("Sid"): item["Effect"]
-            for item in policy["Properties"]["PolicyDocument"]["Statement"]
-        }
-        assert effects["DenyUnencryptedObjectUploads"] == "Deny"
+        statements = policy["Properties"]["PolicyDocument"]["Statement"]
+
+        # The TLS deny is universal -- it applies to the artifact bucket exactly as it does to
+        # the two evidence buckets, and no bucket in this system is exempt from it.
         transport = [
             item
-            for item in policy["Properties"]["PolicyDocument"]["Statement"]
+            for item in statements
             if item.get("Condition", {}).get("Bool", {}).get("aws:SecureTransport") == "false"
         ]
-        assert transport, "every evidence bucket denies non-TLS access"
+        assert transport, "every bucket denies non-TLS access"
+
+        # The two encryption denies are specific to the KMS-encrypted evidence buckets. They
+        # pin an exact customer key, so they are meaningless on the SSE-S3 artifact bucket,
+        # which has no key to pin (deployment contract §§ 6, 18).
+        bucket_ref = policy["Properties"]["Bucket"]
+        target = bucket_ref.get("Ref") if isinstance(bucket_ref, dict) else bucket_ref
+        if target not in evidence_logical_ids:
+            continue
+
+        sids = {item.get("Sid") for item in statements}
+        assert "DenyUnencryptedObjectUploads" in sids
+        assert "DenyWrongKmsKey" in sids
+        effects = {item.get("Sid"): item["Effect"] for item in statements}
+        assert effects["DenyUnencryptedObjectUploads"] == "Deny"
 
 
 def test_only_the_compiler_role_may_write_export_objects(data: Template) -> None:
@@ -430,11 +638,23 @@ def test_no_bucket_grants_public_read(data: Template) -> None:
 def test_each_bucket_has_a_lifecycle_backstop(data: Template) -> None:
     """The orphan story: an unreferenced derivative is swept, never compensated away."""
 
-    for resource in data.find_resources("AWS::S3::Bucket").values():
+    for resource in _evidence_buckets(data).values():
         rules = resource["Properties"]["LifecycleConfiguration"]["Rules"]
         assert rules
         assert all(rule["Status"] == "Enabled" for rule in rules)
         assert all(rule["ExpirationInDays"] > 0 for rule in rules)
+
+    # The artifact bucket is the deliberate exception and is asserted as such rather than
+    # merely skipped: expiring an artifact object would delete the bytes a deployed runtime
+    # version points at, which is what rollback repoints `live` to (deployment contract § 5).
+    artifact = [
+        resource
+        for resource in data.find_resources("AWS::S3::Bucket").values()
+        if "agent-artifacts" in resource["Properties"]["BucketName"]
+    ]
+    assert len(artifact) == 1
+    for rule in artifact[0]["Properties"]["LifecycleConfiguration"]["Rules"]:
+        assert "ExpirationInDays" not in rule, "an artifact object must never expire"
 
 
 # -- the agent runtimes, restated against the new buckets ---------------------------------

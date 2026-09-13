@@ -90,6 +90,33 @@ def test_the_artifact_creates_no_deployed_resource() -> None:
         assert not any(module.startswith("aws_cdk") for module in modules)
 
 
+POLICY_VERSION_CONSTANTS = frozenset({"POLICY_VERSION", "COMPILER_VERSION"})
+"""The only names the artifact may take from ``chorus.privacy.policy``.
+
+The send-authorization authority runs inside this function and compares an approval's recorded
+policy and compiler versions against the deployment's current ones, so it has to *name* those
+two values. They are identifiers of a build, not rules -- reading them evaluates nothing.
+
+Everything that decides is still refused: no threshold, no scope rule, no ``Necessity``, and no
+predicate. :func:`test_the_artifact_takes_only_version_constants_from_the_policy_module` is what
+enforces that, and it is strictly stronger than a module-level allow, because it reads the
+imported **names**.
+"""
+
+POLICY_MODULES = frozenset({"chorus.privacy.compiler", "chorus.privacy.policy"})
+
+
+def imported_names(path: Path, module: str) -> set[str]:
+    """Every name the file imports *from* one exact module."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == module and node.level == 0:
+            found.update(alias.name for alias in node.names)
+    return found
+
+
 def test_the_artifact_reaches_the_privacy_compiler_and_nothing_that_decides_for_it() -> None:
     """It must import the compiler -- that is its whole job -- and no second policy source."""
 
@@ -97,6 +124,17 @@ def test_the_artifact_reaches_the_privacy_compiler_and_nothing_that_decides_for_
 
     assert "chorus.privacy.compiler" in imported
     assert not any(
-        module.startswith("chorus.privacy.") and module != "chorus.privacy.compiler"
-        for module in imported
+        module.startswith("chorus.privacy.") and module not in POLICY_MODULES for module in imported
     ), "the composition root evaluates policy through the compiler alone"
+
+
+def test_the_artifact_takes_only_version_constants_from_the_policy_module() -> None:
+    """A rule, a threshold, or a predicate imported from ``policy`` is a second decider."""
+
+    taken: set[str] = set()
+    for path in source_files():
+        taken |= imported_names(path, "chorus.privacy.policy")
+
+    assert taken <= POLICY_VERSION_CONSTANTS, (
+        f"the artifact imports {taken - POLICY_VERSION_CONSTANTS}"
+    )

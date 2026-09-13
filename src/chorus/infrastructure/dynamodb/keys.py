@@ -427,3 +427,94 @@ def verification_request_sort_key(commitment_id: CommitmentId, generation: int) 
 
 COMMITMENT_SCHEDULE_SORT_KEY_PREFIX = "COMMITMENT_SCHEDULE#"
 VERIFICATION_REQUEST_SORT_KEY_PREFIX = "VERIFICATION_REQUEST#"
+
+
+def demo_clock_partition(namespace: Namespace) -> str:
+    """``NS#{namespace}#CLOCK`` -- the deployed logical clock's own Shareable partition.
+
+    A partition of its own rather than an item inside ``NS#{namespace}``, and that is a
+    permission fact rather than a filing choice
+    ([ADR-029](../../../../docs/adr/ADR-029-deployed-demo-clock-authority.md) SS 1).
+    ``dynamodb:LeadingKeys`` constrains the partition key and nothing constrains the sort key,
+    so a grant on the demo manifest partition would also be a grant on the reset lock and on
+    every future item filed beside it -- the identical defect ADR-019 found for the send fence.
+
+    Deployed, the only value this ever takes is the exact literal ``NS#DEMO#CLOCK``:
+    ``Settings.validate_environment_contract`` already refuses any namespace but ``DEMO`` in the
+    ``demo`` environment, and **no grant in this system authorizes an arbitrary namespace's
+    clock**. The builder still takes the namespace, because a key that hard-coded one would be
+    the only key in the grammar that could not be read back from its own partition.
+    """
+
+    return _join("NS", namespace.value, "CLOCK")
+
+
+DEMO_CLOCK_SORT_KEY = "DEMO_CLOCK"
+"""The single item in the clock partition. There is exactly one, forever."""
+
+
+def demo_control_partition(namespace: Namespace) -> str:
+    """``NS#{namespace}`` -- the partition the demo manifest, reset lock, and reset receipts
+    share with the community row
+    ([06-persistence-and-evidence.md](../../../../docs/architecture/06-persistence-and-evidence.md)
+    § Core table mapping). Deployed it is only ever the literal ``NS#DEMO``; the builder still
+    takes the namespace so the key reads back from its own partition like every other."""
+
+    return _join("NS", namespace.value)
+
+
+DEMO_MANIFEST_SORT_KEY_PREFIX = "DEMO_MANIFEST#"
+"""``DEMO_MANIFEST#{seed_version}`` -- one manifest per seed version; the bounded purge keeps
+every sort key beginning with this prefix (it rewrites the manifest, never erases it)."""
+
+DEMO_RESET_LOCK_SORT_KEY = "DEMO_RESET_LOCK"
+"""The one reset-exclusion item. Kept by the purge; owned by whichever reset holds it."""
+
+DEMO_RESET_RECEIPT_SORT_KEY_PREFIX = "DEMO_RESET_RECEIPT#"
+"""``DEMO_RESET_RECEIPT#{idempotency_key_hash}`` -- the durable idempotent-replay records; kept
+by the purge so a replayed reset still returns its recorded receipt."""
+
+DEMO_REGISTERED_PARTITION_SORT_KEY_PREFIX = "DEMO_REGISTERED_PARTITION#"
+"""``DEMO_REGISTERED_PARTITION#{digest}`` -- one create-only marker per dynamically created
+reset-owned partition (an ``OPERATION`` root, typically). Written **in the same DynamoDB
+transaction** as the partition's first row, so a crash can never leave the resource durable and
+the marker absent. The reset queries this prefix to enumerate the dynamic partitions its
+deterministic manifest roots and pointer chains do not already cover, then deletes the markers
+along with the partitions they name."""
+
+DEMO_RESET_CONTROL_SORT_PREFIXES: tuple[str, ...] = (
+    DEMO_MANIFEST_SORT_KEY_PREFIX,
+    DEMO_RESET_LOCK_SORT_KEY,
+    DEMO_RESET_RECEIPT_SORT_KEY_PREFIX,
+)
+"""Every sort-key prefix in ``NS#DEMO`` that the bounded purge must **not** delete -- the
+reset's own control plane. The community row (``COMMUNITY#…``) and the dynamic-partition markers
+(``DEMO_REGISTERED_PARTITION#…``) are deliberately absent: the community is a seed row the purge
+removes before the re-seed writes it back, and a marker names a partition the purge is about to
+empty, so it is cleared with it."""
+
+
+def demo_manifest_sort_key(seed_version: str) -> str:
+    """``DEMO_MANIFEST#{seed_version}``."""
+
+    return DEMO_MANIFEST_SORT_KEY_PREFIX + _segment(seed_version)
+
+
+def demo_reset_receipt_sort_key(idempotency_key_digest: str) -> str:
+    """``DEMO_RESET_RECEIPT#{idempotency_key_digest}`` -- the key is hashed by the caller so an
+    operator-chosen idempotency string never becomes a raw sort key."""
+
+    return DEMO_RESET_RECEIPT_SORT_KEY_PREFIX + _segment(idempotency_key_digest)
+
+
+def demo_registered_partition_sort_key(partition_key: str) -> str:
+    """``DEMO_REGISTERED_PARTITION#{sha256(partition_key)[:32]}`` -- a stable, delimiter-safe
+    marker id for a dynamically created reset-owned partition. The full partition key is stored
+    as an attribute on the marker item; the digest is only the address."""
+
+    from hashlib import sha256
+
+    return (
+        DEMO_REGISTERED_PARTITION_SORT_KEY_PREFIX
+        + sha256(partition_key.encode("utf-8")).hexdigest()[:32]
+    )

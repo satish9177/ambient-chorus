@@ -420,6 +420,7 @@ class SendHarness:
         return SendActionOperationWorker(
             operations=self.operations(),
             send_action=self.send_action(sender=sender),
+            shareable=self.action.compile.shareable,
             project=self.project(),
             reconcile=self.reconcile(),
         )

@@ -156,6 +156,13 @@ def extraction_input_hash(payload: CommitmentExtractionInput) -> Sha256Digest:
 
     The reply text is hashed rather than absorbed, so this value can be recomputed from the
     immutable evidence during recovery without the recovery path ever holding the text.
+
+    ``destination_display_label`` is absorbed whole rather than hashed, because it is safe
+    configuration rather than private text and reading it back makes a mismatch legible. It is
+    part of the digest because it is part of what the model was shown: an extraction produced
+    while the deployment named one correspondent is not proof for an extraction under another,
+    so a recovered run whose label has changed re-runs instead of replaying an answer that would
+    now fail check 4.
     """
 
     return hash_value(
@@ -163,6 +170,7 @@ def extraction_input_hash(payload: CommitmentExtractionInput) -> Sha256Digest:
             "schema": EXTRACTION_INPUT_SCHEMA,
             "case_id": str(payload.case_id),
             "source_evidence_id": str(payload.source_evidence_id),
+            "destination_display_label": payload.destination_display_label,
             "reply_text_sha256": hash_value(payload.reply_text).value,
         }
     )
@@ -208,6 +216,14 @@ class ExtractCommitment:
     apply: ApplyCommitment
     clock: Clock
     policy_version: str
+    destination_label: str
+    """The safe organization label of the deployment's destination.
+
+    The same value :class:`ApplyCommitment` validates against, taken from the same non-secret
+    configuration and passed to the model as input so check 4 is satisfiable at all. One field on
+    one composition, so the value the model is shown and the value it is judged against cannot
+    be two different things.
+    """
     schedule: CreateDueSchedule | None = None
     schedule_commitments: ShareableRepositoryPort | None = None
 
@@ -216,6 +232,7 @@ class ExtractCommitment:
         payload = CommitmentExtractionInput(
             case_id=job.case_id.value,
             source_evidence_id=job.evidence_id.value,
+            destination_display_label=self.destination_label,
             reply_text=self._text(artifact),
         )
         input_hash = extraction_input_hash(payload)

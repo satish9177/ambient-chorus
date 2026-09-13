@@ -16,6 +16,7 @@ takes no case edge in either table
 from __future__ import annotations
 
 import json
+import re
 from functools import cache
 from typing import Any
 
@@ -26,6 +27,7 @@ from infra.cdk.config import CdkBuildConfig
 from infra.cdk.stacks import ChorusDataStack, ChorusWatcherStack, WatcherBuckets, WatcherTables
 from infra.cdk.stacks.watcher import (
     CASE_KEY_PREFIX,
+    DEMO_CLOCK_PARTITION,
     DLQ_DEPTH_ALARM_THRESHOLD,
     FORBIDDEN_WRITE_PREFIXES,
 )
@@ -108,7 +110,15 @@ def test_core_is_denied_in_total() -> None:
     deny = statement("DenyAllCoreAccess")
 
     assert deny["Effect"] == "Deny"
-    assert actions_of(deny) == {"dynamodb:*"}
+    assert deny["NotAction"] == "dynamodb:ConditionCheckItem"
+    lock = statement("ConditionCheckDemoResetLock")
+    assert actions_of(lock) == {"dynamodb:ConditionCheckItem"}
+    assert lock["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["NS#DEMO"]}}
+    other = statement("DenyOtherCoreConditions")
+    assert other["Effect"] == "Deny"
+    assert other["Condition"] == {
+        "ForAnyValue:StringNotEquals": {"dynamodb:LeadingKeys": ["NS#DEMO"]}
+    }
 
 
 @pytest.mark.parametrize(
@@ -145,7 +155,9 @@ def test_the_role_holds_no_core_table_action_at_all() -> None:
         if not any(action.startswith("dynamodb:") for action in actions_of(item)):
             continue
         rendered = json.dumps(item["Resource"])
-        assert core_arn_fragment not in rendered.lower()
+        if core_arn_fragment in rendered.lower():
+            assert item["Sid"] == "ConditionCheckDemoResetLock"
+            assert actions_of(item) == {"dynamodb:ConditionCheckItem"}
 
 
 def test_the_schedule_group_and_encrypted_dead_letter_queue_exist() -> None:
@@ -171,10 +183,42 @@ def test_one_dropped_due_event_alarms() -> None:
     )
 
 
-def test_no_lambda_function_is_created() -> None:
-    """Phase 9 owns the identity and deploys nothing. The function is Phase 11's."""
+def test_the_watcher_function_version_and_live_alias_exist() -> None:
+    """Phase 11 batch 5: the watcher Lambda, a published Version, and an Alias named ``live``
+    (deployment contract SS 21-23, SS 46). Under the pre-existing watcher role and log group.
+    """
 
-    assert watcher_template().find_resources("AWS::Lambda::Function") == {}
+    built = watcher_template()
+    functions = built.find_resources("AWS::Lambda::Function")
+    assert len(functions) == 1
+    props = next(iter(functions.values()))["Properties"]
+    assert props["Runtime"] == "python3.12"
+    assert props["Architectures"] == ["x86_64"]
+    assert props["Handler"] == "functions.commitment_watcher.handler.handler"
+    assert props["FunctionName"] == "chorus-commitment-watcher-development"
+    assert props["Role"]["Fn::GetAtt"][0].startswith("WatcherRole")
+    assert props["LoggingConfig"]["LogGroup"]["Ref"].startswith("WatcherLogGroup")
+
+    built.resource_count_is("AWS::Lambda::Version", 1)
+    aliases = built.find_resources("AWS::Lambda::Alias")
+    assert len(aliases) == 1
+    alias = next(iter(aliases.values()))["Properties"]
+    assert alias["Name"] == "live"
+    version_logical = alias["FunctionVersion"]["Fn::GetAtt"][0]
+    function_logical = next(iter(functions))
+    assert alias["FunctionName"]["Ref"] == function_logical
+    version = built.find_resources("AWS::Lambda::Version")[version_logical]
+    assert version["Properties"]["FunctionName"]["Ref"] == function_logical
+
+
+def test_the_scheduler_invoke_and_the_alias_are_one_resource() -> None:
+    """SS 46: the scheduler role's ``lambda:InvokeFunction`` Resource is a ``Ref`` to the
+    actual ``Alias`` resource, not a re-typed lookalike ARN string."""
+
+    built = watcher_template()
+    alias_logical = next(iter(built.find_resources("AWS::Lambda::Alias")))
+    grant = _scheduler_statement("InvokeCommitmentWatcherLiveAliasOnly")
+    assert grant["Resource"] == {"Ref": alias_logical}
 
 
 # ------------------------------------------------------------------------------------------
@@ -184,7 +228,9 @@ def test_no_lambda_function_is_created() -> None:
 
 @cache
 def application_statements() -> list[dict[str, Any]]:
-    template = build_app().synth().get_stack_by_name("AmbientChorusApplication").template
+    template = (
+        build_app(offline=True).synth().get_stack_by_name("AmbientChorusApplication").template
+    )
     found: list[dict[str, Any]] = []
     for resource in template["Resources"].values():
         if resource["Type"] == POLICY_TYPE:
@@ -244,7 +290,7 @@ def test_the_application_may_write_the_outbound_message_locator_prefix() -> None
 def test_the_sender_is_denied_the_outbound_message_locator_prefix() -> None:
     """A sender that could write a locator could point a reply at an execution it chose."""
 
-    template = build_app().synth().get_stack_by_name("AmbientChorusSender").template
+    template = build_app(offline=True).synth().get_stack_by_name("AmbientChorusSender").template
     denies = [
         item
         for resource in template["Resources"].values()
@@ -256,3 +302,209 @@ def test_the_sender_is_denied_the_outbound_message_locator_prefix() -> None:
     assert len(denies) == 1
     prefixes = denies[0]["Condition"]["ForAnyValue:StringLike"]["dynamodb:LeadingKeys"]
     assert "NS#*#OUTBOUND_MESSAGE#*" in prefixes
+
+
+# =====================================================================================
+# I14 -- the EventBridge Scheduler execution role: exact minimum, and a scoped trust
+# =====================================================================================
+
+ROLE_TYPE = "AWS::IAM::Role"
+
+
+def _scheduler_role() -> dict[str, Any]:
+    roles = watcher_template().find_resources(ROLE_TYPE)
+    return next(
+        dict(role)
+        for role in roles.values()
+        if "chorus-scheduler" in str(role["Properties"].get("RoleName", ""))
+    )
+
+
+def _scheduler_role_statements() -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for logical_id, policy in watcher_template().find_resources(POLICY_TYPE).items():
+        if logical_id.startswith("SchedulerExecutionRole"):
+            found.extend(policy["Properties"]["PolicyDocument"]["Statement"])
+    return found
+
+
+def _scheduler_statement(sid: str) -> dict[str, Any]:
+    for item in _scheduler_role_statements():
+        if item.get("Sid") == sid:
+            return item
+    raise AssertionError(f"no scheduler-role statement with Sid {sid}")
+
+
+def test_the_scheduler_role_trust_is_scoped_to_account_and_the_schedule_group_arn() -> None:
+    """P1-1: the confused-deputy boundary is the exact **schedule-group** ARN -- not an
+    individual schedule ARN and never a wildcard schedule name."""
+
+    statement = _scheduler_role()["Properties"]["AssumeRolePolicyDocument"]["Statement"][0]
+
+    assert statement["Principal"] == {"Service": "scheduler.amazonaws.com"}
+    assert statement["Action"] == "sts:AssumeRole"
+
+    account = statement["Condition"]["StringEquals"]["aws:SourceAccount"]
+    assert account == {"Ref": "AWS::AccountId"} or "AWS::AccountId" in json.dumps(account)
+
+    source_arn = json.dumps(statement["Condition"]["ArnEquals"]["aws:SourceArn"])
+    assert "schedule-group/chorus-development" in source_arn
+    assert "schedule/chorus-development/" not in source_arn  # no individual-schedule prefix
+    assert "*" not in source_arn
+
+
+def test_the_scheduler_role_invokes_the_watcher_live_alias_only() -> None:
+    """P2-1 / SS 46: the invoke resource is a ``Ref`` to the actual ``AWS::Lambda::Alias``
+    named ``live``, so rollback repoints that alias with no schedule or IAM edit. Never the
+    unqualified function, ``$LATEST``, or a bare version -- and never a re-typed lookalike ARN.
+    """
+
+    built = watcher_template()
+    alias_logical, alias = next(iter(built.find_resources("AWS::Lambda::Alias").items()))
+    assert alias["Properties"]["Name"] == "live"
+
+    grant = _scheduler_statement("InvokeCommitmentWatcherLiveAliasOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"lambda:InvokeFunction"}
+    assert grant["Resource"] == {"Ref": alias_logical}
+
+
+def test_the_scheduler_role_grants_no_unqualified_or_versioned_watcher_invoke() -> None:
+    built = watcher_template()
+    alias_logical = next(iter(built.find_resources("AWS::Lambda::Alias")))
+    for item in _scheduler_role_statements():
+        if item["Effect"] != "Allow" or "lambda:InvokeFunction" not in actions_of(item):
+            continue
+        # the alias resource, and only the alias resource -- never a joined function ARN, a
+        # numeric version, or ``$LATEST``
+        assert item["Resource"] == {"Ref": alias_logical}
+        resource = json.dumps(item["Resource"])
+        assert "$LATEST" not in resource
+        assert not re.search(r"-watcher-development:\d", resource)
+
+
+def test_the_scheduler_role_sends_to_the_dead_letter_queue_only() -> None:
+    grant = _scheduler_statement("SendDroppedDueEventToDeadLetterQueueOnly")
+
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"sqs:SendMessage"}
+    assert grant["Resource"] != "*"
+    assert "WatcherDeadLetterQueue" in str(grant["Resource"])
+
+
+def test_the_scheduler_role_uses_exactly_the_dlq_key_operations() -> None:
+    grant = _scheduler_statement("UseDeadLetterQueueKeyForEncryptedSendOnly")
+
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"kms:GenerateDataKey", "kms:Decrypt"}
+    assert grant["Resource"] != "*"
+    assert "WatcherDeadLetterKey" in str(grant["Resource"])
+
+
+def test_the_scheduler_role_has_no_other_service_capability() -> None:
+    """ALLOW is exactly {lambda:InvokeFunction, sqs:SendMessage, kms:GenerateDataKey,
+    kms:Decrypt} -- no DynamoDB, Bedrock, SES, AgentCore, Secrets Manager, broad Lambda
+    invoke, general SQS, or general KMS."""
+
+    allowed: set[str] = set()
+    for item in _scheduler_role_statements():
+        if item["Effect"] == "Allow":
+            allowed |= actions_of(item)
+    assert allowed == {
+        "lambda:InvokeFunction",
+        "sqs:SendMessage",
+        "kms:GenerateDataKey",
+        "kms:Decrypt",
+    }
+    for forbidden in ("dynamodb:", "bedrock", "ses", "sesv2", "secretsmanager:", "scheduler:"):
+        assert not any(action.startswith(forbidden) for action in allowed)
+    assert "kms:*" not in allowed and "sqs:*" not in allowed and "lambda:*" not in allowed
+
+
+def test_the_scheduler_role_was_trust_only_before_and_now_carries_one_policy() -> None:
+    assert len(_scheduler_role_statements()) == 3
+
+
+# -- the worker side of I14: application worker Scheduler + PassRole -------------------
+
+
+def test_the_worker_pass_role_condition_binds_the_scheduler_service() -> None:
+    passrole = application_statement("PassSchedulerExecutionRoleOnly")
+
+    assert actions_of(passrole) == {"iam:PassRole"}
+    assert "chorus-scheduler-development" in json.dumps(passrole["Resource"])
+    assert passrole["Condition"]["StringEquals"]["iam:PassedToService"] == "scheduler.amazonaws.com"
+
+
+def test_the_api_role_holds_no_scheduler_authority_and_no_pass_role() -> None:
+    template = (
+        build_app(offline=True).synth().get_stack_by_name("AmbientChorusApplication").template
+    )
+    api_allows: set[str] = set()
+    for logical_id, resource in template["Resources"].items():
+        if resource["Type"] != POLICY_TYPE or not logical_id.startswith("ApiRole"):
+            continue
+        for item in resource["Properties"]["PolicyDocument"]["Statement"]:
+            if item["Effect"] != "Allow":
+                continue
+            action = item["Action"]
+            api_allows |= {action} if isinstance(action, str) else set(action)
+
+    assert not any(a.startswith("scheduler:") for a in api_allows)
+    assert "iam:PassRole" not in api_allows
+
+
+# -- ADR-029: the watcher reads one clock and can never move it ------------------------
+
+
+def test_the_watcher_may_strongly_read_the_demo_clock_item() -> None:
+    """Without this the deployed watcher cannot perform step 4 of its own frozen order.
+
+    Its Core deny is total, so the demo manifest is unreachable; and a process-local clock in a
+    separate Lambda is a *different* clock from the one the API advanced. One read grant, on one
+    exact literal partition, is what makes "exactly one clock" true across processes.
+    """
+
+    grant = statement("ReadDemoClockItemOnly")
+    assert grant["Effect"] == "Allow"
+    assert actions_of(grant) == {"dynamodb:GetItem"}
+    assert grant["Condition"]["ForAllValues:StringLike"]["dynamodb:LeadingKeys"] == [
+        DEMO_CLOCK_PARTITION
+    ]
+
+
+def test_the_watcher_holds_no_write_of_any_form_on_the_clock() -> None:
+    """ADR-029 § 2: no ``PutItem``, ``UpdateItem``, ``DeleteItem``, or ``ConditionCheckItem``.
+
+    A watcher that could move logical time could make its own early-firing check pass, so the
+    absence is backed by the explicit deny rather than left to the grant's narrowness.
+    """
+
+    deny = statement("DenyNonCasePartitionWrites")
+    assert deny["Effect"] == "Deny"
+    assert (
+        DEMO_CLOCK_PARTITION in deny["Condition"]["ForAnyValue:StringLike"]["dynamodb:LeadingKeys"]
+    )
+
+    for item in statements():
+        if item["Effect"] != "Allow":
+            continue
+        condition = item.get("Condition", {}).get("ForAllValues:StringLike", {})
+        keys = condition.get("dynamodb:LeadingKeys", [])
+        if DEMO_CLOCK_PARTITION in keys:
+            assert actions_of(item) == {"dynamodb:GetItem"}
+
+
+def test_no_clock_grant_anywhere_is_a_wildcard() -> None:
+    """ADR-029 § 2: there is no ``NS#*#CLOCK*``, and a policy containing one fails review."""
+
+    for item in statements():
+        for block in ("ForAllValues:StringLike", "ForAnyValue:StringLike"):
+            keys = item.get("Condition", {}).get(block, {}).get("dynamodb:LeadingKeys", [])
+            for key in keys if isinstance(keys, list) else [keys]:
+                if "CLOCK" in key:
+                    assert key == DEMO_CLOCK_PARTITION
+
+
+def test_the_clock_partition_is_the_exact_deployed_literal() -> None:
+    assert DEMO_CLOCK_PARTITION == "NS#DEMO#CLOCK"

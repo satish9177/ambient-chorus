@@ -180,14 +180,23 @@ class IngestExternalReply:
         # Written before the transaction, conferring no authority until one commits. An object
         # already at the content address is this same delivery's bytes, so the conflict is the
         # success case rather than an error.
-        with suppress(PersistenceConflictError):
-            await self.objects.put_inbound_reply(
-                namespace=evidence.namespace,
-                community_id=evidence.community_id,
-                case_id=evidence.case_id,
-                raw_sha256=evidence.raw_sha256,
-                content=command.attested.raw_mime,
-            )
+        from chorus.application.services.demo_side_effect import demo_side_effect
+
+        async with demo_side_effect(
+            key=key,
+            repository=self.idempotency,
+            unit_of_work=self.unit_of_work,
+            clock=self.clock,
+            ids=self.ids,
+        ):
+            with suppress(PersistenceConflictError):
+                await self.objects.put_inbound_reply(
+                    namespace=evidence.namespace,
+                    community_id=evidence.community_id,
+                    case_id=evidence.case_id,
+                    raw_sha256=evidence.raw_sha256,
+                    content=command.attested.raw_mime,
+                )
 
         now = self.clock.now()
         case = await self.core.load_case(scope)

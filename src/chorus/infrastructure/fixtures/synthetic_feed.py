@@ -41,6 +41,9 @@ def default_fixture_root(seed_version: str = DEFAULT_SEED_VERSION) -> Path:
     deployed composition root passes an explicit path instead of relying on this.
     """
 
+    packaged_root = Path(__file__).resolve().parent / "data" / seed_version.replace("/", "-")
+    if packaged_root.is_dir():
+        return packaged_root
     repository_root = Path(__file__).resolve().parents[4]
     return repository_root / "demo" / "fixtures" / seed_version.replace("/", "-")
 

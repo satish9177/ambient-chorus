@@ -52,6 +52,24 @@ from chorus.settings import Settings
 INVOCATION = UUID("6f39d0e2-6b57-4a86-9d0b-0a5f39c2b111")
 
 
+@pytest.fixture(autouse=True)
+def _offline_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin dummy credentials so client construction never consults a real provider.
+
+    ``effective_retry_configuration`` builds a real ``BedrockModel`` and therefore a real
+    boto3 client, and on a developer machine that client's credential resolver can reach a
+    configured login provider. These tests must describe the runner, not the machine running
+    them, so the environment is fixed here rather than assumed -- the same pattern already used
+    by ``tests/unit/infra/test_s3_adapter.py``.
+    """
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "local")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "local")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+
+
 def test_the_prompt_version_is_pinned() -> None:
     assert MONITOR_PROMPT_VERSION == "monitor/v3"
 

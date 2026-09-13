@@ -1,0 +1,36 @@
+{
+  "_provenance": "NOT_CAPTURED_FROM_LIVE_SES_AWS_DOCUMENTATION_SYNTHETIC",
+  "notificationType": "Received",
+  "mail": {
+    "timestamp": "2030-01-14T10:00:00.000Z",
+    "source": "property-manager@chorus.invalid",
+    "messageId": "ses-msg-0004-synthetic-wrong-recipient",
+    "destination": ["other-mailbox@chorus.invalid"],
+    "headersTruncated": false,
+    "headers": [
+      {"name": "Message-ID", "value": "<reply-0004@manager.invalid>"},
+      {"name": "In-Reply-To", "value": "<ses-outbound-msg-0001@us-east-1.amazonses.com>"},
+      {"name": "References", "value": "<ses-outbound-msg-0001@us-east-1.amazonses.com>"},
+      {"name": "From", "value": "Property Manager <property-manager@chorus.invalid>"}
+    ],
+    "commonHeaders": {
+      "messageId": "<reply-0004@manager.invalid>",
+      "inReplyTo": "<ses-outbound-msg-0001@us-east-1.amazonses.com>",
+      "references": ["<ses-outbound-msg-0001@us-east-1.amazonses.com>"],
+      "from": ["Property Manager <property-manager@chorus.invalid>"]
+    }
+  },
+  "receipt": {
+    "recipients": ["other-mailbox@chorus.invalid"],
+    "spfVerdict": {"status": "PASS"},
+    "dkimVerdict": {"status": "PASS"},
+    "dmarcVerdict": {"status": "PASS"},
+    "spamVerdict": {"status": "PASS"},
+    "virusVerdict": {"status": "PASS"},
+    "action": {
+      "type": "S3",
+      "bucketName": "chorus-private-evidence-demo",
+      "objectKey": "ns/DEMO/inbound/ses-msg-0004-synthetic-wrong-recipient"
+    }
+  }
+}

@@ -2,8 +2,23 @@
 
 ``tools`` is omitted rather than set to an empty list because the omission is the contract:
 there is nothing to register, nothing to load from a directory, and no dynamic tool discovery.
-The agent's only capability is to answer, and the only shape it may answer in is
-:class:`InvestigationAssessmentDraft`.
+The agent's only capability is to answer, and the only shapes it may answer in are
+:class:`InvestigationAssessmentDraft` and
+:class:`~chorus.contracts.commitment.CommitmentExtractionOutput`.
+
+Two operations, one runner
+--------------------------
+The Investigator runtime serves both ``INVESTIGATE`` and ``EXTRACT_COMMITMENT`` (Phase 11
+deployment contract § 11). They share this runner because they share everything a runner
+decides: the same deployed runtime, the same execution role, the same application inference
+profile, the same single-attempt retry policy, and the same timeout rungs. What differs is the
+reviewed prompt and the output schema, and each is passed in per call rather than held.
+
+Two prompts in one runtime is not two agents. It is also not one agent with a memory: the
+methods below build a *fresh* Strands ``Agent`` for every invocation, so an extraction cannot
+inherit a case an investigation was reading and an investigation cannot inherit a stranger's
+email. That property is the reason the construction is inside ``_answer`` rather than in
+``__post_init__`` or a cached attribute.
 
 Session state is never reused. Each invocation constructs its own agent, so nothing survives
 between two communities' cases inside this process -- which matters more here than for the
@@ -35,9 +50,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final
 
+from chorus.contracts.commitment import (
+    CommitmentExtractionInput,
+    CommitmentExtractionOutput,
+)
+from chorus.contracts.common import StrictModel
 from chorus.contracts.investigation import (
     InvestigationAssessmentDraft,
     InvestigationInput,
+)
+from runtimes.investigator.commitment_prompt import (
+    COMMITMENT_EXTRACTION_SYSTEM_PROMPT,
+    render_commitment_user_message,
 )
 from runtimes.investigator.prompt import (
     INVESTIGATOR_SYSTEM_PROMPT,
@@ -101,16 +125,38 @@ class InvestigatorAgentRunner:
             ),
         )
 
-    def build_agent(self) -> Any:
-        """Construct the agent for exactly one invocation."""
+    def build_agent(self, system_prompt: str = INVESTIGATOR_SYSTEM_PROMPT) -> Any:
+        """Construct the agent for exactly one invocation, under one reviewed prompt.
+
+        The prompt is an argument because this runtime serves two operations and each ships its
+        own reviewed text. It is not a *caller-supplied* prompt: both values are constants
+        inside this artifact, selected by the declared operation and never by the payload.
+        """
 
         from strands import Agent, ModelRetryStrategy
 
         return Agent(
             model=self.build_model(),
-            system_prompt=INVESTIGATOR_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             retry_strategy=ModelRetryStrategy(max_attempts=INVESTIGATOR_MAX_MODEL_ATTEMPTS),
         )
+
+    async def _answer[OutputT: StrictModel](
+        self, schema: type[OutputT], *, system_prompt: str, user_message: str
+    ) -> OutputT:
+        """One bounded model pass: a fresh agent, one reviewed prompt, one strict schema.
+
+        The agent is constructed here and discarded when this returns, so no conversational
+        state, message history, or session context can reach a second invocation. That is the
+        structural half of cross-invocation isolation; the other half is that this runtime holds
+        no module-level runner, so even the client that talks to Bedrock is built per request.
+        """
+
+        agent = self.build_agent(system_prompt)
+        result = await agent.structured_output_async(schema, user_message)
+        if not isinstance(result, schema):  # pragma: no cover - SDK guard
+            raise TypeError("the Investigator runtime returned an unexpected structured output")
+        return result
 
     async def run(self, payload: InvestigationInput, *, fence: str) -> InvestigationAssessmentDraft:
         """Return the structured answer for one bounded case payload.
@@ -121,14 +167,29 @@ class InvestigatorAgentRunner:
         here because the runner must not be the thing that decides what an invocation is called.
         """
 
-        agent = self.build_agent()
-        result = await agent.structured_output_async(
+        return await self._answer(
             InvestigationAssessmentDraft,
-            render_investigation_user_message(payload, fence=fence),
+            system_prompt=INVESTIGATOR_SYSTEM_PROMPT,
+            user_message=render_investigation_user_message(payload, fence=fence),
         )
-        if not isinstance(result, InvestigationAssessmentDraft):  # pragma: no cover - SDK guard
-            raise TypeError("the Investigator runtime returned an unexpected structured output")
-        return result
+
+    async def extract(
+        self, payload: CommitmentExtractionInput, *, fence: str
+    ) -> CommitmentExtractionOutput:
+        """Return the structured commitment candidates for one inbound reply.
+
+        The same runner, the same profile, and a different reviewed prompt -- and no shared
+        state with :meth:`run` beyond the immutable configuration this dataclass holds. The
+        model's answer is a set of offsets into the reply it was shown; every consequential
+        value is derived from those offsets by deterministic application code, which is why
+        this method returns the draft rather than anything resembling a decision.
+        """
+
+        return await self._answer(
+            CommitmentExtractionOutput,
+            system_prompt=COMMITMENT_EXTRACTION_SYSTEM_PROMPT,
+            user_message=render_commitment_user_message(payload, fence=fence),
+        )
 
 
 def effective_retry_configuration(runner: InvestigatorAgentRunner) -> dict[str, object]:

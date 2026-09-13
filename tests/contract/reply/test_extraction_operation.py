@@ -123,7 +123,13 @@ async def test_a_bound_job_runs_once_and_succeeds(reply_harness: ReplyHarness) -
 async def test_the_model_is_given_the_reply_text_and_no_case_data(
     reply_harness: ReplyHarness,
 ) -> None:
-    """Not the case, not other evidence, not facts, not mandates, not contributor data."""
+    """Not the case, not other evidence, not facts, not mandates, not contributor data.
+
+    ``destination_display_label`` is the one value beyond the reply, and it is configuration
+    rather than case data: the safe organization label the deployment already publishes as a
+    non-secret environment variable, present because check 4 compares the model's ``obligor``
+    with it (ADR-027 § 1 amendment). It names no mailbox and carries no address.
+    """
 
     await reply_harness.prepare_sent()
     job, operations = await _started_job(reply_harness)
@@ -137,8 +143,10 @@ async def test_the_model_is_given_the_reply_text_and_no_case_data(
         "schema_version",
         "case_id",
         "source_evidence_id",
+        "destination_display_label",
         "reply_text",
     }
+    assert payload.destination_display_label == reply_harness.destination_label
     # No case on the envelope either: an extraction is bound to one immutable artifact rather
     # than to a version of a case.
     assert extractor.invocations[0].case_id is None
@@ -178,11 +186,13 @@ async def test_the_invocation_record_is_proof_only_for_the_exact_input(
     payload = CommitmentExtractionInput(
         case_id=job.case_id.value,
         source_evidence_id=job.evidence_id.value,
+        destination_display_label=reply_harness.destination_label,
         reply_text=text.reveal(),
     )
     other = CommitmentExtractionInput(
         case_id=job.case_id.value,
         source_evidence_id=job.evidence_id.value,
+        destination_display_label=reply_harness.destination_label,
         reply_text=text.reveal() + " and something else",
     )
 

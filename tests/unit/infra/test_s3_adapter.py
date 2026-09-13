@@ -26,7 +26,11 @@ from chorus.ports.errors import (
     NotFoundError,
     PersistenceConflictError,
 )
-from chorus.ports.objects import export_evidence_key, private_evidence_key
+from chorus.ports.objects import (
+    export_evidence_key,
+    inbound_reply_key,
+    private_evidence_key,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -53,8 +57,12 @@ CASE = CaseId(UUID(int=2))
 EVIDENCE = EvidenceItemId(UUID(int=3))
 PRIVATE_BUCKET = "chorus-private-evidence-test"
 EXPORT_BUCKET = "chorus-export-evidence-test"
+PRIVATE_KEY_ARN = "arn:aws:kms:us-east-1:111111111111:key/11111111-1111-1111-1111-111111111111"
+EXPORT_KEY_ARN = "arn:aws:kms:us-east-1:111111111111:key/22222222-2222-2222-2222-222222222222"
 CONTENT = b"\x89PNG\r\n\x1a\n-safe-derivative"
 DIGEST = Sha256Digest(f"sha256:{sha256(CONTENT).hexdigest()}")
+REPLY_MIME = b"From: a@b.test\r\nSubject: re\r\n\r\nbody\r\n"
+REPLY_DIGEST = Sha256Digest(f"sha256:{sha256(REPLY_MIME).hexdigest()}")
 
 
 @pytest.fixture
@@ -62,7 +70,11 @@ def store() -> tuple[S3ObjectStore, Stubber]:
     client = create_s3_client(region_name="us-east-1")
     stubber = Stubber(client)
     adapter = S3ObjectStore(
-        client=client, private_bucket=PRIVATE_BUCKET, export_bucket=EXPORT_BUCKET
+        client=client,
+        private_bucket=PRIVATE_BUCKET,
+        export_bucket=EXPORT_BUCKET,
+        private_kms_key_id=PRIVATE_KEY_ARN,
+        export_kms_key_id=EXPORT_KEY_ARN,
     )
     return adapter, stubber
 
@@ -203,6 +215,7 @@ async def test_an_export_write_is_a_conditional_create_with_encryption_and_its_d
             "Body": CONTENT,
             "ContentType": "image/png",
             "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": EXPORT_KEY_ARN,
             "ChecksumAlgorithm": "SHA256",
             "Metadata": {DIGEST_METADATA_KEY: DIGEST.value},
             "IfNoneMatch": "*",
@@ -220,6 +233,126 @@ async def test_an_export_write_is_a_conditional_create_with_encryption_and_its_d
         )
 
     stubber.assert_no_pending_responses()
+
+
+# -- I7: every application-controlled write names its bucket's exact KMS key -------------
+
+
+async def test_the_export_writer_sends_the_export_key_and_never_the_private_one(
+    store: tuple[S3ObjectStore, Stubber],
+) -> None:
+    """SS 9: the bucket policy denies a write whose KMS key id is absent or wrong.
+
+    The stub asserts the exact request parameters, so ``SSEKMSKeyId`` being the *export* key ARN
+    -- not the private one, not omitted -- is pinned as a wire fact.
+    """
+
+    adapter, stubber = store
+    stubber.add_response(
+        "put_object",
+        {},
+        {
+            "Bucket": EXPORT_BUCKET,
+            "Key": _export_key(),
+            "Body": CONTENT,
+            "ContentType": "image/png",
+            "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": EXPORT_KEY_ARN,
+            "ChecksumAlgorithm": "SHA256",
+            "Metadata": {DIGEST_METADATA_KEY: DIGEST.value},
+            "IfNoneMatch": "*",
+        },
+    )
+
+    with stubber:
+        await adapter.put_export_evidence(
+            namespace=NAMESPACE,
+            community_id=COMMUNITY,
+            case_id=CASE,
+            derivative_sha256=DIGEST,
+            content=CONTENT,
+            media_type="image/png",
+        )
+
+    stubber.assert_no_pending_responses()
+
+
+async def test_the_private_writer_sends_the_private_key_and_never_the_export_one(
+    store: tuple[S3ObjectStore, Stubber],
+) -> None:
+    """The raw inbound MIME lands in the private bucket under the private evidence key.
+
+    Same conditional-create semantics as the export derivative -- ``IfNoneMatch: *`` and a
+    SHA-256 checksum -- with the private key ARN and nothing else supplied for encryption.
+    """
+
+    adapter, stubber = store
+    reply_key = inbound_reply_key(
+        namespace=NAMESPACE, community_id=COMMUNITY, case_id=CASE, raw_sha256=REPLY_DIGEST
+    )
+    stubber.add_response(
+        "put_object",
+        {},
+        {
+            "Bucket": PRIVATE_BUCKET,
+            "Key": reply_key,
+            "Body": REPLY_MIME,
+            "ContentType": "message/rfc822",
+            "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": PRIVATE_KEY_ARN,
+            "ChecksumAlgorithm": "SHA256",
+            "Metadata": {DIGEST_METADATA_KEY: REPLY_DIGEST.value},
+            "IfNoneMatch": "*",
+        },
+    )
+
+    with stubber:
+        await adapter.put_inbound_reply(
+            namespace=NAMESPACE,
+            community_id=COMMUNITY,
+            case_id=CASE,
+            raw_sha256=REPLY_DIGEST,
+            content=REPLY_MIME,
+        )
+
+    stubber.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("missing", ["private", "export"])
+def test_the_store_refuses_to_construct_without_a_production_key(missing: str) -> None:
+    """A missing required key fails closed at construction, not silently at write time.
+
+    The in-memory adapter is what a run without AWS uses; this one is never built with a blank
+    key so it can fall back to the bucket default the policy rejects.
+    """
+
+    client = create_s3_client(region_name="us-east-1")
+    kwargs = {
+        "client": client,
+        "private_bucket": PRIVATE_BUCKET,
+        "export_bucket": EXPORT_BUCKET,
+        "private_kms_key_id": PRIVATE_KEY_ARN,
+        "export_kms_key_id": EXPORT_KEY_ARN,
+    }
+    kwargs[f"{missing}_kms_key_id"] = ""
+
+    with pytest.raises(ValueError, match="KMS key ARN"):
+        S3ObjectStore(**kwargs)  # type: ignore[arg-type]
+
+
+def test_the_store_refuses_one_key_for_both_buckets() -> None:
+    """Two keys are what make the private and export buckets two boundaries, not one."""
+
+    client = create_s3_client(region_name="us-east-1")
+
+    with pytest.raises(ValueError, match="must not be the same"):
+        S3ObjectStore(
+            client=client,
+            private_bucket=PRIVATE_BUCKET,
+            export_bucket=EXPORT_BUCKET,
+            private_kms_key_id=PRIVATE_KEY_ARN,
+            export_kms_key_id=PRIVATE_KEY_ARN,
+        )
 
 
 async def test_a_write_whose_content_disagrees_with_its_address_is_refused_locally(

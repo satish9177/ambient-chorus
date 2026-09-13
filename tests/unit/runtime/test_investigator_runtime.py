@@ -17,6 +17,7 @@ import pytest
 from runtimes.investigator import agent as runtime_agent
 from runtimes.investigator import entrypoint, prompt
 
+from chorus.contracts.agentcore import InvestigateRequest, InvestigatorOperation
 from chorus.contracts.common import (
     AGENT_INPUT_SCHEMA_VERSION,
     INVESTIGATOR_PROMPT_VERSION,
@@ -98,6 +99,19 @@ def payload(
                 extracted_text=extracted,
             ),
         ),
+    )
+
+
+def request(**kwargs: object) -> InvestigateRequest:
+    """The wire request: one declared operation around one invocation envelope.
+
+    The runtime serves two operations, so the operation is stated by the caller rather than
+    inferred from the payload. Every entry-point test goes through this, because the bytes the
+    deployed runtime receives are these bytes.
+    """
+
+    return InvestigateRequest(
+        operation=InvestigatorOperation.INVESTIGATE, invocation=invocation(**kwargs)
     )
 
 
@@ -232,14 +246,14 @@ def test_the_timeout_hierarchy_is_strictly_ordered() -> None:
 
 
 def test_the_runtime_accepts_a_well_formed_invocation() -> None:
-    raw = invocation().model_dump_json().encode("utf-8")
+    raw = request().model_dump_json().encode("utf-8")
     parsed = entrypoint.parse_invocation(raw)
     assert parsed.agent_name is AgentName.INVESTIGATOR
 
 
 def test_the_runtime_refuses_an_invocation_addressed_to_another_agent() -> None:
-    body = json.loads(invocation().model_dump_json())
-    body["agent_name"] = AgentName.MONITOR.value
+    body = json.loads(request().model_dump_json())
+    body["invocation"]["agent_name"] = AgentName.MONITOR.value
     with pytest.raises(entrypoint.RuntimeContractError):
         entrypoint.parse_invocation(json.dumps(body).encode("utf-8"))
 
@@ -247,16 +261,16 @@ def test_the_runtime_refuses_an_invocation_addressed_to_another_agent() -> None:
 def test_the_runtime_refuses_an_invocation_that_names_no_case() -> None:
     """An assessment of no case could never be applied to anything."""
 
-    body = json.loads(invocation().model_dump_json())
-    body["case_id"] = None
-    body["case_version"] = None
+    body = json.loads(request().model_dump_json())
+    body["invocation"]["case_id"] = None
+    body["invocation"]["case_version"] = None
     with pytest.raises(entrypoint.RuntimeContractError):
         entrypoint.parse_invocation(json.dumps(body).encode("utf-8"))
 
 
 def test_the_request_cannot_name_a_prompt_version_at_all() -> None:
-    body = json.loads(invocation().model_dump_json())
-    body["prompt_version"] = "investigator/v9"
+    body = json.loads(request().model_dump_json())
+    body["invocation"]["prompt_version"] = "investigator/v9"
     with pytest.raises(entrypoint.RuntimeContractError):
         entrypoint.parse_invocation(json.dumps(body).encode("utf-8"))
 
@@ -313,7 +327,7 @@ async def test_a_runner_that_outlives_the_budget_is_cancelled_and_reported() -> 
     """A budget that only appears in a docstring bounds nothing."""
 
     runner = _StallingRunner()
-    raw = invocation().model_dump_json().encode("utf-8")
+    raw = request().model_dump_json().encode("utf-8")
 
     with pytest.raises(entrypoint.RuntimeBudgetExceededError):
         await entrypoint.handle(raw, runner=runner, budget_seconds=0.05)
@@ -324,7 +338,7 @@ async def test_a_runner_that_outlives_the_budget_is_cancelled_and_reported() -> 
 @pytest.mark.anyio
 async def test_a_runner_that_finishes_inside_the_budget_is_left_alone() -> None:
     runner = _AnsweringRunner()
-    raw = invocation().model_dump_json().encode("utf-8")
+    raw = request().model_dump_json().encode("utf-8")
 
     answered = await entrypoint.handle(raw, runner=runner, budget_seconds=5)
 
@@ -337,7 +351,7 @@ async def test_a_runner_that_finishes_inside_the_budget_is_left_alone() -> None:
 @pytest.mark.anyio
 async def test_the_result_names_its_inference_profile_by_digest_only() -> None:
     runner = _AnsweringRunner()
-    raw = invocation().model_dump_json().encode("utf-8")
+    raw = request().model_dump_json().encode("utf-8")
 
     answered = await entrypoint.handle(raw, runner=runner, budget_seconds=5)
 
@@ -351,8 +365,8 @@ async def test_the_entry_point_and_not_the_runner_chooses_the_fence() -> None:
     """The fence must come from the server-generated identity the envelope carries."""
 
     runner = _AnsweringRunner()
-    request = invocation()
-    await entrypoint.handle(
-        request.model_dump_json().encode("utf-8"), runner=runner, budget_seconds=5
+    sent = request()
+    await entrypoint.handle(sent.model_dump_json().encode("utf-8"), runner=runner, budget_seconds=5)
+    assert runner.fence == prompt.derive_fence(
+        sent.invocation.payload, sent.invocation.invocation_id
     )
-    assert runner.fence == prompt.derive_fence(request.payload, request.invocation_id)

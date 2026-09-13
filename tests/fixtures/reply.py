@@ -123,9 +123,7 @@ class ReplyHarness:
                 source_arn=INBOUND_SOURCE_ARN,
             )
         if self.extractor is None:
-            self.extractor = LiteralSpanCommitmentExtractor(
-                destination_label=self.destination_label
-            )
+            self.extractor = LiteralSpanCommitmentExtractor()
 
     # -- setup -----------------------------------------------------------------------------
 
@@ -237,7 +235,7 @@ class ReplyHarness:
             received_at=received_at or self.send.action.compile.clock.now(),
             object_key=object_key,
             headers_truncated=headers_truncated,
-            **verdicts,
+            **verdicts,  # type: ignore[arg-type]  # only ever the 5 verdict-status strings
         )
         return InboundMailTransportContext(
             transport=transport, source_arn=source_arn, envelope=envelope
@@ -302,15 +300,22 @@ class ReplyHarness:
             apply=self.apply_commitment(),
             clock=self.send.action.compile.clock,
             policy_version="policy/v1",
+            destination_label=self.destination_label,
         )
 
     def create_schedule(self) -> CreateDueSchedule:
         return CreateDueSchedule(
+            idempotency=self.send.action.compile.idempotency,
             shareable=self.send.action.compile.shareable,
             audit=self.send.action.compile.audit,
             unit_of_work=self.send.action.unit_of_work,  # type: ignore[arg-type]
             scheduler=self.scheduler,
             clock=self.send.action.compile.clock,
+            # P1/P2-2: the fixture's own commands never set ``logical_now`` on
+            # ``CreateDueScheduleCommand``, so ``demo_schedule_instant`` -- the only caller of
+            # ``wall_clock`` -- is never exercised here; the same fixed test clock is reused
+            # rather than a second one, since nothing in this suite reads it.
+            wall_clock=self.send.action.compile.clock,
             ids=Uuid4Generator(),
             scheduler_environment=SCHEDULER_ENVIRONMENT,
         )

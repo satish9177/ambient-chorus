@@ -40,7 +40,11 @@ from chorus.domain.errors import IntegrityError
 from chorus.domain.ids import CommunityId, IdGenerator, Namespace, Sha256Digest
 from chorus.ports.clock import Clock
 from chorus.ports.records import CommitmentScheduleProjection, CommitmentScheduleStatus
-from chorus.ports.repositories import AuditRepositoryPort, ShareableRepositoryPort
+from chorus.ports.repositories import (
+    AuditRepositoryPort,
+    IdempotencyRepositoryPort,
+    ShareableRepositoryPort,
+)
 from chorus.ports.scheduler import (
     DeadlineSchedulerPort,
     ScheduleCreateFailed,
@@ -94,15 +98,29 @@ class CreateDueScheduleResult:
 
 @dataclass(slots=True)
 class CreateDueSchedule:
-    """Ask the scheduler once, reconcile a lost answer by name, and record the outcome."""
+    """Ask the scheduler once, reconcile a lost answer by name, and record the outcome.
+
+    Two clocks, and they answer different questions (P1/P2-2, Phase 11 batch 4 repair).
+    ``clock`` is the authoritative **logical** clock -- the same one the commitment, the
+    projection, and every audit event in this command are stamped with. ``wall_clock`` answers
+    a completely different question: "what real instant should EventBridge Scheduler fire at?"
+    A real one-time schedule is a wall-clock resource regardless of what the demo's logical
+    clock reads, and confusing the two is exactly the defect this split repairs -- a worker
+    running on a logical clock that reads 2030 must not compute ``actual_now`` from that clock,
+    or the schedule it asks EventBridge Scheduler to create lands in 2030 real time and never
+    fires. ``wall_clock`` is never used for anything the commitment, the projection, or an
+    audit row remembers; it exists for exactly one arithmetic step, below.
+    """
 
     shareable: ShareableRepositoryPort
     audit: AuditRepositoryPort
     unit_of_work: UnitOfWork
     scheduler: DeadlineSchedulerPort
     clock: Clock
+    wall_clock: Clock
     ids: IdGenerator
     scheduler_environment: str
+    idempotency: IdempotencyRepositoryPort
 
     async def execute(self, command: CreateDueScheduleCommand) -> CreateDueScheduleResult:
         commitment = command.commitment
@@ -121,7 +139,10 @@ class CreateDueSchedule:
                 failure_code=None,
             )
 
-        actual_now = self.clock.now()
+        # ``actual_now``: real wall-clock time, and only ever wall-clock time. This is the one
+        # place ``wall_clock`` is read, and the one place it may be -- everywhere else in this
+        # command, ``self.clock`` (the logical clock) is authoritative (P1/P2-2).
+        actual_now = self.wall_clock.now()
         at_utc = (
             commitment.due_at
             if command.logical_now is None
@@ -134,6 +155,7 @@ class CreateDueSchedule:
         request = due_schedule_request(
             environment=self.scheduler_environment,
             namespace=command.namespace,
+            community_id=command.community_id,
             case_id=commitment.case_id,
             commitment_id=commitment.commitment_id,
             generation=commitment.schedule_generation,
@@ -145,14 +167,41 @@ class CreateDueSchedule:
             # would create a second schedule for one commitment.
             raise IntegrityError("COMMITMENT_SCHEDULE")
 
-        outcome = await self.scheduler.create_due_schedule(request)
-        if isinstance(outcome, ScheduleCreateFailed):
-            # A lost response is indistinguishable from a failure here, so the exact name is
-            # asked about before anything is recorded -- never a second differently named
-            # schedule.
-            described = await self.scheduler.describe_schedule(request.schedule_name)
-            if described is None:
-                return await self._record_failure(command, projection, outcome.reason_code)
+        from hashlib import sha256
+
+        from chorus.application.services.demo_side_effect import SIDE_EFFECT_ACTOR, demo_side_effect
+        from chorus.ports.idempotency import (
+            IdempotencyKey,
+            IdempotencyPartition,
+            IdempotencyPartitionKind,
+            IdempotentCommand,
+        )
+
+        intent_key = IdempotencyKey(
+            partition=IdempotencyPartition(
+                kind=IdempotencyPartitionKind.CASE,
+                namespace=command.namespace,
+                case_id=commitment.case_id,
+            ),
+            command=IdempotentCommand.CREATE_COMMITMENT,
+            actor_id_hash=SIDE_EFFECT_ACTOR,
+            key_hash=Sha256Digest("sha256:" + sha256(request.schedule_name.encode()).hexdigest()),
+        )
+        async with demo_side_effect(
+            key=intent_key,
+            repository=self.idempotency,
+            unit_of_work=self.unit_of_work,
+            clock=self.clock,
+            ids=self.ids,
+        ) as attempt:
+            outcome = await self.scheduler.create_due_schedule(request)
+            if isinstance(outcome, ScheduleCreateFailed):
+                attempt.quiescent = False
+                described = await self.scheduler.describe_schedule(request.schedule_name)
+                if described is None:
+                    # An ambiguous create must keep reset closed even if the immediate
+                    # describe has not observed it. No second name is ever manufactured.
+                    return await self._record_failure(command, projection, outcome.reason_code)
         return await self._record_created(command, projection)
 
     async def _record_created(

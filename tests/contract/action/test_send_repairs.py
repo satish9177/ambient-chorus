@@ -30,7 +30,11 @@ from tests.fixtures.send import SendHarness
 
 from chorus.application.commands.approve_action import ApprovalDenial, ApprovalDeniedError
 from chorus.application.commands.decide_mandate import DecideMandate, DecideMandateCommand
-from chorus.application.commands.send_action import SendActionResult, SendFailureReason
+from chorus.application.commands.send_action import (
+    SendAction,
+    SendActionResult,
+    SendFailureReason,
+)
 from chorus.application.services.action_authorization import SEND_FENCE_LIFETIME
 from chorus.application.services.action_renderer import TEMPLATE_VERSION
 from chorus.domain.entities import (
@@ -659,6 +663,10 @@ async def test_the_worker_resumes_an_uncommitted_ambiguous_claim(
 
     first = ScriptedSender(default=SesAccepted(message_id="never"))
     stranding = send_harness.worker(sender=first)
+    # The worker's ``send_action`` is typed as the runner protocol -- the deployed one is a
+    # Lambda invocation -- so the local composition's concrete ``SendAction`` is named here
+    # before its unit of work is replaced.
+    assert isinstance(stranding.send_action, SendAction)
     stranding.send_action.unit_of_work = StorageUnitOfWork(
         driver=LosingOutcomeDriver(
             inner=send_harness.action.compile.driver, lose=_writes_an_execution

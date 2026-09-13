@@ -6,13 +6,19 @@
 # file that quietly acquires an import the artifact may not contain fails before deployment
 # rather than after it.
 #
-# The runtime resource itself is created in Phase 11, because the frozen network design puts it
-# in two isolated VPC subnets with no NAT route and that VPC belongs to the deployment stack.
-# See `server_binding` below: the one genuinely missing piece is the HTTP shim that hands a
-# request body to `handle`, and it is tracked rather than guessed at.
+# The runtime resource itself is created later in Phase 11, because the frozen network design
+# puts it in two isolated VPC subnets with no NAT route and that VPC belongs to the deployment
+# stack. The HTTP binding that hands a request body to `handle` now exists: see
+# `root_entrypoint` and `server_binding` below.
 
 [runtime]
 name = "chorus-action"
+deployed_name = "chorus_action"
+# The AgentCore runtime resource name. Runtime names match
+# `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` -- letters, digits, and underscore only -- so the
+# hyphenated `name` above cannot be one. The IAM role and log group keep their hyphens;
+# the constraint is on the runtime resource alone. Declared here rather than derived, so
+# the mapping is a fact the deployment reads instead of a transformation it performs.
 agent_name = "ACTION"
 prompt_version = "action/v1"
 python_version = "3.12"
@@ -28,12 +34,20 @@ signature = "async (raw: bytes) -> bytes"
 # more.
 
 [artifact]
+root_entrypoint = "runtimes/action/main.py"
+# Copied to the archive **root** as `main.py`, which is where AgentCore looks for the file its
+# entrypoint command names. It is not in `include` because it ships once, at the root, rather
+# than twice; everything in `include` keeps its repo-relative path so `runtimes.action` and
+# `chorus.contracts` resolve inside the unpacked zip exactly as they do in the repository.
 include = [
   "runtimes/__init__.py",
+  "runtimes/bootstrap.py",
+  "runtimes/server.py",
   "runtimes/action/__init__.py",
   "runtimes/action/agent.py",
   "runtimes/action/entrypoint.py",
   "runtimes/action/prompt.py",
+  "src/chorus/__init__.py",
   "src/chorus/contracts/__init__.py",
   "src/chorus/contracts/action.py",
   "src/chorus/contracts/common.py",
@@ -56,7 +70,25 @@ required = [
   "strands-agents>=1.10,<2",
   "pydantic>=2.9,<3",
   "botocore>=1.35,<2",
+  # The HTTP binding. Already inside the closure above -- `strands-agents` reaches it through
+  # `mcp` and `sse-starlette` -- and named here because `main.py` now imports it directly, and a
+  # transitive dependency that becomes a direct one is exactly the kind of fact this list exists
+  # to state.
+  "uvicorn>=0.34,<1",
 ]
+
+[packaging]
+target_platform = "aarch64-manylinux2014"
+target_python = "3.12"
+only_binary = true
+# The build runs on Windows and the runtime runs on Linux/ARM64, so dependencies are resolved
+# for an explicit target rather than for the host. `only_binary` is true because a source
+# distribution would be compiled for the *build* machine: a zip that silently vendored Windows
+# or x86_64 wheels produces a runtime that fails at import with no useful message.
+#
+# Versions come from `uv.lock` and from nowhere else. The build exports the locked `agents`
+# group and installs exactly that, so the artifact's dependency set is decided by the lockfile
+# rather than by whatever resolved on the day it was packaged.
 
 [capabilities]
 tools = false
@@ -85,16 +117,20 @@ runtime_budget_seconds = 60
 # application's `CHORUS_AGENT_TIMEOUT_SECONDS`, which must be larger than both.
 
 [phase_11]
-server_binding = "NOT_IMPLEMENTED"
-# The remaining gap, stated plainly rather than papered over, and identical in kind to the
-# Monitor's and the Investigator's.
+server_binding = "IMPLEMENTED"
+# The gap is closed. `runtimes/action/main.py` is the direct-code entrypoint AgentCore runs; it
+# builds one `runtimes.server.AgentCoreServer` around this runtime's `handle` and serves it on
+# `0.0.0.0:8080` with `GET /ping` and `POST /invocations` and nothing else.
 #
-# AgentCore invokes a runtime over HTTP, and binding `handle` to that transport is the job of
-# the official `bedrock-agentcore` server SDK. That package is not installed in this
-# environment, so its exact API cannot be verified here -- and a hand-written shim guessed at
-# from documentation would be a deployment artifact nobody has ever run, presented as if it
-# had been. The handler, its contract, its bounds, and its isolation are complete and tested;
-# what is missing is one adapter, and it lands with the runtime resource in Phase 11.
+# A bare ASGI application rather than the `bedrock-agentcore` server SDK, because the smallest
+# correct binding is the one that adds no package to the archive: `uvicorn` is already inside
+# this artifact's locked dependency closure by way of `strands-agents -> mcp -> sse-starlette`,
+# so the whole transport costs fifty lines and zero wheels. The SDK would add a dependency to
+# dispatch two fixed paths, and a web framework would add a router and an injection system to
+# do the same.
+#
+# `handle` remains the only entry point. The server holds no contract, no schema, and no branch
+# on payload content, so every existing boundary test still covers the deployed path.
 live_evaluation = "NOT_RUN"
 # The gated scenarios in `tests/evaluation/test_live_action.py` have never been run against a
 # real model.

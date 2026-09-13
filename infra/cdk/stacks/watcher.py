@@ -34,21 +34,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aws_cdk import Duration, RemovalPolicy, Stack, Tags
+from aws_cdk import CfnOutput, Duration, Environment, RemovalPolicy, Stack, Tags
 from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
+from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_scheduler as scheduler
 from aws_cdk import aws_sqs as sqs
 from constructs import Construct
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import CdkBuildConfig, DeploymentIdentities
+from infra.cdk.lambda_support import (
+    ResourceNames,
+    chorus_lambda,
+    load_lambda_manifest,
+    watcher_environment,
+)
 
 CASE_KEY_PREFIX = "NS#*#CASE#*"
-"""The watcher's complete Shareable data-plane authority, as a key prefix."""
+"""The watcher's complete Shareable **write** authority, as a key prefix."""
+
+DEMO_CLOCK_PARTITION = "NS#DEMO#CLOCK"
+"""The **exact literal** partition of the deployed demo clock (ADR-029 § 1-2).
+
+Not a pattern, and deliberately not ``NS#*#CLOCK*``: ``DEMO`` is the only namespace a deployed
+clock exists in, and a wildcard would authorize a clock in a namespace no deployment has. A
+policy containing one fails review, and a template test asserts its absence.
+"""
+
+DEMO_CLOCK_READ_ACTION = "dynamodb:GetItem"
+"""One item, one direct read. The watcher never queries or scans the clock partition."""
 
 FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#ACTION#*",
@@ -57,6 +75,7 @@ FORBIDDEN_WRITE_PREFIXES = (
     "NS#*#OUTBOUND_MESSAGE#*",
     "NS#*#VIEW#*",
     "NS#*#VIEW_CURRENT#*",
+    DEMO_CLOCK_PARTITION,
 )
 """Every Shareable prefix the watcher must never write, denied by ``ForAnyValue``.
 
@@ -102,6 +121,18 @@ DENIED_SCHEDULER_ACTIONS = (
 )
 """A target, not a client. Even ``GetSchedule`` is denied: nothing here reads a schedule."""
 
+SCHEDULER_INVOKE_ACTION = "lambda:InvokeFunction"
+"""The scheduler execution role's entire compute reach: invoke the one watcher function."""
+
+SCHEDULER_DLQ_SEND_ACTION = "sqs:SendMessage"
+"""A dropped one-time schedule delivery lands in the DLQ; the role may put it there and nothing
+else on any queue."""
+
+SCHEDULER_DLQ_KEY_ACTIONS = ("kms:GenerateDataKey", "kms:Decrypt")
+"""What EventBridge Scheduler needs to write an encrypted message to the KMS-encrypted DLQ:
+a data key to encrypt the payload, and decrypt for the SQS envelope. Scoped to the DLQ CMK
+alone -- no other key, and no ``kms:*``."""
+
 DLQ_RETENTION_DAYS = 14
 DLQ_DEPTH_ALARM_THRESHOLD = 1
 """One dropped invocation is worth a person's attention.
@@ -139,8 +170,11 @@ class ChorusWatcherStack(Stack):
         config: CdkBuildConfig,
         tables: WatcherTables,
         buckets: WatcherBuckets,
+        identities: DeploymentIdentities | None = None,
+        offline_synth: bool = True,
+        env: Environment | None = None,
     ) -> None:
-        super().__init__(scope, construct_id)
+        super().__init__(scope, construct_id, env=env)
         Tags.of(self).add("Project", config.project)
         Tags.of(self).add("Environment", config.environment)
         Tags.of(self).add("Namespace", config.namespace)
@@ -208,18 +242,98 @@ class ChorusWatcherStack(Stack):
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             description="Commitment watcher: one edge, one Shareable partition, nothing else.",
         )
+        # The watcher Lambda is deployed in Phase 11 (I2) into this same stack, under the frozen
+        # name below, and rollback repoints its ``live`` alias at a published version rather than
+        # editing schedules or IAM (deployment contract § 20). So both the scheduler target and
+        # the scheduler role's invoke authority bind to the **alias** ARN, not the unqualified
+        # function ARN. Deterministic literals here: the resources do not exist yet, they land
+        # beside this role later, and the worker's stack already depends on this one -- no cycle.
+        self.watcher_function_name = f"chorus-commitment-watcher-{config.environment}"
+        self.watcher_alias_name = "live"
+        self.watcher_function_arn_literal = (
+            f"arn:aws:lambda:{self.region}:{self.account}:function:{self.watcher_function_name}"
+        )
+        self.watcher_alias_arn_literal = (
+            f"{self.watcher_function_arn_literal}:{self.watcher_alias_name}"
+        )
+        # The confused-deputy boundary for a Scheduler execution role is the **schedule-group**
+        # ARN, not an individual schedule ARN and never a wildcard schedule name (deployment
+        # contract § 8.5, AWS cross-service guidance). Deterministic literal rather than
+        # ``schedule_group.attr_arn`` so the frozen group name is legible in the synthesized
+        # trust policy; no cycle either way since the group is built above.
+        self.schedule_group_arn = self.format_arn(
+            service="scheduler",
+            resource="schedule-group",
+            resource_name=self.schedule_group_name,
+        )
+
         self.scheduler_role_name = f"chorus-scheduler-{config.environment}"
         self.scheduler_role = iam.Role(
             self,
             "SchedulerExecutionRole",
             role_name=self.scheduler_role_name,
-            assumed_by=iam.ServicePrincipal("scheduler.amazonaws.com"),
+            # Not an unconstrained service trust: EventBridge Scheduler may assume this role only
+            # for this account and only on behalf of a schedule in the frozen group. The
+            # ``aws:SourceArn`` is the exact schedule-group ARN -- an individual schedule ARN or
+            # a wildcard tail would be a wider boundary than the confused-deputy guidance draws.
+            assumed_by=iam.ServicePrincipal(
+                "scheduler.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": self.account},
+                    "ArnEquals": {"aws:SourceArn": self.schedule_group_arn},
+                },
+            ),
             description="EventBridge Scheduler: invokes the commitment watcher and nothing else.",
         )
         self.scheduler_role_arn_literal = (
             f"arn:aws:iam::{self.account}:role/{self.scheduler_role_name}"
         )
         self._grant_boundary(tables=tables, buckets=buckets)
+
+        # I2 -> compute (deployment contract SS 14, SS 21-23). The watcher Lambda under the
+        # pre-existing role and log group, then a published Version and an Alias named exactly
+        # ``live``. The frozen physical name ``chorus-commitment-watcher-{env}`` is not
+        # negotiable: its ``:live`` alias ARN is already named by the API role, the scheduler
+        # execution role, and ``CHORUS_WATCHER_FUNCTION_ARN`` semantics.
+        _ = identities  # the watcher carries no AgentCore identity (review P2-8)
+        version_removal = RemovalPolicy.DESTROY if config.is_disposable else RemovalPolicy.RETAIN
+        self.function = chorus_lambda(
+            self,
+            "WatcherFunction",
+            config=config,
+            manifest=load_lambda_manifest("commitment_watcher"),
+            role=self.role,
+            environment=watcher_environment(
+                config=config,
+                names=ResourceNames.for_config(config),
+            ),
+            log_group=self.log_group,
+            offline_synth=offline_synth,
+            # SS 23: the published version must change when deployment-relevant watcher code or
+            # config changes. ``current_version`` hashes exactly that, so rollback has a stable
+            # previous version to repoint ``live`` at -- retained, not swept, outside a
+            # disposable environment.
+            current_version_options=lambda_.VersionOptions(removal_policy=version_removal),
+        )
+        self.version = self.function.current_version
+        self.alias = lambda_.Alias(
+            self,
+            "WatcherLiveAlias",
+            alias_name=self.watcher_alias_name,
+            version=self.version,
+        )
+        # The one identity every ``:live`` consumer binds to (deployment contract SS 46): the
+        # actual ``Alias`` resource's ARN, not a re-typed lookalike string. The scheduler
+        # execution role (below) and the API role (in the Application stack, via ``app.py``)
+        # both point their ``lambda:InvokeFunction`` grant at exactly this. It resolves to
+        # ``watcher_alias_arn_literal`` -- the alias's physical name is deterministic -- but a
+        # template test compares the *resources*, not the strings.
+        self.watcher_alias_arn = self.alias.function_arn
+        CfnOutput(self, "WatcherFunctionName", value=self.function.function_name)
+        CfnOutput(self, "WatcherLiveAliasArn", value=self.alias.function_arn)
+        CfnOutput(self, "WatcherPublishedVersion", value=self.version.version)
+
+        self._grant_scheduler_execution_boundary()
 
     def _grant_boundary(self, *, tables: WatcherTables, buckets: WatcherBuckets) -> None:
         """Attach the complete allow list and every explicit deny, in one place."""
@@ -231,6 +345,25 @@ class ChorusWatcherStack(Stack):
                 actions=list(READ_ACTIONS),
                 resources=[tables.shareable.table_arn],
                 conditions={"ForAllValues:StringLike": {"dynamodb:LeadingKeys": [CASE_KEY_PREFIX]}},
+            )
+        )
+        # ADR-029 § 2. The watcher reads the one authoritative logical clock and it reads
+        # nothing else outside its case partitions. Without this the deployed watcher could not
+        # perform step 4 of its own frozen order at all: its Core deny is total, so the demo
+        # manifest is unreachable, and a process-local clock in a separate Lambda is a
+        # *different* clock from the one the API advanced.
+        #
+        # In environments with no clock row the grant simply finds nothing to read, which is
+        # correct -- a grant describes an authority, not an expectation (ADR-029 § 6).
+        self.role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadDemoClockItemOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[DEMO_CLOCK_READ_ACTION],
+                resources=[tables.shareable.table_arn],
+                conditions={
+                    "ForAllValues:StringLike": {"dynamodb:LeadingKeys": [DEMO_CLOCK_PARTITION]}
+                },
             )
         )
         self.role.add_to_policy(
@@ -278,10 +411,13 @@ class ChorusWatcherStack(Stack):
             iam.PolicyStatement(
                 sid="DenyAllCoreAccess",
                 effect=iam.Effect.DENY,
-                actions=["dynamodb:*"],
+                not_actions=["dynamodb:ConditionCheckItem"],
                 resources=[tables.core.table_arn, f"{tables.core.table_arn}/*"],
             )
         )
+        from infra.cdk.reset_support import grant_demo_reset_condition
+
+        grant_demo_reset_condition(self.role, tables.core.table_arn, deny_other_conditions=True)
         self.role.add_to_policy(
             iam.PolicyStatement(
                 sid="DenyEvidenceObjects",
@@ -320,6 +456,46 @@ class ChorusWatcherStack(Stack):
             )
         )
 
+    def _grant_scheduler_execution_boundary(self) -> None:
+        """The exact minimum EventBridge Scheduler needs to deliver one due event.
+
+        Three grants and no fourth (deployment contract § 8.5): invoke the watcher's ``live``
+        alias, put a dropped delivery on the one DLQ, and use the one DLQ key to encrypt that
+        message. No DynamoDB, no Bedrock, no SES, no AgentCore, no Secrets Manager, no broad
+        ``lambda:InvokeFunction``, no general ``sqs:*`` or ``kms:*``. The role had a trust
+        policy and zero attached policies until now.
+
+        The invoke resource is the **qualified alias** ARN (``…:function:…:live``), never the
+        unqualified function ARN and never ``$LATEST`` or a bare version: rollback repoints the
+        alias at a published version and no schedule or policy statement changes (deployment
+        contract § 20).
+        """
+
+        self.scheduler_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="InvokeCommitmentWatcherLiveAliasOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[SCHEDULER_INVOKE_ACTION],
+                resources=[self.alias.function_arn],
+            )
+        )
+        self.scheduler_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="SendDroppedDueEventToDeadLetterQueueOnly",
+                effect=iam.Effect.ALLOW,
+                actions=[SCHEDULER_DLQ_SEND_ACTION],
+                resources=[self.dead_letter_queue.queue_arn],
+            )
+        )
+        self.scheduler_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="UseDeadLetterQueueKeyForEncryptedSendOnly",
+                effect=iam.Effect.ALLOW,
+                actions=list(SCHEDULER_DLQ_KEY_ACTIONS),
+                resources=[self.dead_letter_key.key_arn],
+            )
+        )
+
 
 __all__ = [
     "AUDIT_WRITE_ACTIONS",
@@ -332,6 +508,9 @@ __all__ = [
     "DLQ_DEPTH_ALARM_THRESHOLD",
     "DLQ_RETENTION_DAYS",
     "FORBIDDEN_WRITE_PREFIXES",
+    "SCHEDULER_DLQ_KEY_ACTIONS",
+    "SCHEDULER_DLQ_SEND_ACTION",
+    "SCHEDULER_INVOKE_ACTION",
     "ChorusWatcherStack",
     "WatcherBuckets",
     "WatcherTables",

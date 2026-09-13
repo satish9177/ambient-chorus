@@ -45,4 +45,6 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm run e2e:list
-      - run: npm run cdk:synth
+      # Static CI synthesis is not a deployment: select offline mode explicitly. The default
+      # `cdk:synth` stays deployment-capable and fails closed without real deploy inputs.
+      - run: npm run cdk:synth:offline

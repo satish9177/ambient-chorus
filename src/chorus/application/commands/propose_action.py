@@ -126,6 +126,7 @@ from chorus.ports.agents import (
     AgentError,
     AgentErrorCode,
 )
+from chorus.ports.demo_clock import DemoClockStorePort
 from chorus.ports.errors import (
     CrossCaseViolationError,
     NotFoundError,
@@ -440,6 +441,28 @@ class ProposeAction:
     how "the deployment moved out from under an old view" stayed unexercised.
     """
 
+    freshness_clock: DemoClockStorePort | None = None
+    """The durable clock, re-read strongly at step 6, or ``None`` where no durable clock exists
+    (Phase 11 batch 4 repair, P2-3).
+
+    ``self.clock`` answers step 1's ``now`` and step 6's ``freshness_now`` from the *same*
+    object, and in a deployed topology ``self.clock`` may be a
+    :class:`~chorus.infrastructure.persistent_clock.ScopedLogicalClock` bound **once** for the
+    whole worker invocation -- so a second ``self.clock.now()`` call returns the identical
+    binding, not a fresh answer, and the freshness sample this module's own docstring calls "an
+    authorization freshness sample and nothing else" degenerates into a second copy of the
+    entry-time reading. That defeats exactly the race step 6 exists to catch: a view that was
+    fresh when the model was called and expired *while it answered* would be measured against
+    the entry-time reading and accepted.
+
+    When present, ``freshness_clock`` is asked for a fresh, strongly consistent reading at step
+    6 instead of reusing ``self.clock``. When absent -- the local/test composition, where
+    ``self.clock`` is an ordinary mutable clock nothing else in the same command can advance --
+    ``self.clock.now()`` already answers freshly, and step 1's ``now`` is untouched either way:
+    it is still read exactly once, from ``self.clock``, and every artifact timestamp this
+    command mints still shares that one instant.
+    """
+
     async def execute(self, command: ProposeActionCommand) -> ProposeActionResult:
         now = self.clock.now()
         scope = CaseScope(
@@ -512,7 +535,11 @@ class ProposeAction:
             # for nothing else. See the module docstring: `now` is the canonical artifact
             # instant, and reusing it here would mean a view that expired during the model call
             # was measured against the moment before the call started.
-            self._require_unexpired(command, state, freshness_now=self.clock.now())
+            #
+            # ``freshness_clock``, when wired, is asked for a genuinely fresh reading (P2-3)
+            # rather than ``self.clock.now()`` -- which in a deployed topology may be bound
+            # once for the whole invocation and would otherwise answer the same value twice.
+            self._require_unexpired(command, state, freshness_now=await self._freshness_now())
             return await self._apply(
                 command,
                 scope=scope,
@@ -536,6 +563,19 @@ class ProposeAction:
                 now=now,
             )
             raise
+
+    async def _freshness_now(self) -> datetime:
+        """The step-6 sample: a genuinely independent read, not a second look at step 1's.
+
+        Reused nowhere else and never written anywhere -- it exists purely to answer "is the
+        view still fresh **right now**", which ``self.clock.now()`` alone can no longer promise
+        once ``self.clock`` may be a value bound once per invocation (P2-3).
+        """
+
+        if self.freshness_clock is None:
+            return self.clock.now()
+        record = await self.freshness_clock.read()
+        return record.logical_time
 
     def _require_unexpired(
         self,

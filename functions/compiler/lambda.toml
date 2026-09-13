@@ -1,0 +1,30 @@
+# Deployment manifest for the deterministic compiler Lambda (deployment contract SS 14, SS 16).
+#
+# Runs `functions.compiler.handler.handler` -- CompileView plus the two halves of the send
+# authorization fence. See `functions/api/lambda.toml` for the shared manifest contract.
+
+[function]
+name = "chorus-compiler"
+handler = "functions.compiler.handler.handler"
+description = "Deterministic privacy compiler: sole creator of views and sole send authority."
+
+[runtime]
+architecture = "x86_64"
+python_version = "3.12"
+# 24 s. Traced workload of a compile of the frozen, reviewed fixture: Pillow decode/re-encode
+# (~100 ms), one DynamoDB TransactWriteItems (~50 ms), one S3 PutObject (~100 ms) -- sub-second
+# in practice, so 24 s is ~24x headroom. It is deliberately BELOW the API's 25 s client read
+# timeout for its compiler call (chorus.infrastructure.lambdas.transport_budgets), so a stuck
+# compiler self-terminates before the presenter-facing API gives up and returns a typed
+# dependency error. The fence acquire/release the sender and worker invoke are far shorter still.
+timeout_seconds = 24
+# 1024 MiB: Pillow image decoding and the frozen ADR-018 sanitizer profile are the memory floor.
+memory_mb = 1024
+
+[artifact]
+first_party = [
+  "functions/__init__.py",
+  "functions/envelope.py",
+  "functions/compiler",
+  "src/chorus",
+]

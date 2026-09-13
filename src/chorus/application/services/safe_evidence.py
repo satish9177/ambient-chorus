@@ -165,6 +165,9 @@ class PrepareSafeEvidence:
             # The precondition refused the write: an object already occupies this address.
             await self._require_existing_matches(scope, safe)
         except ExternalDependencyError:
+            from chorus.application.services.demo_side_effect import retain_demo_side_effect_intent
+
+            retain_demo_side_effect_intent()
             # Unknown outcome. The bytes may have landed and this process cannot tell.
             resolved = await self._head(scope, safe.sha256)
             if resolved is not None:

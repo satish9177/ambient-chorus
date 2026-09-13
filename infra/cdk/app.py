@@ -1,10 +1,40 @@
-"""CDK application used by the pinned synth command."""
+"""CDK application used by the pinned synth command.
+
+Phase 11 batch 5 wires the five production Lambdas, the HTTP API, and the watcher ``:live``
+alias into the existing identity stacks, and connects them by their **actual resource ARNs**
+(deployment contract SS 16, SS 30; review P2-2):
+
+    Data
+      -> Compiler        (compiler Lambda)        -> compiler.function.function_arn
+      -> Sender          (sender Lambda)          -> sender.function.function_arn
+      -> Watcher         (watcher Lambda -> Version -> live Alias) -> watcher.alias.function_arn
+      -> Application      (API + worker Lambdas, HTTP API; names the three ARNs above,
+                           the secret identities, and the scheduler identity)
+
+Every deployment stack is created for the frozen region ``us-east-1`` through
+``env=Environment(region=...)`` -- none synthesizes as ``unknown-region``. The compute stacks
+are independent of one another and every one precedes Application, whose two roles name their
+ARNs; explicit ``add_stack_dependency`` calls make the deploy order match.
+
+**Two modes, chosen explicitly (review P2-3, P2-4):**
+
+* deployment-capable (the default) -- every Lambda ZIP must be built and every required
+  deployment identity must be a real, validated ARN, or synthesis refuses;
+* offline review -- ``build_app(offline=True)`` or ``-c offline_synth=true`` /
+  ``CHORUS_CDK_OFFLINE_SYNTH=1`` -- uses the clearly-named placeholder code fixture and
+  synthetic identity fixtures, and its output is never deploy-ready.
+"""
 
 from __future__ import annotations
 
-from aws_cdk import App
+from aws_cdk import App, Environment
 
-from infra.cdk.config import CdkBuildConfig
+from infra.cdk.config import (
+    CdkBuildConfig,
+    DeploymentIdentities,
+    offline_synth_requested,
+)
+from infra.cdk.network_support import NetworkConfig
 from infra.cdk.stacks import (
     ApplicationBuckets,
     ApplicationTables,
@@ -13,50 +43,115 @@ from infra.cdk.stacks import (
     ChorusCompilerStack,
     ChorusDataStack,
     ChorusFoundationStack,
+    ChorusInboundStack,
+    ChorusNetworkStack,
+    ChorusObservabilityStack,
+    ChorusResetStack,
     ChorusSenderStack,
     ChorusWatcherStack,
     CompilerBuckets,
     CompilerTables,
+    ResetBuckets,
+    ResetTables,
     SenderBuckets,
     SenderTables,
     WatcherBuckets,
     WatcherTables,
 )
 
+_DEFAULT_NAMESPACE_BY_ENVIRONMENT = {"demo": "DEMO"}
 
-def build_app() -> App:
-    """Construct the CDK application without deploying resources."""
 
-    app = App()
-    environment = app.node.try_get_context("environment")
-    config = (
-        CdkBuildConfig(environment=environment)
-        if isinstance(environment, str) and environment
-        else CdkBuildConfig()
+def _resolve_config(app: App) -> CdkBuildConfig:
+    """Build the stable config from context. Region defaults to -- and is validated against --
+    the frozen Phase 11 region; the account is used only when explicitly supplied."""
+
+    def _str(key: str) -> str | None:
+        value = app.node.try_get_context(key)
+        return value if isinstance(value, str) and value else None
+
+    environment = _str("environment") or "development"
+    namespace = _str("namespace") or _DEFAULT_NAMESPACE_BY_ENVIRONMENT.get(environment) or "LOCAL"
+    kwargs: dict[str, str] = {"environment": environment, "namespace": namespace}
+    region = _str("aws_region")
+    if region is not None:
+        kwargs["aws_region"] = region  # CdkBuildConfig.__post_init__ rejects a non-frozen region
+    account = _str("account")
+    if account is not None:
+        kwargs["account"] = account
+    return CdkBuildConfig(**kwargs)
+
+
+def _stack_env(config: CdkBuildConfig) -> Environment:
+    """The frozen region on every deployment stack; the account only when supplied."""
+
+    return Environment(region=config.aws_region, account=config.account)
+
+
+def build_app(*, offline: bool | None = None, context: dict[str, str] | None = None) -> App:
+    """Construct the CDK application without deploying resources.
+
+    ``offline`` selects the synthesis mode; when ``None`` it is read from context /
+    ``CHORUS_CDK_OFFLINE_SYNTH`` and otherwise defaults to **deployment-capable** -- so the
+    normal ``python infra/cdk/app.py`` path never silently uses a placeholder (review P2-3).
+    ``context`` is an optional CDK context map (equivalent to repeated ``-c key=value``), used
+    by tests to exercise deployment mode with real identity ARNs.
+    """
+
+    app = App(context=context)
+    config = _resolve_config(app)
+    offline_synth = (
+        offline if offline is not None else offline_synth_requested(app.node.try_get_context)
     )
-    ChorusFoundationStack(
+    identities = DeploymentIdentities.from_context(
+        config.environment, app.node.try_get_context, offline=offline_synth
+    )
+    network_config = NetworkConfig.from_context(app.node.try_get_context, offline=offline_synth)
+    env = _stack_env(config)
+
+    artifact_bucket_arn = f"arn:aws:s3:::chorus-agent-artifacts-{config.environment}"
+
+    ChorusFoundationStack(app, "AmbientChorusFoundation", config=config, env=env)
+
+    # Macro A: the isolated network is foundational (deployment contract §§ 6-9, 16, 18). It
+    # references only deterministic ARN literals, so it takes no dependency on Data and stays
+    # first in the DAG; the three VPC-attached compute stacks depend on it.
+    network = ChorusNetworkStack(
         app,
-        "AmbientChorusFoundation",
+        "AmbientChorusNetwork",
         config=config,
+        network=network_config,
+        artifact_bucket_arn=artifact_bucket_arn,
+        env=env,
     )
-    data = ChorusDataStack(
-        app,
-        "AmbientChorusData",
-        config=config,
-    )
-    ChorusAgentStack(
+
+    data = ChorusDataStack(app, "AmbientChorusData", config=config, env=env)
+    # The customer artifact bucket is a third bucket, separate from both evidence buckets and
+    # their keys, because agent code is not evidence (deployment contract SS 6). Its ARN is a
+    # literal derived from the environment token; no bucket resource is created here.
+    agents = ChorusAgentStack(
         app,
         "AmbientChorusAgents",
         config=config,
+        env=env,
+        artifact_bucket_arn=artifact_bucket_arn,
+        artifact_bucket_name=data.agent_artifact_bucket.bucket_name,
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        monitor_security_group=network.monitor_runtime_security_group,
+        investigator_security_group=network.investigator_runtime_security_group,
+        action_security_group=network.action_runtime_security_group,
+        offline_synth=offline_synth,
     )
-    ChorusCompilerStack(
+    compiler = ChorusCompilerStack(
         app,
         "AmbientChorusCompiler",
         config=config,
+        env=env,
+        identities=identities,
+        offline_synth=offline_synth,
         tables=CompilerTables(
-            core=data.core_table,
-            shareable=data.shareable_table,
-            audit=data.audit_table,
+            core=data.core_table, shareable=data.shareable_table, audit=data.audit_table
         ),
         buckets=CompilerBuckets(
             private=data.private_evidence_bucket,
@@ -64,40 +159,72 @@ def build_app() -> App:
             private_key=data.private_evidence_key,
             export_key=data.export_evidence_key,
         ),
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        vpc_subnet_arns=network.isolated_subnet_arns,
+        security_group=network.compiler_security_group,
     )
-    # Synthesized in Phase 9 so the ADR-028 negative-capability assertions have a policy to
-    # read, and created *before* the application stack because the application's narrowed
-    # scheduler grant names this stack's schedule group and passes this stack's execution role.
-    # The watcher is the smallest principal in the system -- one edge, one Shareable partition,
-    # no model, no mail, no scheduler client -- and its trust-matrix row was wrong until now: it
-    # read ``Share: R/W(commitment/case projection)``, which mislocated the case row into a table
-    # the watcher is denied outright. Nothing here is deployed.
+    # The sender invokes the compiler for both halves of the send fence, so it takes the
+    # compiler's **actual function ARN** (review P2-2); batch 5 also always wires its
+    # destination-registry secret identity.
+    sender = ChorusSenderStack(
+        app,
+        "AmbientChorusSender",
+        config=config,
+        env=env,
+        identities=identities,
+        offline_synth=offline_synth,
+        compiler_function_arn=compiler.function.function_arn,
+        tables=SenderTables(
+            core=data.core_table, shareable=data.shareable_table, audit=data.audit_table
+        ),
+        buckets=SenderBuckets(
+            private=data.private_evidence_bucket, export=data.export_evidence_bucket
+        ),
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        vpc_subnet_arns=network.isolated_subnet_arns,
+        security_group=network.sender_security_group,
+    )
+    # Created before Application because the application's narrowed scheduler grant names this
+    # stack's schedule group and passes this stack's execution role. Batch 5 adds the watcher
+    # Lambda here, plus its published Version and the ``live`` Alias that the scheduler role and
+    # the API role both invoke.
     watcher = ChorusWatcherStack(
         app,
         "AmbientChorusWatcher",
         config=config,
+        env=env,
+        identities=identities,
+        offline_synth=offline_synth,
         tables=WatcherTables(
-            core=data.core_table,
-            shareable=data.shareable_table,
-            audit=data.audit_table,
+            core=data.core_table, shareable=data.shareable_table, audit=data.audit_table
         ),
         buckets=WatcherBuckets(
-            private=data.private_evidence_bucket,
-            export=data.export_evidence_bucket,
+            private=data.private_evidence_bucket, export=data.export_evidence_bucket
         ),
     )
-    # Synthesized in Phase 7 so the ADR-022 negative-capability assertion has a policy to read.
-    # The application principal existed as a row in the trust matrix and as nothing a test could
-    # check; a condition-check grant on a compiler-owned prefix is exactly the kind of statement
-    # that has to be provable from the template rather than argued from the repository.
-    ChorusApplicationStack(
+    agent_live_endpoint_arns: tuple[str, str, str] | None = None
+    if (
+        agents.monitor_live_endpoint is not None
+        and agents.investigator_live_endpoint is not None
+        and agents.action_live_endpoint is not None
+    ):
+        agent_live_endpoint_arns = (
+            agents.monitor_live_endpoint.agent_runtime_endpoint_arn,
+            agents.investigator_live_endpoint.agent_runtime_endpoint_arn,
+            agents.action_live_endpoint.agent_runtime_endpoint_arn,
+        )
+
+    application = ChorusApplicationStack(
         app,
         "AmbientChorusApplication",
         config=config,
+        env=env,
+        identities=identities,
+        offline_synth=offline_synth,
         tables=ApplicationTables(
-            core=data.core_table,
-            shareable=data.shareable_table,
-            audit=data.audit_table,
+            core=data.core_table, shareable=data.shareable_table, audit=data.audit_table
         ),
         buckets=ApplicationBuckets(
             private=data.private_evidence_bucket,
@@ -105,27 +232,115 @@ def build_app() -> App:
             private_key=data.private_evidence_key,
             export_key=data.export_evidence_key,
         ),
+        agent_live_endpoint_arns=agent_live_endpoint_arns,
         scheduler_group_name=watcher.schedule_group_name,
         scheduler_role_arn=watcher.scheduler_role_arn_literal,
+        compiler_function_arn=compiler.function.function_arn,
+        sender_function_arn=sender.function.function_arn,
+        # The actual ``Alias`` resource ARN, so ``POST /v1/demo/clock/advance`` invokes the same
+        # ``:live`` identity the scheduler does (deployment contract SS 8.1, SS 38, SS 46).
+        watcher_alias_arn=watcher.watcher_alias_arn,
+        # I16 -> the **worker** is VPC-attached; the API is not (deployment contract SS 2).
+        worker_vpc=network.vpc,
+        worker_vpc_subnets=network.isolated_subnet_selection,
+        worker_vpc_subnet_arns=network.isolated_subnet_arns,
+        worker_security_group=network.worker_security_group,
     )
-    # Synthesized in Phase 8 so the ADR-024 negative-capability sweep has a policy to read.
-    # The sender is the principal whose documented boundary was, until now, a sentence beside
-    # a grant that contradicted it: ``W(execution only)`` authorized rewriting the proposal
-    # and the approval, because they shared a partition. Nothing here is deployed.
-    ChorusSenderStack(
+
+    # Phase 11 Macro B: Inbound SES transport (deployment contract § 10, DAG stage 10).
+    inbound_receiving_address = (
+        app.node.try_get_context("inbound_receiving_address") or "reply@inbound.demo.invalid"
+    )
+    inbound = ChorusInboundStack(
         app,
-        "AmbientChorusSender",
+        "AmbientChorusInbound",
         config=config,
-        tables=SenderTables(
-            core=data.core_table,
-            shareable=data.shareable_table,
-            audit=data.audit_table,
+        env=env,
+        identities=identities,
+        offline_synth=offline_synth,
+        private_evidence_bucket=data.private_evidence_bucket,
+        private_evidence_key=data.private_evidence_key,
+        core_table=data.core_table,
+        shareable_table=data.shareable_table,
+        audit_table=data.audit_table,
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        vpc_subnet_arns=network.isolated_subnet_arns,
+        security_group=network.inbound_security_group,
+        inbound_source_arn=identities.inbound_source_arn,
+        inbound_receiving_address=inbound_receiving_address,
+    )
+
+    # Macro A: the dedicated reset authority (deployment contract §§ 12, 19-26, DAG stage 11).
+    # Its own narrow role, VPC-attached to the isolated network's reset security group, with no
+    # public route. It names only DEMO-namespace-bounded resources.
+    reset = ChorusResetStack(
+        app,
+        "AmbientChorusReset",
+        config=config,
+        env=env,
+        offline_synth=offline_synth,
+        tables=ResetTables(
+            core=data.core_table, shareable=data.shareable_table, audit=data.audit_table
         ),
-        buckets=SenderBuckets(
+        buckets=ResetBuckets(
             private=data.private_evidence_bucket,
             export=data.export_evidence_bucket,
+            private_key=data.private_evidence_key,
+            export_key=data.export_evidence_key,
         ),
+        vpc=network.vpc,
+        vpc_subnets=network.isolated_subnet_selection,
+        vpc_subnet_arns=network.isolated_subnet_arns,
+        security_group=network.reset_security_group,
     )
+
+    # Macro A: base observability (deployment contract §§ 27-30, DAG stage 12). Lambda error
+    # alarms for every function that exists after Macro A, and one ``chorus-{env}`` dashboard.
+    # AgentCore alarms are Macro B. It references the watcher DLQ and the HTTP API by their
+    # deterministic identities, so it is last and depends on nothing structurally.
+    observability = ChorusObservabilityStack(
+        app,
+        "AmbientChorusObservability",
+        config=config,
+        env=env,
+        dead_letter_queue_name=watcher.dead_letter_queue.queue_name,
+        http_api_id=application.http_api.http_api_id,
+        monitor_runtime=agents.monitor_runtime,
+        investigator_runtime=agents.investigator_runtime,
+        action_runtime=agents.action_runtime,
+        monitor_live_endpoint=agents.monitor_live_endpoint,
+        investigator_live_endpoint=agents.investigator_live_endpoint,
+        action_live_endpoint=agents.action_live_endpoint,
+    )
+
+    # A principal's stack deploys after every resource its policy names (deployment contract
+    # SS 16). Cross-stack ARN references already create most of these edges; the explicit calls
+    # make the intent legible and cover the deterministic-literal cases.
+    sender.add_stack_dependency(compiler)
+    application.add_stack_dependency(compiler)
+    application.add_stack_dependency(sender)
+    application.add_stack_dependency(watcher)
+    application.add_stack_dependency(agents)
+    # Network is foundational: every VPC-attached compute stack deploys after it.
+    agents.add_stack_dependency(network)
+    agents.add_stack_dependency(data)
+    compiler.add_stack_dependency(network)
+    sender.add_stack_dependency(network)
+    application.add_stack_dependency(network)
+    inbound.add_stack_dependency(network)
+    inbound.add_stack_dependency(data)
+    inbound.add_stack_dependency(application)
+    reset.add_stack_dependency(network)
+    reset.add_stack_dependency(data)
+    # Observability is last: it names the alarmed functions, the watcher DLQ, the HTTP API,
+    # and the agent runtimes.
+    observability.add_stack_dependency(application)
+    observability.add_stack_dependency(watcher)
+    observability.add_stack_dependency(inbound)
+    observability.add_stack_dependency(reset)
+    observability.add_stack_dependency(agents)
+
     return app
 
 

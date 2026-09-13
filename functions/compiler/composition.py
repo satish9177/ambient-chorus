@@ -59,6 +59,10 @@ class CompilerSettings:
     """Everything the composition root needs, and nothing it could decide policy from."""
 
     region: str
+    namespace: str
+    """Deployment configuration, not a caller field. The demo clock's partition is the exact
+    literal ``NS#{namespace}#CLOCK``, and the compiler's read grant names that literal -- so a
+    namespace an invocation could choose would be a partition the policy never authorized."""
     core_table: str
     shareable_table: str
     audit_table: str
@@ -67,25 +71,29 @@ class CompilerSettings:
     community_public_label: str
     destination: StoredSafeDestination
     cursor_secret: bytes
+    private_evidence_key_arn: str | None = None
+    export_evidence_key_arn: str | None = None
+    """The exact KMS key ARN each evidence bucket is encrypted under, from CDK outputs
+    (``CHORUS_PRIVATE_EVIDENCE_KEY_ARN`` / ``CHORUS_EXPORT_EVIDENCE_KEY_ARN``).
+
+    Required for a deployed composition and refused when absent (below), the same split the
+    sender's ``compiler_function_arn`` expresses. ``S3ObjectStore`` passes each as
+    ``SSEKMSKeyId`` and the deployed bucket policy denies a write that omits or misnames the
+    key, so a compiler built with no key ARN fails every safe-evidence write in an account and
+    nowhere else -- which is exactly the failure that must happen at construction instead.
+    """
     dynamodb_endpoint: str | None = None
 
 
-def build_compile_view(
-    settings: CompilerSettings,
-    *,
-    clock: Clock,
-    ids: IdGenerator | None = None,
-    reviews: EvidenceReviewRegistryPort | None = None,
-) -> CompileView:
-    """Construct the compile use case over deployed adapters.
+def build_compiler_driver(settings: CompilerSettings) -> DynamoDbStorageDriver:
+    """The compiler's one storage handle, over all three tables.
 
-    The identifier generator defaults to UUIDv4 because a view is an ordinary entity, not one of
-    the ADR-011 replay identities. Determinism of the *view hash* comes from the inputs being
-    fixed, which is why the golden tests inject a deterministic generator rather than this
-    function producing one.
+    Shared by the two use cases this function serves -- the compile itself and the send-fence
+    authority the sender invokes -- so a deployed compiler holds exactly one client and one
+    table map rather than one per entry point.
     """
 
-    driver = DynamoDbStorageDriver(
+    return DynamoDbStorageDriver(
         client=create_dynamodb_client(
             region_name=settings.region, endpoint_url=settings.dynamodb_endpoint
         ),
@@ -95,11 +103,39 @@ def build_compile_view(
             TableName.AUDIT: settings.audit_table,
         },
     )
+
+
+def build_compile_view(
+    settings: CompilerSettings,
+    *,
+    clock: Clock,
+    ids: IdGenerator | None = None,
+    reviews: EvidenceReviewRegistryPort | None = None,
+    driver: DynamoDbStorageDriver | None = None,
+) -> CompileView:
+    """Construct the compile use case over deployed adapters.
+
+    The identifier generator defaults to UUIDv4 because a view is an ordinary entity, not one of
+    the ADR-011 replay identities. Determinism of the *view hash* comes from the inputs being
+    fixed, which is why the golden tests inject a deterministic generator rather than this
+    function producing one.
+    """
+
+    driver = driver or build_compiler_driver(settings)
     cursors = SignedCursorCodec(secret=settings.cursor_secret)
+    private_key_arn = settings.private_evidence_key_arn
+    export_key_arn = settings.export_evidence_key_arn
+    if not private_key_arn or not export_key_arn:
+        # Refused rather than defaulted, the same way the deployed sender refuses a missing
+        # compiler ARN: a compiler with no evidence key ARN can never write a safe derivative
+        # under the deployed bucket policy, so it must fail here and not at the first compile.
+        raise ValueError("a deployed compiler needs the private and export evidence KMS key ARNs")
     objects = S3ObjectStore(
         client=create_s3_client(region_name=settings.region),
         private_bucket=settings.private_evidence_bucket,
         export_bucket=settings.export_evidence_bucket,
+        private_kms_key_id=private_key_arn,
+        export_kms_key_id=export_key_arn,
     )
     generator = ids or Uuid4Generator()
     registry = reviews or FixtureEvidenceReviewRegistry.from_fixtures(
