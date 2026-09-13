@@ -141,8 +141,9 @@ four residents send messages about a broken elevator over time, mixed with unrel
 
 ### Challenges we ran into
 
-- Making disclosure authority live entirely outside the model — the Action agent's IAM role has
-  no read access to Core DynamoDB or the private evidence bucket at all.
+- Making disclosure authority live entirely outside the model, not just prompted away from it —
+  enforced as an IAM boundary the agent's role literally cannot cross, verifiable independent of
+  anything an LLM decides to do.
 - Getting deterministic disclosure right under real edge cases (revoked mandates racing an
   in-flight compile, forwarded duplicate evidence inflating corroboration) — now a named,
   ordered, fail-closed check per case, 22 steps deep.
@@ -166,12 +167,14 @@ four residents send messages about a broken elevator over time, mixed with unrel
   confirmed delivery to a real Gmail inbox.
 - A deterministic privacy compiler with a fully specified, documented 22-step evaluation order.
 - 31 accepted ADRs recording the hard calls, not written after the fact.
-- 227 backend test modules (unit, contract, Hypothesis property-based) plus 19 frontend test
-  files, including dedicated privacy-isolation and stale-conflict tests.
+- 5,721 backend tests passing (5,761 collected, 40 skipped, 0 failures) across unit, contract,
+  and Hypothesis property-based suites, plus 52 frontend tests passing across 17 files, including
+  dedicated privacy-isolation and stale-conflict tests. Full CI green end to end: ruff, mypy,
+  import-linter, architecture-link checks, license check, secret scan, frontend
+  lint/typecheck/build, E2E listing, and offline CDK synth.
 - Found and fixed a real AWS-only IAM defect during live deployment.
-- Three Strands-SDK agent runtimes, each with its own AgentCore runtime, endpoint, IAM role, and
-  isolated VPC subnet — code-complete and offline-synth-validated, pending only the open quota
-  case.
+- Three Strands-SDK agent runtimes, one AgentCore endpoint each — code-complete and
+  offline-synth-validated, pending only the open quota case.
 
 ### Judge-facing differentiation
 
@@ -240,18 +243,21 @@ recording. Target 2:30.
 
 Use if AgentCore/Nova remains blocked at recording time. Label every beat on screen as
 **LIVE AWS**, **LOCAL / deterministic**, or **CAPTURED FIXTURE — Nova blocked**. Never let a
-captured-fixture beat imply live agent execution. Target 2:30.
+captured-fixture beat imply live agent execution. Lead with the product problem, not the AWS
+provisioning blocker — the blocker is one honest beat, not the opening frame. Target 2:45,
+achievable in the 2:30–3:00 range.
 
 | Time | Beat | Label | Say |
 |---|---|---|---|
-| 0:00–0:20 | Cold open, honest framing | — | "Chorus's deterministic backbone is deployed and live on AWS right now. Its three reasoning agents are code-complete and IAM-isolated, waiting on an AWS Bedrock quota case we filed and are still waiting on — so this walkthrough labels every step honestly." |
-| 0:20–0:40 | Live reset & reseed of the DEMO namespace | **Live AWS** | "This is the deployed Reset Lambda, running now, against real DynamoDB and S3 — the same command we use before every rehearsal." |
-| 0:40–1:05 | Ambient feed → Monitor output | **Captured fixture** | "Nova 2 Lite is blocked at the account level right now, so this is captured output from our test suite — the exact typed contract the live agent returns, not a mockup." |
-| 1:05–1:25 | Private mandates | **Local, real deterministic code** | "There's no model in this step in production either — permission is always a human decision." |
-| 1:25–1:45 | Investigator output | **Captured fixture** | "Again — captured, not live, and labeled as such." |
-| 1:45–2:05 | Compile boundary walkthrough (code + docs, not a live invoke) | **Local / documented** | "We won't fake this by hand-typing a request into the deployed compiler — that would mean guessing at facts no real case has yet. Here's the exact 22-step evaluation it runs, and the reason codes it returns." |
-| 2:05–2:20 | Action proposal (captured) → approval UI (local) → direct SES canary send | **Captured** → **Local** → **Live AWS** | "The draft is captured. The send is not — this is the identical SES path we already proved live, sending for real, right now." |
-| 2:20–2:30 | Close on the blocker, framed forward | — | "Unblocking the quota case doesn't change a line of this code — it just turns every captured-fixture label in this video into a live call." |
+| 0:00–0:15 | Cold open on the problem | — | "One complaint is easy to ignore. Four residents email about a broken elevator over three weeks — into five separate inboxes that never talk to each other. Chorus finds that pattern without taking away anyone's control over what leaves their inbox." |
+| 0:15–0:30 | Honest framing | — | "Chorus's deterministic backbone is deployed and live on AWS right now. Its three reasoning agents are code-complete and IAM-isolated, waiting on a Bedrock quota case we filed and are still waiting on — so every step from here is labeled honestly." |
+| 0:30–0:50 | Live reset & reseed of the DEMO namespace | **Live AWS** | "This is the deployed Reset Lambda, running now, against real DynamoDB and S3 — the same command we use before every rehearsal." |
+| 0:50–1:15 | Ambient feed → Monitor output | **Captured fixture** | "Nova 2 Lite is blocked at the account level right now, so this is captured output from our test suite — the exact typed contract the live agent returns, not a mockup." |
+| 1:15–1:35 | Private mandates | **Local, real deterministic code** | "There's no model in this step in production either — permission is always a human decision." |
+| 1:35–1:55 | Investigator output | **Captured fixture** | "Again — captured, not live, and labeled as such." |
+| 1:55–2:20 | Compile boundary walkthrough (code + docs, not a live invoke) | **Local / documented** | "We won't fake this by hand-typing a request into the deployed compiler — that would mean guessing at facts no real case has yet. Here's the exact 22-step evaluation it runs, and the reason codes it returns." |
+| 2:20–2:35 | Action proposal (captured) → approval UI (local) → direct SES canary send | **Captured** → **Local** → **Live AWS** | "The draft is captured. The send is not — this is the identical SES path we already proved live, sending for real, right now." |
+| 2:35–2:45 | Close on the blocker, framed forward | — | "Unblocking the quota case doesn't change a line of this code — it just turns every captured-fixture label in this video into a live call." |
 
 ## 4. Recording shot list
 
