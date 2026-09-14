@@ -1,6 +1,6 @@
 # Frontend and deterministic demo architecture
 
-**Phase 11 reset correction:** [ADR-031](../adr/ADR-031-demo-reset-mutation-interlock.md)
+**Demo reset interlock:** [ADR-031](../adr/ADR-031-demo-reset-mutation-interlock.md)
 requires atomic normal-mutation fencing, registration/discovery of all Monitor-created cases,
 and refusal while an external-attempt reservation is unresolved. Reset rechecks durable replay
 under its lock and salts seed transaction tokens with its durable reset generation. The reset
@@ -130,7 +130,7 @@ No reset creates a report, fact, candidate case, assessment, mandate proposal/de
 
 ## The local composition root
 
-Before Phase 10 the only place an `ApiContainer` was constructed was `tests/contract/api/conftest.py`, so there was nothing a browser could be pointed at and nothing a Playwright run could drive. Phase 10 owns a real one.
+Without a composition root outside the test suite there would be nothing a browser could be pointed at and nothing a Playwright run could drive. The local composition root is that entry point for development and local demos.
 
 ```text
 src/chorus/composition/local.py        build_local_container(settings) -> ApiContainer
@@ -154,9 +154,9 @@ What it wires, and what each of those is:
 | clock | `LogicalDemoClock` seeded from the manifest | `SystemClock` |
 | dispatcher | `InProcessOperationDispatcher` | worker Lambda |
 
-It requires **no AWS credentials**, makes **no network call**, and reaches **no** SES, AgentCore, EventBridge, S3, or deployed DynamoDB. It also wires the five Phase-9 slots the previous composition left `None` — `verify_commitment`, `inbound_replies`, `record_commitment_due`, `demo_clock`, and `commitments` — which is what moves `POST /demo/external-replies`, `POST /demo/clock/advance`, and `POST .../verification` off their `503` and makes the last four steps of the hero flow reachable at all. Wiring them changes no Phase-9 semantics: the attester still authenticates the fixture through the trust boundary, the watcher still re-verifies every event field against the strongly loaded row, and verification still requires a resident persona owning an `ACTIVE` fact.
+It requires **no AWS credentials**, makes **no network call**, and reaches **no** SES, AgentCore, EventBridge, S3, or deployed DynamoDB. It also wires the five reply-and-commitment slots — `verify_commitment`, `inbound_replies`, `record_commitment_due`, `demo_clock`, and `commitments` — without which `POST /demo/external-replies`, `POST /demo/clock/advance`, and `POST .../verification` answer `503` and the last four steps of the hero flow are unreachable. Wiring them changes no commitment semantics: the attester still authenticates the fixture through the trust boundary, the watcher still re-verifies every event field against the strongly loaded row, and verification still requires a resident persona owning an `ACTIVE` fact.
 
-The environment gate is the existing `Settings.environment`. `build_local_container` refuses to construct outside `test`, `development`, or `demo`, so the fakes cannot be assembled in a deployed process by configuration accident. Phase 11 deploys this composition against real adapters; it does not write a second one.
+The environment gate is the existing `Settings.environment`. `build_local_container` refuses to construct outside `test`, `development`, or `demo`, so the fakes cannot be assembled in a deployed process by configuration accident. The deployed Lambda entry points under `functions/` do not reuse this root: each has its own composition root that wires the same application services to the AWS adapters its IAM role permits.
 
 ## Local hero smoke
 

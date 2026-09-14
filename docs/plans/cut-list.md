@@ -53,7 +53,7 @@ Each cut must update docs/tests/status before presentation. Cutting a UI embelli
 
 ## Kill criteria
 
-Remove/defer a planned optional item when it consumes more than half a day without directly advancing a phase exit criterion, introduces a new trust/data boundary, requires new credentials/external approval that is not already ready, or makes the five-minute critical path less deterministic. Stop the whole release/demo-send claim if any privacy/IAM/duplicate-send gate is nonzero, SES/AgentCore prerequisites are absent, or docs and behavior disagree materially.
+Remove/defer a planned optional item when it consumes more than half a day without directly advancing a release gate or the non-negotiable spine, introduces a new trust/data boundary, requires new credentials/external approval that is not already ready, or makes the five-minute critical path less deterministic. Stop the whole release/demo-send claim if any privacy/IAM/duplicate-send gate is nonzero, SES/AgentCore prerequisites are absent, or docs and behavior disagree materially.
 
 ## After V1
 

@@ -1,10 +1,10 @@
 # Coding-agent instructions for Ambient CHORUS
 
-## Mission and current phase
+## Mission
 
-Ambient CHORUS discovers recurring community problems and produces an evidence-backed external action without disclosing anything a contributor did not authorize. The architecture is frozen. The repository is currently in the **design phase**; do not implement application code until the user explicitly approves implementation.
+Ambient CHORUS discovers recurring community problems and produces an evidence-backed external action without disclosing anything a contributor did not authorize. The application, the local demo, and the AWS infrastructure code are implemented, and the architecture is frozen: any change to it starts with an accepted ADR.
 
-Read [docs/README.md](docs/README.md) before making changes. It is the source-of-truth index. Follow the authoritative documents in the dependency order listed there, then the accepted ADRs, then the implementation plans. If prose conflicts with an accepted ADR, the newer accepted ADR wins and the conflicting document must be corrected in the same change.
+Read [docs/README.md](docs/README.md) before making changes. It is the source-of-truth index. Follow the authoritative documents in the dependency order listed there, then the accepted ADRs, then the deployment, demo, risk, and scope documents in [docs/plans](docs/plans/). If prose conflicts with an accepted ADR, the newer accepted ADR wins and the conflicting document must be corrected in the same change.
 
 ## Hard security invariants
 
@@ -46,7 +46,7 @@ Any architecture-changing implementation requires an accepted ADR and updates to
 
 ## Implementation and test discipline
 
-Follow [docs/plans/build-order.md](docs/plans/build-order.md) and the active phase in [docs/plans/implementation-plan.md](docs/plans/implementation-plan.md). Implement the smallest vertical contract for the phase; do not pull future-phase scope forward.
+Implement the smallest change that satisfies the contract you are working on, and do not pull in scope the [cut list](docs/plans/cut-list.md) excludes.
 
 - Preserve typed IDs, UTC timestamps, optimistic versions, idempotency keys, and structured errors end to end.
 - Time, UUID generation, agent invocation, storage, and external side effects must be injected behind narrow ports in deterministic tests.
@@ -55,24 +55,32 @@ Follow [docs/plans/build-order.md](docs/plans/build-order.md) and the active pha
 - Never include raw messages, health details, apartment numbers, private URIs, email addresses, or agent prompt/completion bodies in normal logs.
 - Never weaken an invariant to make a test or demo pass.
 
-Expected validation after Phase 0 defines the commands:
+Validation mirrors CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)):
 
 ```text
-uv run ruff check .
+uv sync --frozen
+npm ci
 uv run ruff format --check .
-uv run mypy src tests
+uv run ruff check .
+uv run mypy src tests infra tools apps/api runtimes
+uv run lint-imports
 uv run pytest
-npm --prefix apps/web run lint
-npm --prefix apps/web run test
-npm --prefix apps/web run build
-npm exec cdk -- --app "uv run python -m infra.cdk.app" synth
+uv run python tools/check_architecture_links.py
+uv run python tools/check_license.py
+uv run python tools/check_secrets.py
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npm run e2e:list
+npm run cdk:synth:offline
 ```
 
-If a command is not yet available in the current phase, say so; do not invent successful validation.
+CI runs the persistence contract tests against DynamoDB Local with `CHORUS_REQUIRE_DYNAMODB_LOCAL=1`. Locally, start it with `docker compose up dynamodb-local`; without it those tests skip. `npm run cdk:synth` (without `:offline`) is deployment-capable and fails closed without real deployment inputs. If you could not run a command, say so; do not invent successful validation.
 
 ## Change hygiene
 
-- Keep commits scoped to one implementation phase or coherent correction.
+- Keep each commit to one coherent change or correction.
 - Run the relevant validation before proposing a commit.
 - Do not commit generated secrets, `.env`, resident data, private evidence, local outboxes, or CDK assets.
 - Do not commit or amend unless explicitly asked. Never push automatically.

@@ -1,55 +1,57 @@
-# Phase 11 deployment contract
+# AWS deployment contract
 
-The frozen deployment contract for Phase 11 — AWS deployment and AgentCore hardening. It adds no
-product decision. Every semantic here is already frozen in [ADR-010](../adr/ADR-010-agentcore-runtime.md),
+How Ambient CHORUS is deployed to AWS: identity, region, model access, AgentCore runtimes, network,
+IAM, storage, SES, reset, configuration, the live canary matrix, stack order, cost, and acceptance.
+It adds no product decision. Every semantic here is already frozen in
+[ADR-010](../adr/ADR-010-agentcore-runtime.md),
 [ADR-018](../adr/ADR-018-safe-evidence-and-compile-commit.md) through
-[ADR-028](../adr/ADR-028-deadline-watcher-and-scheduler-boundary.md), and
+[ADR-031](../adr/ADR-031-demo-reset-mutation-interlock.md), and
 [02-trust-iam-deployment-configuration.md](../architecture/02-trust-iam-deployment-configuration.md);
-what this document freezes is *how the already-decided system is deployed*, in what order, under
-which identity, and what must be proved live before Phase 11 is accepted.
+what this document fixes is *how the already-decided system is deployed*, in what order, under
+which identity, and what must be proved live before the deployment is accepted (§ 20).
 
-**ADR-029 and ADR-030 are Accepted.**
-[ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md) freezes the deployed demo clock.
-[ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md) (the live SES receipt path) was Accepted
-on 2026-09-10 for Phase 11 Macro B, covering the single S3 action receipt topology, pinned S3
-reader, and corrected envelope decoding.
+[ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md) freezes the deployed demo clock, and
+[ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md) freezes the live SES receipt path: the single
+S3 action receipt topology, the pinned S3 reader, and corrected envelope decoding.
 
-**Status: NOT READY TO DEPLOY.** § 21 classifies every outstanding item. Four are user
-prerequisites; the rest are implementation work, most of which can begin offline today.
+**Current state:** seven of the eleven stacks are deployed and verified in `us-east-1`; the three
+agent runtimes are blocked on AWS account provisioning. § 21 has the full breakdown.
 
-## 1. What Phase 11 owns, exactly
+## 1. What is deployed
 
-Phase 11 is the **static-now / live-in-Phase-11** split cashed out. Phases 5–10 built every
-artifact, its role, its policy, its log group, and its static template assertion, and deployed
-none of them.
+Eleven CDK stacks. Every stack is created for the frozen region `us-east-1`
+(`Environment(region=…)`; `CdkBuildConfig` rejects any other region), and cross-stack references use
+**actual resource ARNs** (`Fn::ImportValue`), never independently constructed literals.
 
-**Identity / data / log / queue resources** (Phases 5–10): 7 stacks, ~39 resources — 3 tables,
-2 evidence buckets, 2 KMS keys, 8 IAM roles, 6 log groups, the schedule group, the DLQ + its
-key, the DLQ alarm, and the SES configuration set. Zero AgentCore runtime, zero SES identity,
-zero web.
+| Stack | Holds |
+|---|---|
+| `AmbientChorusFoundation` | no resources; a toolchain-compatibility stack |
+| `AmbientChorusNetwork` | one VPC with two isolated subnets in two configured AZs, no NAT/IGW/EIP, six interface and two gateway endpoints, and the endpoint and workload security groups (§ 7) |
+| `AmbientChorusData` | the Core, Shareable, and Audit tables; the private and export evidence buckets and their separate KMS keys; the `chorus-agent-artifacts-{env}` bucket (§ 6, § 9) |
+| `AmbientChorusAgents` | the Monitor, Investigator, and Action AgentCore runtimes with their `live` endpoints, application inference profiles, roles, and log groups (§ 4, § 5) |
+| `AmbientChorusCompiler` | the compiler Lambda: the sole creator of views and the send-fence authority |
+| `AmbientChorusSender` | the sender Lambda and the `chorus-demo` SES configuration set (§ 10.1) |
+| `AmbientChorusWatcher` | the commitment watcher Lambda and its `live` alias, the schedule group, the scheduler execution role, and the DLQ with its alarm |
+| `AmbientChorusApplication` | the HTTP API (payload format 2.0), the API Lambda, and the operation worker Lambda (§ 14) |
+| `AmbientChorusInbound` | the SES receipt rule set and rule, the SNS topic, and the inbound-mail Lambda (§ 10.2) |
+| `AmbientChorusReset` | the operator-only DEMO reset Lambda and its narrow role (§ 12) |
+| `AmbientChorusObservability` | a Lambda error alarm per deployed function and one `chorus-{env}` dashboard (§ 19) |
 
-**Phase 11 batch 5 (offline) adds compute and the ingress**, and after the review repair the
-synthesized offline app was **7 stacks, ~55 resources** (Macro A takes it to 10 — see the
-Macro A note below). The five production Lambdas synthesize
-under their **pre-existing** execution roles and dedicated log groups — `chorus-api-{env}`,
-`chorus-worker-{env}` and the HTTP API in `AmbientChorusApplication`; `chorus-compiler-{env}`,
-`chorus-sender-{env}`, and `chorus-commitment-watcher-{env}` in their own stacks — Python 3.12,
-x86-64 (no Lambda architecture is frozen; x86-64 is the least-risky choice for the existing
-dependency closure, and AgentCore's ARM64 decision is untouched), each with a physical name
-taken directly from the configured environment string. Every deployment stack is created for the
-frozen region `us-east-1` (`Environment(region=…)`; `CdkBuildConfig` rejects any other region).
-The watcher gains a published `Version` and an `Alias` named exactly `live`; the API Gateway v2
-**HTTP API** gains one `$default` proxy integration at **payload format version 2.0** and its
-`$default` stage with auto-deploy. The compiler / sender / watcher-alias are named by their
-**actual resource ARNs** (cross-stack `Fn::ImportValue`), not independently constructed
-literals; the demo-access / cursor-signing / destination-registry **secret identities** (ARNs
-only — no value synthesized) and the scheduler identity are wired by `infra/cdk/app.py`.
+Seven Python 3.12 Lambda functions run on x86-64 — no Lambda architecture is frozen, x86-64 is the
+least-risky choice for the existing dependency closure, and AgentCore's ARM64 decision is
+untouched. Each runs under its own execution role and dedicated log group, with a physical name
+taken from the configured environment string (`chorus-api-{env}`, `chorus-worker-{env}`,
+`chorus-compiler-{env}`, `chorus-sender-{env}`, `chorus-commitment-watcher-{env}`,
+`chorus-demo-reset-{env}`, and the inbound-mail function). The worker, compiler, sender,
+inbound-mail, and reset functions are VPC-attached; the API and watcher deliberately are not (§ 7).
+The watcher publishes a `Version` and an `Alias` named exactly `live`, and the HTTP API has one
+`$default` proxy integration at payload format version 2.0 with an auto-deployed `$default` stage.
 
 Only the **worker** carries the three AgentCore runtime-endpoint ARNs — it is the only function
 that invokes an agent. The API, compiler, sender, and watcher carry `agent_mode=agentcore` (a
-demo-wide invariant) and nothing else AgentCore: the "and all six runtime/profile ARNs" clause
-moved out of the global `Settings` validator into the worker's own settings mapper. No batch-5
-component consumes a model-profile ARN.
+demo-wide invariant) and nothing else AgentCore, and no Lambda consumes a model-profile ARN. The
+demo-access, cursor-signing, and destination-registry **secret identities** (ARNs only — no value
+is synthesized) and the scheduler identity are wired by `infra/cdk/app.py`.
 
 **Two synthesis modes, chosen explicitly.** Deployment-capable mode (the default for
 `python infra/cdk/app.py` / `build_app()`) refuses a missing Lambda ZIP and a synthetic /
@@ -64,71 +66,32 @@ that sets `-c offline_synth=true`); the plain `npm run cdk:synth` remains deploy
 fails closed.
 
 **Deployment artifacts** are built by `tools/build_lambda_artifacts.py` from `uv.lock`
-(`--no-default-groups`, `--python-platform x86_64-manylinux_2_28`, `--only-binary :all:`) and
-gated: the repository's own credential patterns over the first-party files (zero exceptions) and
-over the final ZIP, an ELF `e_machine` check over every shared object including versioned
-libraries (`libjpeg-*.so.62`), and a narrow per-match suppression for exactly one pinned
-`PIL/ImageFont.py` false positive. A clean-checkout release gate (session fixture; run for real
-on the CI Linux/Python-3.12 runner) builds all five ZIPs into a temp directory and scans the
-finished ZIPs on every platform. On **Linux/x86-64** it additionally unpacks each ZIP and runs
-a fresh `python -S -E` whose `sys.path` is rebuilt to **only** the extracted archive plus the
-interpreter's own standard-library directories (discovered via `sysconfig` — `stdlib`,
-`platstdlib`, `lib-dynload`): the handler, `chorus`, `pydantic_core` and its compiled
-`_pydantic_core`, and `PIL` for the compiler then resolve from the **archive** while
-`importlib` / `json` / `pathlib` resolve from **Python itself**, with the repository checkout,
-`.venv`, host site-packages, user site, `PYTHONPATH`, and all network access excluded. On any
-other platform (the developer's Windows machine) that last step is a documented `sys.platform`
-skip; this repair was **verified for structure, ELF, secret scan, and determinism on Windows
-and has not been executed on the Windows machine's Linux probe.**
+(`--no-default-groups`, `--python-platform x86_64-manylinux_2_28`, `--only-binary :all:`), one ZIP
+per function, and gated: the repository's own credential patterns over the first-party files (zero
+exceptions) and over the final ZIP, an ELF `e_machine` check over every shared object including
+versioned libraries (`libjpeg-*.so.62`), and a narrow per-match suppression for exactly one pinned
+`PIL/ImageFont.py` false positive. Deployment-capable synthesis fails closed
+(`LambdaArtifactMissingError`) when a ZIP is missing. A clean-checkout release gate builds every
+ZIP into a temporary directory and scans the finished archives on every platform. On
+**Linux/x86-64** it additionally unpacks each ZIP and runs a fresh `python -S -E` whose `sys.path`
+is rebuilt to **only** the extracted archive plus the interpreter's own standard-library
+directories (discovered via `sysconfig` — `stdlib`, `platstdlib`, `lib-dynload`): the handler,
+`chorus`, `pydantic_core` and its compiled `_pydantic_core`, and `PIL` for the compiler then
+resolve from the **archive** while `importlib` / `json` / `pathlib` resolve from **Python itself**,
+with the repository checkout, `.venv`, host site-packages, user site, `PYTHONPATH`, and all network
+access excluded. On any other platform, including Windows, that last step is a documented
+`sys.platform` skip. The AgentCore runtime artifacts are built separately (§ 5) and published by
+`tools/publish_runtime_artifacts.py`.
 
-**Phase 11 Macro A (offline) adds the network foundation, the VPC Lambda attachment, the reset
-authority, and base observability.** The synthesized offline app is now **10 stacks**:
-`AmbientChorusNetwork` (one VPC, two isolated subnets in two configured AZs, no NAT/IGW/EIP,
-six interface + two gateway endpoints, endpoint and workload security groups); the worker,
-compiler, and sender `Function`s gain a `VpcConfig` on those two subnets and exact inline ENI
-IAM (no `AWSLambdaVPCAccessExecutionRole`) — the API and watcher deliberately stay out;
-`AmbientChorusReset` (a dedicated `chorus-demo-reset-{env}` role and function, VPC-attached, no
-public route, every grant bounded to the delimiter-aware `["NS#DEMO", "NS#DEMO#*"]` grammar and
-`ns/DEMO/*`) with the **full deployed reset semantics** — `chorus.composition.deployed_demo_reset`
-runs the frozen manifest-driven sequence (persisted `DemoManifest`, `DEMO_RESET_LOCK`, durable
-idempotent replay, bounded no-scan partition/prefix/schedule purge, the ADR-029 § 3
-generation-fenced clock reseed, post-purge verification) against production adapters and calls
-the **shared** `DemoResetService` seed/receipt; and `AmbientChorusObservability` (a Lambda error
-alarm per deployed function and one `chorus-{env}` dashboard). Review R1–R5 repaired the ENI IAM
-(`SourceFunctionArn` on the code-blocking DENY, not the service-side ALLOW), the exact DEMO
-namespace grammar, the bounded AgentCore S3 endpoint exception, and the reset S3/KMS access.
-
-**Still absent:** the three AgentCore Runtime resources and their inference profiles, the
-artifact **upload**, the inbound-mail Lambda and the ADR-030 SES receipt path, AgentCore
-runtime alarms, the `DemoManifestRegistrar` call-site wiring into the dynamic-entity creation
-paths (a named implementation seam — the port and adapter exist), live canaries, and any live
-deployment. **The compute resources exist only in an offline synthesis; deployment remains
-blocked** by the AgentCore/inbound stacks and the user prerequisites in § 21.
-
-**What already exists in code and must be credited rather than rebuilt.** The AWS adapters are
-written, typed, and tested: `DynamoDbStorageDriver` and the three repositories, `S3ObjectStore`,
-`SesV2EmailSender` with its outcome classifier, `EventBridgeDeadlineScheduler` (frozen
-`FlexibleTimeWindow=OFF`, `ActionAfterCompletion=DELETE`, `ClientToken`, max age 3600 s, max
-retries 3, DLQ target, and classified-never-raised outcomes), `Boto3AgentCoreInvoker`,
-`CompilerSendAuthorization`, and the full inbound attester/verifier. Phase 11 does not write
-adapters. It writes the six things that bind them to AWS:
-
-1. ~~**the AgentCore HTTP server binding**~~ — **done** (§ 5). All three `runtime.toml` now
-   declare `server_binding = "IMPLEMENTED"`, bound to a bare ASGI application on the already-locked
-   `uvicorn`; `bedrock-agentcore` is still not a dependency and the binding does not import it;
-2. **Lambda handlers** — `functions/*` contains composition roots and **no `handler`**; there is
-   no ASGI adapter (`mangum` is absent) and no Secrets Manager client anywhere in the repository;
-3. **a deployed composition root** — `build_local` constructs `InMemoryStorageDriver` itself and
-   refuses any driver that is not `NamespaceStorePurge`;
-4. **the `InboundMailTransportAuthenticator`** ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md) § 1);
-5. **the `SesEventTransportAuthenticator`** ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 10);
-6. **the artifact build/publish pipeline and the deploy/canary CLI.**
-
-**Documentation correction.** [11-frontend-and-demo.md](../architecture/11-frontend-and-demo.md)
-says "Phase 11 deploys this composition against real adapters; it does not write a second one."
-`build_local` cannot do that. Phase 11 either parameterises it by adapter set or adds
-`chorus.composition.aws`; the sentence must be corrected in the same change. No wiring, port, or
-invariant changes either way.
+**The AWS adapters are written, typed, and tested:** `DynamoDbStorageDriver` and the three
+repositories, `S3ObjectStore`, `SesV2EmailSender` with its outcome classifier,
+`EventBridgeDeadlineScheduler` (frozen `FlexibleTimeWindow=OFF`, `ActionAfterCompletion=DELETE`,
+`ClientToken`, max age 3600 s, max retries 3, DLQ target, and classified-never-raised outcomes),
+`Boto3AgentCoreInvoker`, `CompilerSendAuthorization`, the full inbound attester/verifier, and
+`SesReceiptTransportAuthenticator`. The deployment binds them to AWS through the AgentCore HTTP
+server binding (§ 5), one Lambda handler and composition root per function under `functions/`
+(§ 14), and the artifact tools above. The local composition root (`chorus.composition.local`) is
+never deployed; the deployed composition roots are separate.
 
 ## 2. Deployment identity
 
@@ -172,7 +135,7 @@ equals `Account`, **stop**: no deploy, no bootstrap, no resource. The deploy CLI
 and exits non-zero; a shell habit is not a control. The same check refuses an account other than
 the frozen one.
 
-Current state: the local CLI session is expired, so no identity can be verified right now (P1).
+Verify the identity before every deploy (P1 in § 21).
 
 ## 3. Region and account
 
@@ -220,8 +183,8 @@ sets:
 - **A.** that agent's exact application inference profile ARN, taken from a deployment output.
   **Never constructed from a name**: an application inference profile ARN ends in a
   service-generated identifier, and a synthesized ARN built from `chorus-monitor-demo` names
-  nothing. The existing `_default_profile_arn` helper is a placeholder and must be replaced by
-  discovery.
+  nothing. The ARN is read from the `CfnApplicationInferenceProfile` resource the agents
+  stack creates.
 - **B.** the foundation-model ARNs the US geographic profile routes to, **condition-bound to that
   exact inference profile** so the grant is usable only through the profile it belongs to:
 
@@ -262,12 +225,11 @@ concrete failure; a model change needs evaluation evidence and an ADR, per
 Verified against the installed **`aws-cdk-lib 2.267.0`**:
 
 - **The construct is `aws_bedrockagentcore.Runtime`.** `AgentCoreRuntime` is *not* the construct —
-  it is the runtime-environment class supplying `PYTHON_3_10 … PYTHON_3_14 | NODE_22`. The earlier
-  draft named it as the construct and was wrong.
+  it is the runtime-environment class supplying `PYTHON_3_10 … PYTHON_3_14 | NODE_22`.
 - Artifact: `AgentRuntimeArtifact.from_s3(s3.Location(bucket_name=…, object_key=…),
   AgentCoreRuntime.PYTHON_3_12, ["python", "main.py"])`. Direct-code Python 3.12 from an S3 zip;
-  **no ECR image required**. The command is the frozen minimum start command below, not the OTEL
-  wrapper this line used to show.
+  **no ECR image required**. The command is the frozen minimum start command below, not an OTEL
+  wrapper.
 - Authorizer: `RuntimeAuthorizerConfiguration.using_iam()` (Python snake_case for `usingIAM`);
   it is also the default.
 - Network: `RuntimeNetworkConfiguration.using_vpc(scope, vpc=…, security_groups=…, vpc_subnets=…)`.
@@ -310,7 +272,7 @@ that runtime's own handler. It is a bare ASGI application (`runtimes/server.py`)
 closure** — `strands-agents → mcp → sse-starlette → uvicorn` — so two routes cost fifty lines and
 no wheel. `bedrock-agentcore` is not a dependency and the binding does not import it.
 
-**Entrypoint command: `["python", "main.py"]`.** Corrected from
+**Entrypoint command: `["python", "main.py"]`**, not
 `["opentelemetry-instrument", "main.py"]`. `uv pip install --target` resolves *wheels* for the
 declared platform but generates console-script launchers for the **build host**, so a Windows
 build writes `bin/opentelemetry-instrument.exe` — unusable on Linux/ARM64, and `bin/` is not on
@@ -374,14 +336,15 @@ Three runtimes, three roles, three log groups, three profiles. No Graph, no swar
 no agent-to-agent invocation — already an IAM fact via the `bedrock-agentcore:InvokeAgentRuntime`
 deny on all three roles.
 
-## 6. AgentCore artifact loading, and the deny that currently blocks it
+## 6. AgentCore artifact loading and the S3 deny split
 
-**A defect in the synthesized agent policy.** Each runtime role is granted `s3:GetObject` on its
-own artifact prefix and, in the same policy, denied `s3:GetObject` on `Resource: "*"` as part of
-`DENIED_DATA_PLANE_ACTIONS`. **An explicit deny always wins.** As synthesized, every agent runtime
-is denied its own artifact and cannot cold-start.
+**Why the deny is split.** Each runtime role is granted `s3:GetObject` on its own artifact
+prefix. A blanket `s3:GetObject` deny on `Resource: "*"` in the same policy — which the agent
+policy originally carried as part of `DENIED_DATA_PLANE_ACTIONS` — would override that grant,
+because **an explicit deny always wins**: every agent runtime would be denied its own artifact
+and could not cold-start.
 
-**The repair, which weakens no isolation.** Split the one blanket S3 deny into two:
+**The split, which weakens no isolation.** The one blanket S3 deny becomes two:
 
 ```text
 DenyEvidenceObjects   DENY  s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket
@@ -402,8 +365,10 @@ DynamoDB denies are untouched.
 - the **AWS service-owned code bucket** AgentCore reads during cold start. Its ARN is not ours to
   enumerate, so the **S3 gateway endpoint policy must not be a closed allowlist of our own
   buckets**. It admits (a) `s3:GetObject` on the artifact bucket's agent prefixes, (b)
-  `s3:GetObject`/`s3:PutObject` on the two evidence buckets, and (c) `s3:GetObject` on the
-  service-owned AgentCore code path. A gateway endpoint policy that named only (a) and (b) would
+  `s3:GetObject`/`s3:PutObject` on the two evidence buckets (plus the delete and prefix-constrained
+  list actions the reset role needs), and (c) `s3:GetObject` on the service-owned AgentCore code
+  path — the regional `arn:aws:s3:::acr-code-*-us-east-1-an/*` pattern, admitted only when
+  `aws:PrincipalServiceName` is `bedrock-agentcore.amazonaws.com`. A gateway endpoint policy that named only (a) and (b) would
   produce a cold-start failure that reads as a runtime error, and this is the one place where an
   over-tight endpoint policy is silently fatal. Endpoint policy is defence in depth; the role
   policies remain the authority.
@@ -419,12 +384,12 @@ subnets are placed by resolving the supported AZ IDs into this account's names
 the resulting names in deploy config. Choosing `us-east-1a`/`us-east-1b` by name and hoping is how
 this fails in a fresh account.
 
-## 7. Network design and the corrected endpoint matrix
+## 7. Network design and the endpoint matrix
 
 [ADR-010](../adr/ADR-010-agentcore-runtime.md) freezes AgentCore VPC mode in two isolated subnets
 with no NAT and no internet route, and all three manifests declare `network_mode = "VPC"`. **That
 is the reason there is no NAT gateway** — the egress boundary is a frozen security decision.
-Cost is a consequence, not the justification, and the earlier draft had that backwards.
+Cost is a consequence, not the justification.
 
 **Which components actually need VPC placement.** Not all of them, and the default is *out*:
 
@@ -470,16 +435,16 @@ calls:
   inbound notification path is implemented over SNS or SQS, the corresponding endpoint is added
   *then*, with the code that needs it.
 
-**Required interface endpoints: 6. Gateway endpoints: 2 (free). Conditional: 2.** The earlier
-draft listed nine interface endpoints including KMS, STS-adjacent, and logs; that inventory was
-wrong.
+**Required interface endpoints: 6. Gateway endpoints: 2 (free). Conditional: 2.** Every workload
+security group sets `allow_all_outbound=False`; its only egress is TCP 443 to the endpoint
+security groups and to the S3 and DynamoDB managed prefix lists.
 
 **No NAT** unless a real service dependency proves it impossible. None has.
 
-## 8. IAM — corrections
+## 8. IAM
 
-Eight roles exist and synthesize. Phase 11 makes **five** corrections, each a repair of something
-already frozen in `02`, not a new decision.
+Each subsection is a repair of, or an addition to, something already frozen in `02`, not a new
+decision.
 
 ### 8.1 Split the API and worker principals
 
@@ -499,14 +464,13 @@ unassertable and hands the request-path role the agent-invoke grant.
 agent-invoking operation is dispatched to the worker and returns 202. If a route is ever found
 that needs it, that is a design change, not a grant to add quietly.
 
-Both roles are missing `lambda:InvokeFunction` and `secretsmanager:GetSecretValue` entirely today
-— neither is granted anywhere in the application stack. Both are added with exact function and
-secret ARNs.
+Every `lambda:InvokeFunction` and `secretsmanager:GetSecretValue` grant names an exact function or
+secret ARN, taken from the created resources and the configured secret identities (§ 1).
 
 ### 8.2 Repair the compiler's Shareable read authority
 
-**The compiler role has no Shareable read grant at all.** It holds `WriteViewPrefixesOnly` and
-nothing else on that table. But the send-authorization service — which runs *inside the compiler
+**The compiler role was first synthesized with no Shareable read grant at all** — only
+`WriteViewPrefixesOnly`. But the send-authorization service — which runs *inside the compiler
 Lambda*, invoked by the sender through `CompilerSendAuthorization` — reads:
 
 | Call | Shareable partition |
@@ -517,12 +481,11 @@ Lambda*, invoked by the sender through `CompilerSendAuthorization` — reads:
 | `load_proposal` | `NS#*#ACTION#*` |
 | `load_approval` | `NS#*#ACTION#*` |
 
-and `CompileView` reads the first two. Every one fails with `AccessDenied` in the deployed system.
-The send fence can never be acquired, so **no send can ever happen** and the demo's 3:00–3:45
-segment is impossible.
+and `CompileView` reads the first two. Without a read grant every one fails with `AccessDenied` in
+the deployed system: the send fence can never be acquired, so **no send can ever happen**.
 
 `02` § IAM already says `Compiler Lambda | … | R(all safe)/W(view only)`. The document is right;
-the CDK is missing the read. **This is a code defect, not a design change, and needs no ADR.**
+the CDK was missing the read. **That was a code defect, not a design change, and needed no ADR.**
 
 The repair, narrower than the document requires and sufficient for every call above:
 
@@ -556,30 +519,34 @@ Per § 6.
 
 ### 8.6 Lambda VPC execution permissions — an honest wildcard
 
-Every VPC-attached Lambda role needs the six ENI operations:
-`ec2:CreateNetworkInterface`, `DescribeNetworkInterfaces`, `DeleteNetworkInterface`,
-`AssignPrivateIpAddresses`, `UnassignPrivateIpAddresses`, `DescribeSubnets`.
+Every VPC-attached Lambda role — worker, compiler, sender, inbound mail, and reset — needs the six
+ENI operations: `ec2:CreateNetworkInterface`, `DescribeNetworkInterfaces`,
+`DeleteNetworkInterface`, `AssignPrivateIpAddresses`, `UnassignPrivateIpAddresses`,
+`DescribeSubnets`.
 
 **These require `Resource: "*"`.** `CreateNetworkInterface` acts on a resource that does not exist
 yet, and the `Describe*` calls are not resource-scoped at all. This is an AWS-imposed wildcard, and
-the earlier draft's claim that X-Ray was the only legitimate allow wildcard was wrong.
+it is bounded by four inline statements per role (`infra/cdk/network_support.py`) rather than by
+the managed `AWSLambdaVPCAccessExecutionRole`:
 
-It is constrained rather than merely admitted:
+| Statement | Effect | Actions | Condition |
+|---|---|---|---|
+| `AllowCreateVpcEni` | Allow | `ec2:CreateNetworkInterface` | none: ENI creation is a Lambda service operation, and a subnet condition there is ineffective |
+| `AllowManageVpcEni` | Allow | `ec2:DeleteNetworkInterface`, `ec2:AssignPrivateIpAddresses`, `ec2:UnassignPrivateIpAddresses` | `StringEquals ec2:Subnet` = the two isolated subnet ARNs |
+| `AllowDescribeVpcEni` | Allow | `ec2:DescribeNetworkInterfaces`, `ec2:DescribeSubnets` | none: unconditioned reads of non-sensitive network metadata |
+| `DenyVpcEniFromFunctionCode` | **Deny** | all six | `ArnEquals lambda:SourceFunctionArn` = this exact function |
 
-```jsonc
-"Condition": {
-  "ArnEquals":   { "lambda:SourceFunctionArn": "<this function's ARN>" },
-  "StringEquals":{ "ec2:Subnet": ["<subnet-a>", "<subnet-b>"] }
-}
-```
+**No `lambda:SourceFunctionArn` appears on any Allow.** AWS injects that key for requests that
+originate inside the function's own code, not for the ENI management the Lambda service performs
+on the function's behalf, so the key on an Allow makes VPC attachment fail. On the Deny it fires
+only for ENI calls the function's code makes itself. The API and watcher roles receive none of
+these statements, because they are not in the VPC (§ 7).
 
-`lambda:SourceFunctionArn` binds the permission to calls the Lambda service makes on this
-function's behalf, so function code that reached for `ec2:CreateNetworkInterface` itself would be
-denied. Where `ec2:Subnet` is not supported for a given action, `lambda:SourceFunctionArn` alone
-carries it. `DescribeSubnets` and `DescribeNetworkInterfaces` remain unconditioned reads of
-non-sensitive network metadata; that is stated rather than dressed up.
+A defect in these grants surfaced only in the first live deployment — VPC-attached Lambdas lacked
+permission for the ENI operations the Lambda service performs on their behalf — although synthesis
+and offline review both looked correct. The statements above are the repair.
 
-### 8.9 Two contradictions, resolved exactly (Phase 11 batch 4)
+### 8.9 Two contradictions, resolved exactly
 
 Building the production handlers surfaced two places where the frozen composition and the frozen
 policy disagreed. Both are resolved here, narrowly, and each resolution is asserted from the
@@ -630,7 +597,7 @@ DenyWorkerDemoClockWrites DENY   PutItem, UpdateItem, DeleteItem, ConditionCheck
 The table-wide `ReadShareable` statement both principals already hold reached this row; the
 positive statement makes the authority **stated and assertable** rather than incidental, and the
 deny makes "the worker cannot move logical time" an explicit refusal rather than the absence of
-a grant. **This amends ADR-029 § 2's principal table for the worker row and nothing else.**
+a grant. **ADR-029's accepted amendment records this change to the worker row.**
 
 **C. The API's clock write, and the watcher's clock read.**
 
@@ -655,20 +622,18 @@ anywhere" sentence untouched, which is why it is not amended here.
 `NS#*#CLOCK*` anywhere, template tests sweep for one on every role that touches the partition,
 and a policy containing one fails review.
 
-### 8.10 The compiler's clock authority, and the wall/logical split for scheduling (Phase 11 batch 4 repair)
+### 8.10 The compiler's clock authority, and the wall/logical split for scheduling
 
-An independent review found two further places where a clock-domain mismatch had reached
-production code. Both are resolved here, but **the amendment itself lives in ADR-029, not in
-this document** — a plan cannot override an accepted ADR under
-[docs/README.md](../README.md)'s own precedence order, so a prior version of this section that
-claimed to "amend ADR-029 § 2's principal table" was itself the defect a later review caught.
-[ADR-029 § "Accepted Phase 11 batch 4 amendment"](../adr/ADR-029-deployed-demo-clock-authority.md#accepted-phase-11-batch-4-amendment)
+Two further places where a clock-domain mismatch had reached production code are resolved here,
+but **the amendment itself lives in ADR-029, not in this document** — this contract cannot
+override an accepted ADR under [docs/README.md](../README.md)'s own precedence order.
+[ADR-029's accepted amendment](../adr/ADR-029-deployed-demo-clock-authority.md#accepted-phase-11-batch-4-amendment)
 is the authoritative principal table; everything below describes the same two repairs and the
 IAM template that implements them, and restates that table only for convenience.
 
 **D. The compiler genuinely requires authoritative logical time, read-only.**
 
-Unresolved architectural question 0 (below) asked what clock the deployed compiler stamps a view
+The question was what clock the deployed compiler stamps a view
 with. `functions/compiler/handler.py` supplied `SystemClock`, so a compiled view's
 `generated_at` and `expires_at` were wall-clock instants while the case world runs on the demo
 logical clock, seeded at `2030-01-14`. A caller comparing a view's expiry against logical time —
@@ -745,7 +710,7 @@ is the authoritative version if the two ever appear to disagree:**
 
 | Wildcard | Where | Justification |
 |---|---|---|
-| `ec2:*NetworkInterface*` on `*` | five VPC-attached Lambda roles | AWS-imposed; constrained by `lambda:SourceFunctionArn` and `ec2:Subnet` |
+| `ec2:*NetworkInterface*` on `*` | five VPC-attached Lambda roles | AWS-imposed; `ec2:Subnet` on the management allow, and a `lambda:SourceFunctionArn` deny against function code (§ 8.6) |
 | `xray:PutTraceSegments` on `*` | agent runtimes | no resource-level ARN exists for segment submission |
 | `Resource: "*"` on every DENY | all roles | a deny is only meaningful when it covers everything |
 | `dynamodb:*`, `s3:PutObject/DeleteObject/ListBucket`, `bedrock:*`, `scheduler:*` inside DENY | sender, watcher, agents | an action wildcard inside a deny is the strongest form |
@@ -763,15 +728,15 @@ every event field against a strongly loaded row; the watcher's Core deny stays *
 ([ADR-029](../adr/ADR-029-deployed-demo-clock-authority.md)); no `dynamodb:UpdateItem` and no
 blanket `dynamodb:TransactWriteItems` anywhere.
 
-## 9. S3 and KMS — a write defect that fails every object write
+## 9. S3 and KMS
 
 `S3ObjectStore` calls `put_object(..., ServerSideEncryption="aws:kms")` for both the inbound raw
-MIME and the export evidence derivative, and **omits `SSEKMSKeyId`**. The bucket policy denies
+MIME and the export evidence derivative, and **must pass `SSEKMSKeyId`**. The bucket policy denies
 `s3:PutObject` when `s3:x-amz-server-side-encryption-aws-kms-key-id` does not equal the exact key
 ARN — and an **absent** condition key does not equal the value, so `StringNotEquals` evaluates
 true and the deny fires.
 
-**Every private and export object write returns `AccessDenied` in the deployed system.** No safe
+**Without it, every private and export object write returns `AccessDenied` in the deployed system.** No safe
 evidence derivative can be written, so no compile can commit; no raw MIME can be stored, so no
 reply can be ingested. Nothing in local testing catches it, because no local path evaluates a
 bucket policy.
@@ -821,13 +786,13 @@ scheduler event's own timestamp.
 - `from_identity_id` stays the opaque `chorus-demo-sender`; only the sender resolves an address,
   from its own secret.
 
-**SES production access is NOT a Phase 11 prerequisite.** Corrected. In the sandbox, both sender
+**SES production access is NOT a deployment prerequisite.** In the sandbox, both sender
 and recipient must be verified identities — and in this demo both are ours. The sandbox caps
 apply (200 messages/24 h, 1 msg/s), and the demo sends one. Production access is **optional and
 desirable** for flexibility (sending to an unverified judge address, higher rate) and is worth
 requesting early, but the hero flow does not depend on it and it does not gate acceptance.
 
-**Phase 8 semantics are unchanged by deployment.** At most one deliberate attempt per approval;
+**Send semantics are unchanged by deployment.** At most one deliberate attempt per approval;
 `DRAFT → APPROVED → SENDING`; ambiguity classifies as `SEND_UNKNOWN`, never as failure and never
 as success; **no automatic retry after an ambiguous send**; `claim_owner_hash` ownership; the
 fence acquired and released through the compiler's typed operation; final authorization
@@ -839,7 +804,8 @@ event destination publishing `Send`, `Delivery`, and `Rendering Failure` to the 
 a rule on `source = aws.ses` targets the reconciliation entry point of the worker. EventBridge is
 chosen over SNS because the event arrives with an AWS-attested envelope the
 `SesEventTransportAuthenticator` can bind to a rule ARN, and because it needs no subscription
-confirmation dance. Phase 11 owes that authenticator; with none, a `SEND_UNKNOWN` row stays
+confirmation dance. That authenticator has a port and no implementation yet; with none, a
+`SEND_UNKNOWN` row stays
 `SEND_UNKNOWN`, which ADR-025 § 9 already names as correct.
 
 ### 10.2 Inbound — one exact transport
@@ -988,8 +954,8 @@ event carrying a closed reason code and no content.
 `EXTRACT_COMMITMENT` to the **Investigator** runtime under its own prompt version
 `commitment-extraction/v1`. The deployed Investigator artifact now serves it: `handle`
 dispatches on a declared operation, and the allowlist carries the extraction contract and its
-reviewed prompt. The local composition still uses `LiteralSpanCommitmentExtractor` — a stand-in,
-not a fallback — because the deployed composition root is I2 and is not yet written.
+reviewed prompt. The local composition uses `LiteralSpanCommitmentExtractor` — a local stand-in,
+not a fallback for the deployed path.
 
 **Frozen: a second bounded operation in the same Investigator runtime. No fourth agent.**
 
@@ -1005,8 +971,7 @@ not a fallback — because the deployed composition root is I2 and is not yet wr
 | Limits | the extraction path uses the Investigator's existing budget/timeout rungs |
 | Live evaluation | its own gated scenarios, run before acceptance (§ 20) — still `NOT_RUN` |
 
-**Correction — the discriminator did not exist and had to be added.** The earlier draft named
-"the request envelope's existing operation kind", but `AgentInputEnvelope` has no operation field
+**The discriminator is a dedicated envelope.** `AgentInputEnvelope` has no operation field
 and `ApplicationOperationKind` never crosses the port. The discriminator is therefore a new
 Investigator-only wrapper, `chorus.contracts.agentcore.InvestigatorRequest`, parsed as a Pydantic
 **tagged union**: the tag is read first, exactly one member is selected, and an unrecognised or
@@ -1048,7 +1013,7 @@ strict schema and decides nothing.
 
 ## 12. Reset authority
 
-Reset is a Phase 11 deliverable and the normal application roles cannot perform it. The API role
+Reset is a deployment responsibility, and the normal application roles cannot perform it. The API role
 holds no `DeleteItem` on view prefixes, no `s3:DeleteObject` anywhere, and is explicitly denied
 `scheduler:DeleteSchedule` by [ADR-028](../adr/ADR-028-deadline-watcher-and-scheduler-boundary.md)
 § 6. Granting it those would make the request-path principal able to erase the system.
@@ -1060,10 +1025,10 @@ constraints already contemplates for audit readers.
 |---|---|
 | Principal | `chorus-demo-reset-demo`, a dedicated Lambda role; **not** attached to the API or worker |
 | Invocation | `uv run chorus-demo reset --namespace DEMO --confirm "RESET DEMO"` → the reset function. Not reachable from a browser route without the demo token *and* the confirmation string |
-| Namespace bound | every grant carries `ForAllValues:StringLike dynamodb:LeadingKeys = ["NS#DEMO", "NS#DEMO#*"]` — the **delimiter-aware** grammar (review R3), so `NS#DEMO2` and `NS#DEMONSTRATION` match neither entry — and every S3 grant is scoped to `ns/DEMO/*`. The role **cannot name a partition or prefix outside `DEMO`**, in any table or bucket |
+| Namespace bound | every grant carries `ForAllValues:StringLike dynamodb:LeadingKeys = ["NS#DEMO", "NS#DEMO#*"]` — the **delimiter-aware** grammar, so `NS#DEMO2` and `NS#DEMONSTRATION` match neither entry — and every S3 grant is scoped to `ns/DEMO/*`. The role **cannot name a partition or prefix outside `DEMO`**, in any table or bucket |
 | Environment bound | the function refuses to run unless `CHORUS_ENVIRONMENT=demo` and `CHORUS_NAMESPACE=DEMO`; `production` is already rejected at startup in V1 |
 
-**What it may touch** (implemented in `chorus.composition.deployed_demo_reset`; review R2):
+**What it may touch** (implemented in `chorus.composition.deployed_demo_reset`):
 Core and Shareable partitions in the `DEMO` namespace, enumerated from the **persisted
 `DemoManifest`** (`NS#DEMO` / `DEMO_MANIFEST#{seed_version}`) — query-by-partition then bounded
 batch delete, **never a table scan**, and a missing or corrupt manifest fails the reset closed;
@@ -1106,7 +1071,7 @@ performs no second reset.
 | `CHORUS_{MONITOR,INVESTIGATOR,ACTION}_RUNTIME_ARN` — the **endpoint** ARN | deployment output → env var |
 | `CHORUS_{MONITOR,INVESTIGATOR,ACTION}_MODEL_PROFILE_ARN` — **discovered**, never constructed | deployment output → env var |
 | `CHORUS_{SENDER,COMPILER,WATCHER,WORKER}_FUNCTION_ARN`, `CHORUS_SCHEDULER_ROLE_ARN`, `CHORUS_SES_IDENTITY_ARN`, `CHORUS_INBOUND_SOURCE_ARN` | deployment output → env var |
-| **new** `CHORUS_PRIVATE_EVIDENCE_KEY_ARN`, `CHORUS_EXPORT_EVIDENCE_KEY_ARN` (§ 9) | deployment output → env var |
+| `CHORUS_PRIVATE_EVIDENCE_KEY_ARN`, `CHORUS_EXPORT_EVIDENCE_KEY_ARN` (§ 9) | deployment output → env var |
 | `CHORUS_SES_FROM_IDENTITY_ID`, `CHORUS_DESTINATION_{ID,DISPLAY_LABEL,REGISTRY_VERSION,ROUTING_TOKEN}` | safe env var — **non-secret by design**, names no mailbox |
 | `CHORUS_DESTINATION_ADDRESS_DIGEST`, `CHORUS_INBOUND_ADDRESS_DIGEST` | safe env var — digests, never addresses |
 | `CHORUS_PUBLIC_BASE_URL` | safe env var (the CORS origin) |
@@ -1115,17 +1080,17 @@ performs no second reset.
 | account ID, deploy region, resolved AZ names (§ 6) | CDK context / deploy config |
 
 No secret is committed; `.env` is local-development only and is never deployed secret storage.
-`tools/check_secrets.py` runs in CI. **`.env.example` is stale** — it omits
-`CHORUS_SCHEDULER_ENVIRONMENT`, `CHORUS_INBOUND_TRANSPORT`, `CHORUS_INBOUND_SOURCE_ARN`,
-`CHORUS_DESTINATION_ADDRESS_DIGEST`, and `CHORUS_INBOUND_ADDRESS_DIGEST`, all of which exist in
-`Settings`; the two key ARNs are new. All are added with safe placeholders.
+`tools/check_secrets.py` runs in CI. **`.env.example` is still incomplete** — it omits
+`CHORUS_INBOUND_TRANSPORT`, `CHORUS_INBOUND_SOURCE_ARN`, `CHORUS_DESTINATION_ADDRESS_DIGEST`, and
+`CHORUS_INBOUND_ADDRESS_DIGEST`, all of which exist in `Settings`; they belong there with safe
+placeholders.
 
 ## 14. API, worker, and frontend deployment
 
 **Host: API Gateway HTTP API (payload format 2.0) + FastAPI on Lambda**, plus a separate
 application-worker Lambda. Frozen by [08-api-design.md](../architecture/08-api-design.md).
 
-**API entry point — built in Phase 11 batch 4** (`functions/api/`):
+**API entry point** (`functions/api/`):
 
 - the **ASGI adapter** is `mangum`, pinned in `pyproject.toml`, with `lifespan="off"` (the
   application is built around an explicitly constructed container, so no start-up hook exists to
@@ -1156,7 +1121,7 @@ the view prefixes, so the compile route invokes the compiler function synchronou
 (`compile-request/v1`); it holds no `bedrock-agentcore:InvokeAgentRuntime`, so every
 agent-invoking route dispatches to the worker and returns `202`.
 
-**Worker entry point — built in Phase 11 batch 4** (`functions/worker/`): the **durable
+**Worker entry point** (`functions/worker/`): the **durable
 dispatcher** is `InvocationType="Event"` against the one configured worker ARN, replacing
 `InProcessOperationDispatcher`. **No `BackgroundTasks` substitute**: an operation that lives in a
 request process dies with it. The handover contract is `worker-job/v1` — identifiers, versions,
@@ -1171,7 +1136,7 @@ strongly still by the execution's own `APPROVED@v → SENDING@v+1` compare-and-s
 delivers one identical event twice through the production handler over the real worker and
 asserts the model was invoked exactly once.
 
-**Compiler, sender, and watcher entry points — built in Phase 11 batch 4.** Each binds its
+**Compiler, sender, and watcher entry points.** Each binds its
 existing composition root to real AWS clients and adds nothing else:
 
 | Function | Operations | Notes |
@@ -1185,17 +1150,19 @@ credentials, no configuration, and no network; a test imports all five with AWS 
 resolution disabled. Every refusal body is a reason code and nothing else: no traceback, no
 payload echo, no downstream body.
 
-**The inbound-mail entry point is not built.** It is [ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md)'s
-and belongs to a later batch; the deployed container wires `inbound_replies=None`, so the route
-answers `503` rather than accepting an unauthenticated delivery.
+**The inbound-mail entry point** (`functions/inbound_mail/`) implements
+[ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md)'s receipt path with
+`SesReceiptTransportAuthenticator` (§ 10.2). The deployed API container wires
+`inbound_replies=None`, so the API's reply route answers `503` rather than accepting an
+unauthenticated delivery.
 
 **Frontend hosting is a conditional, not a deferral.** Two branches, and the hackathon rules
 decide which (P4):
 
-- **If a locally-run SPA against the deployed API is acceptable:** Phase 11 builds no web stack.
+- **If a locally-run SPA against the deployed API is acceptable:** no web stack is built.
   `CHORUS_PUBLIC_BASE_URL=http://localhost:5173`, CORS admits exactly that origin, and
   `README`/status say plainly that the frontend runs locally against deployed AWS.
-- **If judging requires a public URL:** `AmbientChorusWeb` is **restored into Phase 11** and must
+- **If judging requires a public URL:** an `AmbientChorusWeb` stack is **added to the deployment** and must
   deploy before acceptance — private S3 bucket + CloudFront with OAC, SPA 404→`index.html`
   fallback, HTTPS only, `no-store` on `index.html` and immutable hashed assets, and **no secret in
   any `VITE_*` variable**. `CHORUS_PUBLIC_BASE_URL` becomes the distribution domain.
@@ -1234,7 +1201,8 @@ Post-deploy, before the hero smoke, non-destructive.
 | L | **The correlation canary.** Real reply from the verified correspondent identity to the receiving address | `SendEmail` `MessageId` → delivered `Message-ID` local part → reply's `In-Reply-To`/`References` (read per [ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md) § 4, from `mail.headers` or the pinned bytes) → **exactly one direct locator lookup**, no scan, no GSI; the pinned raw MIME lands private; commitment extracted |
 | M | Sentinel sweep of CloudWatch logs and X-Ray traces | the injected secret string **absent everywhere** |
 
-No destructive or chaos testing in Phase 11 — Phase 12 owns the adversarial matrix.
+No destructive or chaos testing belongs in this canary run; the adversarial matrix of
+[12-evaluation-and-testing.md](../architecture/12-evaluation-and-testing.md) is a separate exercise.
 
 **Canary L is the one that can invalidate a design rather than a policy.** If the `Message-ID`
 relationship does not hold, or if replies do not echo `References`, the correlation contract
@@ -1315,9 +1283,7 @@ construct outside `test`/`development`, and the local sender is filesystem-only.
 
 ## 18. Cost and retention
 
-**Corrected arithmetic.** The endpoint inventory is **6 interface + 2 gateway** (§ 7), not the
-nine interface endpoints the earlier draft implied by listing gateways in the same table and then
-counting eleven.
+The endpoint inventory is **6 interface + 2 gateway** (§ 7).
 
 Interface endpoints are billed **per endpoint, per AZ, per hour**. With two AZs:
 6 × 2 × 730 h × ~$0.01 ≈ **$88/month**, accruing whether or not anybody demos. Gateway endpoints
@@ -1325,7 +1291,7 @@ are free. This is the largest fixed line item.
 
 **No-NAT is chosen because [ADR-010](../adr/ADR-010-agentcore-runtime.md) freezes the egress and
 isolation boundary.** It also happens to be cheaper than a NAT gateway; that is a side effect, not
-the reason, and the earlier draft had the justification backwards.
+the reason.
 
 Everything on the demo path is pay-per-request and rounds to well under a dollar per run:
 DynamoDB on-demand, Lambda invocations, AgentCore per-invocation, six to eight Nova 2 Lite calls,
@@ -1383,90 +1349,80 @@ Canary M is the enforcement.
 Alarms: the existing DLQ-depth alarm, plus Lambda error-rate and AgentCore invocation-failure
 alarms. One dashboard. No monitoring platform.
 
-## 20. Phase 11 acceptance
+## 20. Deployment acceptance
 
-Phase 11 is **not** weakened. It is accepted only when all of the following hold:
+The deployment is accepted only when all of the following hold:
 
 - live evaluation of **Monitor**, **Investigator**, and **Action** against the real model;
 - live **commitment extraction** (§ 11) against the real model;
 - deployed compiler, sender, and watcher, each proved by its canaries;
-- real AWS persistence — DynamoDB, S3, KMS — with the § 9 write repair proved by canary B;
+- real AWS persistence — DynamoDB, S3, KMS — with the § 9 write requirement proved by canary B;
 - one **authenticated inbound reply** correlated to one `SENT` execution (canary L);
 - **durable reset** (§ 12) run successfully and repeatably;
 - **rollback proof** — an AgentCore endpoint repointed to a previous version and a Lambda alias
   rolled back, both exercised;
 - the full **IAM and network canary matrix** (§ 15) green;
-- the **alarms and dashboard** the implementation plan lists, working;
+- the **alarms and dashboard** (§ 19) working;
 - **one real AWS hero flow** (§ 17) completed end to end.
 
-Phase 12 remains broad evaluation, adversarial, and concurrency work. Phase 13 remains rehearsal,
-presentation, submission, and cost cleanup.
+Broad adversarial and concurrency evaluation
+([12-evaluation-and-testing.md](../architecture/12-evaluation-and-testing.md)) and demo rehearsal
+([demo-plan.md](demo-plan.md)) build on an accepted deployment and are not part of this gate.
 
 ## 21. Status
 
-### User prerequisites — these block deployment and nothing else
+Recorded 2026-09-13. Re-check the account before relying on any row.
 
-| | Item | Resolution |
-|---|---|---|
-| **P1** | **Deployment identity.** CLI session expired; no verifiable non-root principal. | Create the `ChorusDeployer` permission set, `aws sso login`, confirm the ARN is not root. Blocks *deployment*, not offline implementation. |
-| **P2** | **DNS control for a receiving domain or subdomain.** | Required: the ability to publish SES verification records and an **MX** record for the receiving subdomain, and DKIM records for the sending identity. **Not** required: buying a new domain if suitable DNS is already controlled; Route 53 specifically; owning both correspondents' domains; a custom MAIL FROM. **Hard prerequisite before any real inbound SES acceptance.** |
-| **P3** | **Bedrock model access and region enablement.** | Confirm `us.amazon.nova-2-lite-v1:0` is invocable and that `us-east-1`, `us-east-2`, and `us-west-2` are enabled and unrestricted by SCP for `bedrock:InvokeModel` (§ 4). Account prerequisite; proved by canary J. |
-| **P4** | **Hackathon frontend rule.** | Decide whether a locally-run SPA against the deployed API is acceptable. If not, `AmbientChorusWeb` returns to Phase 11 scope (§ 14). |
+### Live state
 
-### Reclassified from the previous draft
-
-| | Was | Now |
-|---|---|---|
-| B1 identity | blocker | **P1 — user prerequisite for deployment**, not for implementation |
-| B2 region | blocker | **configuration issue** — pin the region; the CLI default is drift |
-| B3 model | blocker | **P3 + live-canary question** (canary J) |
-| B4 domain | blocker | **P2 — user prerequisite**, wording corrected (DNS control, not domain purchase) |
-| B5 server binding | blocker | **implementation blocker** (I1) |
-| B6 handlers/composition | blocker | **implementation blocker** (I2) |
-| B7 authenticators | blocker | **implementation blocker** (I3) |
-| B8 model IAM | blocker | **implementation blocker** (I4), scope corrected to inference-profile + conditioned FM ARNs |
-| B9 role split | blocker | **implementation blocker** (I5) — confirmed |
-| B10 SES production access | blocker | **NOT REQUIRED** for a verified sandbox demo; optional and desirable |
-| B11 `Message-ID` | blocker | **live-canary question** (canary L); ADR amendment only if it fails |
-
-### Implementation blockers — offline work, no AWS account needed
-
-| | Item |
+| Component | State |
 |---|---|
-| ~~**I1**~~ | **Done.** AgentCore server binding: a bare ASGI application on the already-locked `uvicorn` rather than a `bedrock-agentcore` dependency, `main.py` with `/ping` + `/invocations` per runtime, the archive import bootstrap, `deployed_name`, and the corrected `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` names (§ 5). Live evaluation remains `NOT_RUN`. |
-| **I2** | **Handlers: six of six done** (§ 14): API (Mangum, payload v2, bearer-token middleware, per-request logical time), operation worker, compiler, sender, commitment watcher, and — since Macro A — the operator-only demo-reset handler (`functions/demo_reset/handler.py`, thin: env gate, `demo-reset-request/v1` envelope, `DeployedDemoReset.reset`, typed error translation) — handlers, composition roots, the `worker-job/v1` async boundary, and the synchronous compile/fence/send/watcher contracts. **Resources: done offline (batch 5).** The five `Function` resources under the pre-existing roles/log groups (the reset `Function` is `AmbientChorusReset`, I13); the watcher published `Version` + `live` `Alias`; the API Gateway HTTP API with a `$default` payload-v2 proxy integration and a Lambda invoke permission scoped to that API and the API function alone; every cross-function ARN, the two API secret identities and the sender's, and the scheduler identity wired in `app.py`; the deterministic lock-based Lambda packaging (`tools/build_lambda_artifacts.py`) with its first-party secret gate, ELF check, and isolated-artifact import proof. **Macro A final completion repair:** `demo_reset` joined the canonical `FUNCTION_DIRS` build inventory — a normal build now produces **six** ZIPs (`api`, `worker`, `compiler`, `sender`, `commitment_watcher`, `demo_reset`), the reset ZIP passing the identical final-artifact gates with no exemption, and deployment-capable CDK resolution fails closed (`LambdaArtifactMissingError`) on a missing `chorus-demo-reset` ZIP with a deploy-guard test to prove it. **VPC attachment — done offline (Macro A, I16):** the worker, compiler, and sender `Function`s carry a `VpcConfig` on the isolated network's two subnets and their own security group; the API and watcher stay out. **Still owed:** the inbound-mail entry point (I9/I10, implemented offline in Macro B). |
-| **I3** | `InboundMailTransportAuthenticator` and `SesEventTransportAuthenticator` |
-| **I4** | Agent IAM: discovered inference-profile ARNs + conditioned foundation-model ARNs (§ 4) |
-| **I5** | Split API and worker roles; add the missing `lambda:InvokeFunction` and `secretsmanager:GetSecretValue` grants (§ 8.1). **Roles split in batch 4; batch 5 wires the conditional grants unconditionally** from the created worker resource, the compiler / sender / watcher-alias **actual resource ARNs** (cross-stack `Fn::ImportValue`), and the configured secret identities — a template test proves each function's environment identity and the matching IAM resource are one ARN. |
-| **I6** | **Compiler Shareable read** — without it no send is possible (§ 8.2) |
-| **I7** | **S3 `SSEKMSKeyId`** — without it no object write succeeds (§ 9) |
-| **I8** | **AgentCore artifact deny split** — without it no runtime cold-starts (§ 6) |
-| ~~**I9**~~ | **Done offline (Macro B).** SES receipt decoder corrections per [ADR-030](../adr/ADR-030-live-ses-receipt-decoding.md) — single S3 action + `TopicArn`, `receipt.action.type == "S3"`, one bounded pinned read reused everywhere, `mail.headers` with pinned-bytes fallback, `From` mailbox, `receipt.recipients` — with golden unit tests over synthesized AWS-schema payloads (live validation pending canary L). |
-| ~~**I10**~~ | **Done offline (Macro B).** Inbound bucket/key policy carve-out (six statements, nine proved cases) and ingress-object accounting (§ 10.3). |
-| ~~**I11**~~ | **Done offline.** Live commitment extraction in the Investigator runtime (§ 11): `investigator-request/v1`, the `commitment-extraction/v1` prompt, and the safe destination label the deterministic obligor check needs. Not yet run against a real model. |
-| **I12** | **Done.** `DynamoDbDemoClockStore` at the exact literal `NS#DEMO#CLOCK`: strongly consistent read, and one guarded forward compare-and-swap whose `version`, `reset_generation`, and strictly-earlier-`logical_time` fences are all condition expressions the table evaluates. Missing, corrupt, and unreachable each fail closed and typed, with no fallback to a process-local clock, to `SystemClock`, or to an event's timestamp. The normal adapter exposes **no reset and no reseed** — asserted by absence. **Macro A adds** the reset principal's separate `DynamoDbDemoClockResetStore`: a strong read (absent row is not a failure — ADR-029 § 6) plus one conditional reseed that advances `reset_generation` monotonically and never reuses it, restores `logical_time`/`advance_count`, and starts a fresh `version` sequence; a stale pre-reset advance then fails on the generation fence even when its numeric version coincides. |
-| **I13** | **Macro A residual correction implemented and verified offline; independent micro verification pending.** The dedicated reset role/function retains exact DEMO namespace, object-prefix, ENI, and private reseed boundaries. [ADR-031](../adr/ADR-031-demo-reset-mutation-interlock.md) specifies the atomic reset-lock condition on every normal mutation, case-world registration with first case creation, discovery of every registered case and its descendants, and existing contextual idempotency reservations for external attempts. Reset refuses in-flight or unresolved side effects before purge, reconciles schedules from durable projections as well as the bounded list, rechecks receipts under lock, and salts seed transactions with a receipt identity derived from the persisted reset generation. The six-ZIP pipeline packages and validates the frozen fixture resources; the one synthetic binary is exact-path/digest pinned and byte-scanned by the shared scanner. Export evidence reset grants are delete/list only. No AWS deployment or canary is claimed. |
-| **I14** | Scheduler execution role policies (§ 8.5) — done (batch 4). **Lambda VPC ENI grants (§ 8.6) — done offline (Macro A; review R1):** four inline statements on each of the worker, compiler, sender, and reset roles — `AllowCreateVpcEni` (`ec2:CreateNetworkInterface` on `*`, **no condition**: Lambda's Hyperplane creation is a service operation and a subnet condition there is ineffective, documented as an AWS service limitation); `AllowManageVpcEni` (`Delete`/`Assign`/`Unassign` on `*`, `StringEquals ec2:Subnet` = the two isolated subnet ARNs); `AllowDescribeVpcEni` (the two `Describe*` on `*`, unconditioned); and `DenyVpcEniFromFunctionCode` — `Effect: DENY` on all six actions, `ArnEquals lambda:SourceFunctionArn` = this exact function. **No `lambda:SourceFunctionArn` on any Allow:** AWS's service-side ENI management does not carry that key, so a `SourceFunctionArn` condition on the Allow makes VPC attachment fail; it belongs on the Deny, where it fires only for the function's own code. No `AWSLambdaVPCAccessExecutionRole`, no `ec2:*`; the API and watcher roles receive none. |
-| **I15** | AgentCore artifact **build** done — lock-based, `aarch64-manylinux2014`/3.12, ELF-verified, with its own secret gate (§ 5). The **Lambda** artifact build is done too (batch 5): `tools/build_lambda_artifacts.py`, one zip per production function, `x86_64-manylinux_2_28`/3.12, first-party trees re-rooted so the deployed import path matches the repository, ELF-verified, first-party secret gate, and an isolated unpacked-archive import test. Still owed: artifact **publish** (both), the deploy CLI with the § 2 identity refusal, and AZ-ID resolution (§ 6). |
-| **I16** | **Network, Reset, and Observability stacks — done offline (Macro A).** `AmbientChorusNetwork`: one VPC, exactly two `PRIVATE_ISOLATED` subnets in the two `-c network_availability_zones=<a>,<b>` deployment-config AZs (deployment mode fails closed without them; offline synth uses a clearly-named synthetic fixture), no NAT/IGW/EIP, no default route; the frozen **six interface** endpoints (`bedrock-runtime`, `bedrock-agentcore`, `lambda`, `secretsmanager`, `scheduler`, `email`) and **two gateway** endpoints (`s3`, `dynamodb`) on both isolated route tables; a per-endpoint security group admitting TCP 443 only from the workloads the frozen matrix lists, and per-workload security groups with `allow_all_outbound=False` whose only egress is 443 to those endpoint SGs and to the S3/DynamoDB managed prefix lists; scoped S3 and DynamoDB endpoint policies. **The S3 endpoint policy's AgentCore exception is bounded (review R4):** it is `s3:GetObject` on the AWS-documented regional service bucket pattern `arn:aws:s3:::acr-code-*-us-east-1-an/*`, conditioned on `aws:PrincipalServiceName = bedrock-agentcore.amazonaws.com` — **not** the previous `s3:GetObject` on `arn:aws:s3:::*/*` for every principal. The evidence-object statement also covers `s3:DeleteObject`/`DeleteObjectVersion` and a prefix-constrained `s3:ListBucket` so the reset role's own IAM is usable through the endpoint (review R5-A). `AmbientChorusReset` and `AmbientChorusObservability` per I13 and § 27–30. **Still owed:** the **Inbound** stack (I9/I10, implemented offline in Macro B); the AgentCore-runtime alarms (Macro B). `.env.example` unchanged this macro — Macro A adds no new required non-secret variable (the AZ names are `-c` context / deploy config, not a `CHORUS_` setting). |
+| `AmbientChorusFoundation`, `AmbientChorusNetwork`, `AmbientChorusData`, `AmbientChorusReset`, `AmbientChorusCompiler`, `AmbientChorusSender`, `AmbientChorusWatcher` | **Deployed and independently verified** in `us-east-1` |
+| SES sending identity and the `chorus-demo` configuration set | **Verified** |
+| SES `SendEmail` canary — a direct API call, not through the application pipeline | **Delivered** to a real inbox |
+| `AmbientChorusApplication`, `AmbientChorusInbound`, `AmbientChorusObservability` | **Not yet re-verified live** |
+| `AmbientChorusAgents` — the three AgentCore runtimes | **Blocked**: applied AgentCore Runtime quotas are 0 |
+| Nova 2 Lite invocation | **Blocked**: `ValidationException: Operation not allowed`; an AWS Support case is open and escalated |
 
-**I6, I7, and I8 are the three that make an otherwise complete deployment fail at runtime**, each
-in a way that reads as an unrelated error: no send, no object write, no agent cold start.
+Canaries that need an agent runtime (F–F3, J–J3, and everything downstream of a live agent
+operation) cannot run until the agents are unblocked, and every live model evaluation is still
+`NOT_RUN`. Do not describe the system as running on AgentCore, powered by Nova 2 Lite, or live end
+to end until this table says so.
 
-### Unresolved architectural questions
-0. ~~**What clock does the deployed compiler stamp a view with?**~~ **Resolved** (Phase 11
-   batch 4 repair, § 8.10 D): the compiler reads the durable logical clock, read-only, the same
-   shape as the worker's grant in § 8.9 B. A compiled view's `generated_at` and `expires_at` are
-   now logical-clock instants, in the same domain as the case world they describe and the
-   freshness check that later compares against them. The rejected alternative was an ADR
-   statement that view lifetime is wall-clock everywhere.
+### Account and environment prerequisites
+
+| | Item | Requirement |
+|---|---|---|
+| **P1** | Deployment identity | A non-root principal with short-lived credentials, checked before every deploy (§ 2). |
+| **P2** | DNS for the receiving subdomain | SES verification, DKIM, and **MX** records for the receiving subdomain. Buying a new domain, Route 53, owning both correspondents' domains, and a custom MAIL FROM are **not** required. Hard prerequisite for any real inbound SES acceptance (canary L). |
+| **P3** | Bedrock model access and AgentCore quota | `us.amazon.nova-2-lite-v1:0` invocable, with `us-east-1`, `us-east-2`, and `us-west-2` enabled and unrestricted by SCP for `bedrock:InvokeModel` (§ 4), and a non-zero AgentCore Runtime quota. **Currently blocked** (see above); proved by canary J. |
+| **P4** | Frontend hosting rule | Whether a locally run SPA against the deployed API is acceptable; if not, a web stack joins the deployment (§ 14). |
+
+### Implementation still owed
+
+- **`SesEventTransportAuthenticator`** has a port and consumers but no implementation, so SES
+  configuration-set events cannot yet reconcile a `SEND_UNKNOWN` execution (§ 10.1).
+- **A deploy command that enforces the § 2 identity refusal.** The refusal is specified; no command
+  implements it yet.
+- **`.env.example`** is missing four inbound and digest settings (§ 13).
+
+Everything else this contract specifies is implemented and covered by offline synthesis and tests:
+the AgentCore server binding and artifact build (§ 5), the Lambda handlers and composition roots
+(§ 14), the split API and worker roles (§ 8.1), the compiler's Shareable read (§ 8.2),
+`SSEKMSKeyId` on every object write (§ 9), the AgentCore S3 deny split (§ 6), the
+inference-profile IAM (§ 4), the SES receipt path and its bucket-policy carve-out (§ 10.2–10.3),
+live commitment extraction in the Investigator runtime (§ 11), the durable demo clock and its reset
+(§ 8.9, § 12), and the network, reset, and observability stacks.
+
+### Open questions
+
 1. **Does AgentCore fetch the S3 artifact under the execution role or under a service-owned
-   mechanism?** § 6 assumes the execution role and repairs the deny accordingly. Canary F3 plus a
+   mechanism?** § 6 assumes the execution role and splits the deny accordingly. Canary F3 plus a
    real cold start (canary J) settles it. If it is service-owned, the artifact grant is
    unnecessary but harmless and the endpoint policy still matters.
 2. **Does a real reply echo `References`?** Assumed yes for standard clients, depended on by the
    correlation contract, proved only by canary L. Sub-addressed `Reply-To` routing remains the
-   recorded fallback and would reopen the Phase-8 preview binding.
+   recorded fallback and would reopen the approval preview binding.
 3. **Is `bedrock-agentcore` (data plane) reachable from an isolated subnet via a VPC interface
    endpoint in `us-east-1`?** Assumed yes; if not, the worker moves out of the VPC, which it can
    do without weakening any boundary since it holds no private-object grant the API does not.

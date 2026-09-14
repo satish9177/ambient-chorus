@@ -1,6 +1,6 @@
 # Elevator v1 synthetic ambient corpus
 
-This directory is the frozen Phase 3 input for the demo. It is **input data**, not an answer
+This directory is the frozen input corpus for the demo. It is **input data**, not an answer
 key: it contains messages, actors, timestamps, and attachment provenance, and it deliberately
 contains no report identifier, no fact identifier, no case identifier, and no statement about
 which messages belong together. Discovery happens at runtime through the Monitor contract.
@@ -13,7 +13,7 @@ which messages belong together. Discovery happens at runtime through the Monitor
 | `feed.json` | The 24 fixed ambient messages in channel order |
 | `evidence/elevator-e42.jpg` | The lift control-panel photograph attached to message 16 |
 | `evidence/injection-notice.txt` | The malicious document attached to message 18 |
-| `evidence/management-reply.eml` | The manager reply, staged in the catalog and **not** ingested until the Phase 9 external-reply step |
+| `evidence/management-reply.eml` | The manager reply, staged in the catalog and **not** ingested until the external-reply step |
 
 `SyntheticAmbientAdapter` verifies every declared checksum and byte length before returning a
 single message. An edited corpus, a changed evidence file, or an unknown manifest field fails
@@ -36,4 +36,4 @@ Fixture identifiers are `uuid5` of `ambient-chorus/elevator-v1/{name}` under the
 recorded in the manifest. Durable identity for anything discovered at runtime is derived from
 validated inputs instead, never from a fixture name.
 
-The Phase 1 domain-level fixture builder remains `tests/fixtures/elevator.py`.
+A separate domain-level fixture builder for unit tests lives in `tests/fixtures/elevator.py`.

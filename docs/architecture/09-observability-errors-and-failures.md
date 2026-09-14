@@ -70,7 +70,7 @@ The `service` field names the process that actually emitted the record, not the 
 
 ## CloudWatch metrics and alarms
 
-The audit vocabulary is deliberately a different one, because logs describe what a process did and audit events describe what was decided. Phase 8's `AuditEvent.event_type` values are `action.approved`, `action.rejected`, `action.invalidated`, `action.send.started`, `action.sent`, `action.send.failed`, `action.send.unknown`, `action.send.reconciled`, and `action.actioned`, carrying identifiers, versions, closed reason codes, and the `proposal_hash`/`view_hash`/`preview_hash`/`rendered_message_hash`/`ses_request_token_hash` chain — and no message text ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 14).
+The audit vocabulary is deliberately a different one, because logs describe what a process did and audit events describe what was decided. The approval and send path's `AuditEvent.event_type` values are `action.approved`, `action.rejected`, `action.invalidated`, `action.send.started`, `action.sent`, `action.send.failed`, `action.send.unknown`, `action.send.reconciled`, and `action.actioned`, carrying identifiers, versions, closed reason codes, and the `proposal_hash`/`view_hash`/`preview_hash`/`rendered_message_hash`/`ses_request_token_hash` chain — and no message text ([ADR-025](../adr/ADR-025-one-deliberate-ses-attempt.md) § 14).
 
 Use embedded metric format with dimensions limited to `Environment`, `Service`, `AgentName`, `Outcome`, and bounded `ReasonCode`; never case/contributor IDs.
 
@@ -190,7 +190,7 @@ Policy denial is not logged as an application error. Unknown exceptions become `
 | private S3 URI accidentally supplied | strict DTO/denylist rejects at boundary; never log or forward | not retryable as-is | no view/proposal | `private_uri.denied`; safe validation message |
 | prompt injection in community message | treat as delimited data; Monitor output still validated | ordinary agent retry only on timeout | text remains private; no authority | injection-observed marker, no content in log |
 | prompt injection in evidence | Investigator may see; no tools/policy authority; compiler lacks export rule | no policy retry | evidence private, excluded | audit says `UNSAFE_EVIDENCE`/`INTERNAL_ONLY` |
-| a delivery arrives with no transport authenticator wired | `TRANSPORT_UNAVAILABLE`; nothing is decoded | not retryable; Phase 11 owes the authenticator | no evidence, no case write | `reply.rejected`; the delivery is not evidence about anything |
+| a delivery arrives with no transport authenticator wired | `TRANSPORT_UNAVAILABLE`; nothing is decoded | not retryable; the deployment must wire an authenticator | no evidence, no case write | `reply.rejected`; the delivery is not evidence about anything |
 | forged, foreign-transport, wrong-sender, or wrong-recipient delivery | refused at the attester before any decode or persist | never retried | nothing written anywhere | `reply.rejected` with one of the ten closed codes and no content |
 | a reply that correlates to nothing, to two executions, to a `SEND_UNKNOWN` execution, or to a terminal case | refused whole | never retried | nothing written in the case | `reply.rejected`; `REPLY_UNCORRELATED`, `REPLY_CORRELATION_AMBIGUOUS`, `REPLY_EXECUTION_NOT_SENT`, `REPLY_CASE_TERMINAL` |
 | oversized, attachment-bearing, header-truncated, or HTML-only reply | refused whole; raw bytes not retained and no metadata recorded | not retryable | nothing written | `reply.rejected` |

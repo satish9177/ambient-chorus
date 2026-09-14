@@ -25,7 +25,7 @@ Those cannot both hold. `view_id` and `safe_evidence_ref_id` are minted *during*
 
 § Safe photo derivative required "a deterministic image library" that "decodes and re-encodes to PNG, strips EXIF/comments/profiles, caps dimensions, and recomputes SHA-256", and required a decompression bomb, an unexpected frame, and a decode failure to fail closed. No library was chosen, no cap had a number, and no encoder setting was fixed — while [12-evaluation-and-testing.md](../architecture/12-evaluation-and-testing.md) already required a golden hash over the output. Determinism of PNG bytes is a property of a specific encoder and its zlib, not of the format, so a golden hash without a pinned encoder is a test that passes until someone upgrades something.
 
-The frozen risk register carries this as R16, and the Phase-6 entry of [implementation-plan.md](../plans/implementation-plan.md) names "image library/parser vulnerabilities" as the phase's headline risk. A hardening profile that exists only in an implementer's head is not a mitigation.
+The frozen risk register carries this as R16, and the Phase-6 entry of the implementation plan (since retired) names "image library/parser vulnerabilities" as the phase's headline risk. A hardening profile that exists only in an implementer's head is not a mitigation.
 
 ### The review was a boolean with four names
 

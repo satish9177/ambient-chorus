@@ -187,7 +187,7 @@ not a hope about timing:
   on that prefix and nothing else. Ingestion cannot replace the bytes it is reasoning about, and
   that is an IAM fact rather than a code convention.
 - **Only the operational reset principal and the bucket lifecycle rule may remove ingress objects**
-  ([the deployment contract](../plans/phase-11-deployment-contract.md) § 12).
+  ([the deployment contract](../plans/deployment-contract.md) § 12).
 
 "The bucket and prefix matched" is explicitly **not** sufficient and is not claimed to be.
 
@@ -448,7 +448,7 @@ no content, as ADR-026 § 3 froze.
 The decoder gains golden tests over **captured real SES receipt payloads**, not hand-written
 dictionaries — inventing the envelope shape is the specific mistake this ADR exists to correct, and
 a second round of invented fixtures would repeat it. Canary L in
-[the deployment contract](../plans/phase-11-deployment-contract.md) § 15 is the acceptance test: a
+[the deployment contract](../plans/deployment-contract.md) § 15 is the acceptance test: a
 real reply, from the verified correspondent identity, to the receiving address, correlating to
 exactly one `SENT` execution through one direct locator lookup.
 

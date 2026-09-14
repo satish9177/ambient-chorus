@@ -1,4 +1,4 @@
-# Phase-7 Codex repair regressions
+# Action-proposal repair regressions (Codex review)
 
 One directory, eleven findings. Every module below fails on the pre-repair implementation for
 the exact reason Codex reported, and passes only against the repair.

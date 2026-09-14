@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-09-07
 **Deciders:** Ambient CHORUS maintainers and product owner
-**Amends:** [02-trust-iam-deployment-configuration.md](../architecture/02-trust-iam-deployment-configuration.md) § IAM notation and resources, § Principal-specific constraints; [04-domain-state-and-events.md](../architecture/04-domain-state-and-events.md) § Commitment; [06-persistence-and-evidence.md](../architecture/06-persistence-and-evidence.md) § Shareable table mapping, § Transaction boundaries; [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md) § Scheduler flow, § Demo clock without scheduler theater; [ADR-006](ADR-006-eventbridge-commitment-scheduling.md); [implementation-plan.md](../plans/implementation-plan.md) § Phase 9 exit criteria
+**Amends:** [02-trust-iam-deployment-configuration.md](../architecture/02-trust-iam-deployment-configuration.md) § IAM notation and resources, § Principal-specific constraints; [04-domain-state-and-events.md](../architecture/04-domain-state-and-events.md) § Commitment; [06-persistence-and-evidence.md](../architecture/06-persistence-and-evidence.md) § Shareable table mapping, § Transaction boundaries; [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md) § Scheduler flow, § Demo clock without scheduler theater; [ADR-006](ADR-006-eventbridge-commitment-scheduling.md); the Phase 9 exit criteria of the implementation plan (since retired)
 **Depends on:** [ADR-027](ADR-027-commitment-extraction-grounding-and-authority.md)
 
 ## Context
@@ -132,7 +132,7 @@ It removes a word that promised a mechanism nobody built, replaces it with the s
 - `CommitmentStatus` is unchanged; `PENDING_SCHEDULE` is documented as a projection value.
 - The word "signed" is removed from [07-action-ses-and-commitments.md](../architecture/07-action-ses-and-commitments.md) § Demo clock; "attach scheduler name/generation" is corrected in [06-persistence-and-evidence.md](../architecture/06-persistence-and-evidence.md).
 - The watcher row of the trust matrix is corrected to `Core: D | Share: R/W(NS#*#CASE#*)`; the application's scheduler grant is narrowed.
-- Phase 9's live-schedule exit criterion moves to Phase 11; [build-order.md](../plans/build-order.md)'s `9→10` gate changes with it.
+- Phase 9's live-schedule exit criterion moves to Phase 11; the build order's `9→10` gate changes with it (build order since retired).
 - **T19** is extended to name the early-firing and unknown-commitment branches. New **T40**: a watcher invocation for a commitment in another namespace or case.
 
 ## Residual risk
@@ -145,4 +145,4 @@ It removes a word that promised a mechanism nobody built, replaces it with the s
 
 ## Revisit condition
 
-Reopen when a deadline must be changeable — that needs a reschedule verb, a generation increment, an `update_schedule` or delete-and-recreate path, and a rule for what happens to a `DUE` commitment whose deadline moves — or when schedule volume, cost, or quotas make one-time schedules unattractive, which is [ADR-006](ADR-006-eventbridge-commitment-scheduling.md)'s own revisit condition. Recurring calendars and Step Functions remain out of scope by [implementation-plan.md](../plans/implementation-plan.md) Phase 9.
+Reopen when a deadline must be changeable — that needs a reschedule verb, a generation increment, an `update_schedule` or delete-and-recreate path, and a rule for what happens to a `DUE` commitment whose deadline moves — or when schedule volume, cost, or quotas make one-time schedules unattractive, which is [ADR-006](ADR-006-eventbridge-commitment-scheduling.md)'s own revisit condition. Recurring calendars and Step Functions remain out of scope, as the implementation plan's Phase 9 scope recorded (plan since retired; see also [cut-list.md](../plans/cut-list.md)).

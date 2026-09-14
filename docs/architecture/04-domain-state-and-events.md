@@ -63,11 +63,11 @@ Purpose: a contributor-scoped assertion extracted from one or more messages.
 
 Fields: `report_id`, `case_id?`, `community_id`, `contributor_id`, `source_message_ids: nonempty tuple`, `issue_type`, `private_summary: SensitiveStr[1..1000]`, `occurred_at?`, `location_area?`, `evidence_ids`, `status: ACTIVE|DUPLICATE|RETRACTED`, `duplicate_of_report_id?`, `version`, timestamps. Every source message has the same community and, when known, contributor. A duplicate never counts independently. Case linkage/status may change; lineage and owner do not. Private-zone only.
 
-`case_id` remains optional in the broader domain model, because a later correction or split path may hold a report between cases. **A Phase-3 persisted `Report` row always has a non-null `case_id`**: the Core key grammar addresses a report inside its case partition, so a case-less report has no address to live at.
+`case_id` remains optional in the broader domain model, because a later correction or split path may hold a report between cases. **A persisted `Report` row always has a non-null `case_id`**: the Core key grammar addresses a report inside its case partition, so a case-less report has no address to live at.
 
 A Monitor report proposal that cannot satisfy the candidate-creation guard therefore stays **provisional**. It becomes no `Report`, no `Fact`, no case, and no feed signal, and V1 does not invent an unlinked-report table to hold it. It is not lost either: the source messages remain ordinary community messages, and the bounded Monitor context window described in [03-agent-architecture.md](03-agent-architecture.md) includes recent prior messages, so a later run over a corroborating message reconsiders them and may then form a candidate. Discovery is deferred, not discarded.
 
-Phase-3 Monitor may **not** move an already-linked report from one case to another. If a message or report that a feed signal already binds to one case is proposed for a different case, the whole apply fails closed with a typed linkage conflict. Re-linking is an explicit later correction/split use case with its own authority.
+The Monitor intake apply may **not** move an already-linked report from one case to another. If a message or report that a feed signal already binds to one case is proposed for a different case, the whole apply fails closed with a typed linkage conflict. Re-linking is an explicit later correction/split use case with its own authority.
 
 ### Fact
 
@@ -144,7 +144,7 @@ That is why `READY_FOR_ACTION→ACTION_PROPOSED` moves `version` and not `author
 
 `corroboration_source_count` is the **case-level** independent-source count over every `ACTIVE` case fact. Intake creates a case with `0`; the investigation apply writes the deterministically recomputed value in the same transaction that appends the assessment. It is not a fact's `evidence_status`, and a corroborated case may contain facts that remain `REPORTED` ([ADR-015](../adr/ADR-015-evidence-status-and-verification.md)). `assessment_id` is the current-assessment pointer; there is no separate pointer item, so the pointer and the case version can never disagree.
 
-`current_view_id` is **unused in V1 and remains `None`**. The sole current-view authority is the Shareable table's `VIEW_CURRENT` pointer. The compiler never writes the Core case row and never sets this field: its only Core write is the send fence, and storing a pointer in two places is how the two come to disagree. The field is left in place rather than removed during Phase 6; a later cleanup ADR may drop it. `current_action_id` is subject to the same rule under its own `ACTION_CURRENT` pointer.
+`current_view_id` is **unused in V1 and remains `None`**. The sole current-view authority is the Shareable table's `VIEW_CURRENT` pointer. The compiler never writes the Core case row and never sets this field: its only Core write is the send fence, and storing a pointer in two places is how the two come to disagree. The field is left in place rather than removed; a later cleanup ADR may drop it. `current_action_id` is subject to the same rule under its own `ACTION_CURRENT` pointer.
 
 The compiler's abstention from the case row is now an ordinary least-privilege fact rather than a defence against self-staling. Under the split counters above, a writer that moved `version` would not stale a view; only a writer that moved `authorization_version` would, and the compiler moves neither.
 
@@ -190,7 +190,7 @@ Purpose: one qualifying statement with complete citations, structured exactly as
 
 Fields: `caveat_id: UUID`, `text: str[1..500]`, `export_fact_ids: sorted tuple[1..10]`, `caveat_hash`. Immutable within a proposal. `caveat_id` is model-local under the same rule as `claim_id`.
 
-A caveat has **at least one citation**; there is no zero-citation caveat in V1. Bare-string caveats are gone, because the immutable artifact a human approves has to contain the caveat-to-fact proof the validator relied on — otherwise Phase-8 revalidation cannot re-check it and the renderer cannot cite it ([ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) § 2).
+A caveat has **at least one citation**; there is no zero-citation caveat in V1. Bare-string caveats are gone, because the immutable artifact a human approves has to contain the caveat-to-fact proof the validator relied on — otherwise send-time revalidation cannot re-check it and the renderer cannot cite it ([ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) § 2).
 
 ### ActionProposal
 
@@ -397,7 +397,7 @@ The failing term supplies the `state_reason_code`, evaluated in the order above:
 
 Attaching a new Monitor-derived report to an existing case is a mutation of that case, so it is gated by state, not merely by similarity. The Monitor-linkable states are `CANDIDATE`, `AWAITING_MANDATES`, `INVESTIGATING`, `READY_FOR_ACTION`, `ACTION_PROPOSED`, `ACTIONED`, and `VERIFYING`. In every one of those, linking appends reports and facts and leaves `state` unchanged.
 
-`RESOLVED` and `CLOSED_UNRESOLVED` are **not** Monitor-linkable. The state machine reopens a terminal case only through an explicit human/demo reopen command, and Phase-3 Monitor has no such authority. A proposal to attach a report to a terminal case fails closed with a typed ineligible-state error; the case's `state`, `state_reason_code`, and `version` are all left exactly as they were, and no report, fact, signal, or audit row is written for that group. A terminal case is also excluded from the candidate summaries the Monitor is shown, so the ordinary path never proposes one.
+`RESOLVED` and `CLOSED_UNRESOLVED` are **not** Monitor-linkable. The state machine reopens a terminal case only through an explicit human/demo reopen command, and the Monitor intake apply has no such authority. A proposal to attach a report to a terminal case fails closed with a typed ineligible-state error; the case's `state`, `state_reason_code`, and `version` are all left exactly as they were, and no report, fact, signal, or audit row is written for that group. A terminal case is also excluded from the candidate summaries the Monitor is shown, so the ordinary path never proposes one.
 
 Mandate revocation or policy/case changes trigger a deterministic readiness reconciliation. They do not unsend a `SENT` action. If an unsent proposal becomes stale, it is invalidated and case returns to `READY_FOR_ACTION` or `INVESTIGATING`. Case transition never relies solely on an agent recommendation.
 

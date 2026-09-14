@@ -2,7 +2,7 @@
 
 The request path writes a durable ``ApplicationOperation``, hands one job over asynchronously,
 and returns ``202``. This is the other end of that handover
-([the deployment contract](../../docs/plans/phase-11-deployment-contract.md) § 14).
+([the deployment contract](../../docs/plans/deployment-contract.md) § 14).
 
 The order of one invocation
 ----------------------------

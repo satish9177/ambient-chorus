@@ -105,7 +105,7 @@ The sanitizer and the commit model are frozen in [ADR-018](../adr/ADR-018-safe-e
 - no EXIF, ICC, XMP, comment, or text chunk survives into the emitted PNG;
 - sanitizing one source twice, in two separate processes, produces byte-identical output and the identical `derivative_sha256`;
 - `ShareableEvidenceRef.media_type` is `image/png` for a JPEG source;
-- the compile transaction's participant count is asserted arithmetically against the staged plan on both `ALLOW` and `DENY`, in the manner Phase 5 used for the investigation apply, so a silently added participant fails before storage;
+- the compile transaction's participant count is asserted arithmetically against the staged plan on both `ALLOW` and `DENY`, in the manner already used for the investigation apply, so a silently added participant fails before storage;
 - a stale compile cannot roll the current pointer backwards, a denied compile leaves the pointer untouched, and a compile never mutates the Core case row or its version;
 - the largest legal `compiler-audit-projection/v1` row at the frozen per-case maxima stays safely inside the 400 KiB item limit.
 
@@ -207,7 +207,7 @@ Playwright covers exactly three surfaces: discovery, Resident B adjust/revoke, p
 67. `test_cross_case_artifact_or_proof_replay_is_refused` — an attested reply, a commit proof, or a due event from another case or namespace.
 68. `test_no_command_constructs_a_commitment_cancellation` and `test_no_command_constructs_actioned_to_ready_for_action`
 38. `test_send_fence_ignores_core_occ_version_and_checks_state_and_authorization_version`
-39. `test_current_view_pointer_move_during_invocation_persists_nothing` — the Phase-7 twin of 25: the pointer moves *while the model is answering*, so only the apply transaction's `VIEW_CURRENT` condition can refuse, and no second invocation follows.
+39. `test_current_view_pointer_move_during_invocation_persists_nothing` — the action-proposal twin of 25: the pointer moves *while the model is answering*, so only the apply transaction's `VIEW_CURRENT` condition can refuse, and no second invocation follows.
 40. `test_draft_execution_round_trips_through_codec` — the `DRAFT` shape carries no approval, send key, rendered hash, or SES token, and presence is monotonic across every transition.
 41. `test_proposal_apply_participant_count_is_exactly_ten` — asserted arithmetically against the staged plan.
 42. `test_second_proposal_against_live_draft_conflicts_without_model_call`

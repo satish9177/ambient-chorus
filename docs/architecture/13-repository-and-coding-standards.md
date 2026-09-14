@@ -1,84 +1,56 @@
 # Repository structure, dependency rules, and coding standards
 
-## Final repository layout
+## Repository layout
 
 ```text
 ambient-chorus/
-├── AGENTS.md
+├── AGENTS.md                        # mandatory instructions for coding agents
 ├── README.md
-├── pyproject.toml                 # uv workspace/tool config
+├── pyproject.toml                   # uv project, dependency groups, tool configuration
 ├── uv.lock
-├── package.json                   # npm workspace command facade
+├── package.json                     # npm workspace command facade
 ├── package-lock.json
 ├── .env.example
-├── compose.yaml                   # DynamoDB Local only
+├── compose.yaml                     # DynamoDB Local only
 ├── apps/
-│   ├── api/
-│   │   └── chorus_api/
-│   │       ├── main.py            # FastAPI composition root
-│   │       ├── dependencies.py
-│   │       ├── problem_details.py
-│   │       └── routes/             # feed, cases, mandates, actions, demo, operations
-│   └── web/
-│       ├── package.json
-│       ├── vite.config.ts
-│       └── src/
-│           ├── api/                # generated schema + hand-written fetch wrapper
-│           ├── components/
-│           ├── surfaces/           # ambient, mandate, case-action only
-│           ├── styles/
-│           ├── app.tsx
-│           └── main.tsx
+│   ├── api/chorus_api/              # FastAPI app: main.py, asgi.py, dependencies, problem details, routes/
+│   └── web/                         # React + Vite SPA
+│       ├── openapi/openapi.json     # committed OpenAPI export
+│       ├── src/
+│       │   ├── api/                 # generated schema.d.ts + the one hand-written fetch client
+│       │   ├── pages/               # the three surfaces: feed, mandate thread, case + action
+│       │   ├── components/          # feed, mandate, case, private, shareable, shared
+│       │   ├── context/, hooks/, styles/
+│       │   ├── app.tsx
+│       │   └── main.tsx
+│       └── tests/                   # Playwright smoke and hero-flow specs
 ├── src/chorus/
-│   ├── domain/                     # standard-library entities, values, state machines, errors
-│   ├── privacy/                    # pure policy/v1 compiler, transformations, canonicalization
-│   ├── contracts/
-│   │   ├── common.py
-│   │   ├── monitor.py              # private runtime contract
-│   │   ├── investigation.py        # private runtime contract
-│   │   └── action.py               # safe view/proposal contract only
-│   ├── application/
-│   │   ├── commands/
-│   │   ├── queries/
-│   │   ├── services/
-│   │   └── operations.py
-│   ├── ports/                       # narrow Protocols: repositories, agents, clock, IDs, storage, mail, scheduler
-│   └── infrastructure/
-│       ├── dynamodb/
-│       ├── s3/
-│       ├── agentcore/
-│       ├── ses/
-│       ├── scheduler/
-│       ├── observability/
-│       └── local/
-├── runtimes/
-│   ├── monitor/                     # entrypoint + monitor/v3 prompt + deployment manifest
-│   ├── investigator/                # entrypoint + investigator/v1 prompt
-│   └── action/                      # entrypoint + action/v1 prompt; allowlisted artifact build
-├── functions/
-│   ├── worker/                      # async application commands
-│   ├── compiler/                    # compiler/fence Lambda composition root
-│   ├── sender/                      # deterministic renderer/SES/reconciliation
-│   └── commitment_watcher/
-├── infra/cdk/
-│   ├── app.py
-│   ├── config.py
-│   └── stacks/                      # data, agents, compute, web, observability
-├── demo/
-│   ├── fixtures/elevator-v1/
-│   ├── evaluation/elevator-v1/
-│   └── README.md
+│   ├── domain/                      # standard-library entities, values, state machines, errors
+│   ├── privacy/                     # pure policy/v1 compiler, transformations, canonicalization
+│   ├── contracts/                   # agent boundary DTOs: monitor, investigation, action, commitment
+│   ├── application/                 # commands, queries, services, operations
+│   ├── ports/                       # narrow Protocols: repositories, agents, clock, storage, mail, scheduler
+│   ├── infrastructure/              # adapters: dynamodb, s3, agentcore, ses, scheduler, secrets, local, ...
+│   ├── composition/                 # local composition root, demo reset, CLI entry points
+│   └── settings.py
+├── runtimes/                        # AgentCore runtimes: monitor, investigator, action, shared server
+├── functions/                       # Lambda entry points: api, worker, compiler, sender,
+│                                    #   commitment_watcher, inbound_mail, demo_reset
+├── infra/cdk/                       # CDK app, configuration, support modules, stacks/
+├── demo/fixtures/elevator-v1/       # frozen synthetic corpus and evidence
+├── tools/                           # artifact build/publish, link/license/secret checks, live evaluation
 ├── tests/
-│   ├── unit/{domain,privacy,application,contracts}/
-│   ├── property/
-│   ├── integration/{dynamodb,aws_adapters,local_flow}/
-│   ├── iam/
-│   ├── evaluation/
-│   └── e2e/
-└── docs/                            # current source of truth
+│   ├── unit/                        # domain, privacy, application, contracts, infra, tooling, ...
+│   ├── property/                    # Hypothesis invariants
+│   ├── contract/                    # cross-layer contracts, including DynamoDB Local persistence
+│   ├── smoke/                       # local hero flow, reset, and negative paths
+│   ├── repair/                      # regressions for independent review findings
+│   ├── evaluation/                  # live model evaluations; skipped without a live binding
+│   └── fixtures/
+└── docs/                            # architecture, ADRs, deployment and demo documents
 ```
 
-Only directories with a concrete first implementation task are created in that phase. Empty pattern directories are not scaffolded early.
+Directories exist only when they hold real code; empty pattern directories are not scaffolded.
 
 ## Python dependency boundaries
 
@@ -129,7 +101,7 @@ Test naming is `test_<unit>_<condition>_<outcome>`. Arrange/act/assert should be
 
 ## Dependency and package management
 
-`uv` owns the Python lock and workspace. Dependency groups: `dev`, `test`, `infra`; runtime packages declare the minimal subset used in their deployment artifact. Exact resolved versions live in `uv.lock`, not copied into docs. Phase 0 pins direct dependency compatible ranges and records licenses.
+`uv` owns the Python lock and workspace. Dependency groups: `dev`, `test`, `agents`, `infra`; runtime packages declare the minimal subset used in their deployment artifact. Exact resolved versions live in `uv.lock`, not copied into docs. Direct dependencies are pinned to compatible ranges, and their licenses are checked by `tools/check_license.py`.
 
 `npm` workspaces own `apps/web` and the root `package-lock.json`. CI uses `npm ci`, never mixed package managers. Dependabot/Renovate is optional after the demo; dependency updates are separate, tested changes.
 
@@ -143,7 +115,7 @@ OpenAPI, prompt, policy, compiler, renderer, fixture, and CDK build versions are
 
 ## Commit/review discipline
 
-- One coherent phase/slice per commit after explicit user permission; no automatic commit or push.
+- One coherent change per commit after explicit user permission; no automatic commit or push.
 - Generated OpenAPI types and locks are committed with the source change that generated them.
 - Security-sensitive changes require doc/ADR/test updates in the same review.
 - `git diff --check`, relevant validation, secret scan, and no private fixture leakage before commit.

@@ -200,7 +200,7 @@ not mean while it lived in a Python object.
 - The watcher role gains one read-only statement scoped to the exact literal partition; the API
   role gains read plus the guarded CAS; the reset principal gains read/write. All three are
   asserted from the synthesized template, and a wildcard clock grant fails the assertion.
-- The reset boundary ([the deployment contract](../plans/phase-11-deployment-contract.md) § 12)
+- The reset boundary ([the deployment contract](../plans/deployment-contract.md) § 12)
   performs steps 1–5 of § 3 as part of the bounded `DEMO` purge.
 - Deployed watcher decisions become reproducible across process restarts, which is what makes the
   demo's 4:30–5:00 segment provable rather than incidental.

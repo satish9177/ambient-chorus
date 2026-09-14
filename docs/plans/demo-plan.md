@@ -1,12 +1,12 @@
 # Five-minute demo runbook
 
-This is the implementation target, not a claim that commands currently exist. The live demo uses only the `DEMO` namespace and the exact three product surfaces.
+This is the runbook for the live, deployed five-minute demo. A step marked *(not yet implemented)* describes the target and must not be presented as working. The live demo uses only the `DEMO` namespace and the exact three product surfaces. To rehearse the same flow without AWS, use the local quickstart in the [README](../../README.md#run-it-locally-no-aws).
 
 ## Preflight (30–60 minutes before)
 
 1. Confirm the deployed version reports expected `policy/v1`, compiler/template/prompt versions, Nova 2 Lite inference-profile targets, and AgentCore endpoint versions.
 2. Confirm Bedrock/AgentCore quota/access, SES verified sender/recipient/configuration set, EventBridge Scheduler role/DLQ, destination secret, CloudWatch alarms, and demo access token.
-3. Run `uv run chorus-demo preflight --namespace DEMO`. It must execute non-sensitive runtime schema smokes, IAM-deny canaries, compiler allow/deny canaries, and a sender mailbox-simulator/controlled-address check. It must not create the elevator case outputs.
+3. *(Not yet implemented.)* Run `uv run chorus-demo preflight --namespace DEMO`. It must execute non-sensitive runtime schema smokes, IAM-deny canaries, compiler allow/deny canaries, and a sender mailbox-simulator/controlled-address check. It must not create the elevator case outputs.
 4. Verify no `SENDING` or `SEND_UNKNOWN` execution exists. An unknown outcome is a hard stop for another live send until reconciled/reset is safely allowed.
 5. Run:
 
@@ -72,7 +72,7 @@ Expected proof: Action has no private/tool/data access, sender alone calls SES, 
 
 ### 3:45–4:30 — Manager promise and real schedule
 
-- Deliver the staged management reply through the inbound boundary. **On the deployed demo this is a real email**, sent from the verified correspondent identity to the receiving address and authenticated by SES's own SPF/DKIM/DMARC verdicts — the fixture-selector route below is the `test`/`development` mechanic, because `LocalInboundMailAuthenticator` refuses to construct in `demo` and the AWS composition passes `authenticator=None` ([the deployment contract](phase-11-deployment-contract.md) § 10.2). The scripted part is the wording; the transport, the authentication, and the correlation are real. Its plain-text body states an explicit ISO date — “We will restore elevator B to service by 2030-01-14.” — because [ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) § 6 rejects weekday and relative date constructs outright and [ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 4 will not let a model turn “Wednesday” into an instant. The presenter selects a **fixture identifier**; the route reads no case, destination, sender, or body from the caller, and the fixture goes through the same attester a deployed delivery would ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md)).
+- Deliver the staged management reply through the inbound boundary. **On the deployed demo this is a real email**, sent from the verified correspondent identity to the receiving address and authenticated by SES's own SPF/DKIM/DMARC verdicts — the fixture-selector route below is the `test`/`development` mechanic, because `LocalInboundMailAuthenticator` refuses to construct in `demo` and the AWS composition passes `authenticator=None` ([the deployment contract](deployment-contract.md) § 10.2). The scripted part is the wording; the transport, the authentication, and the correlation are real. Its plain-text body states an explicit ISO date — “We will restore elevator B to service by 2030-01-14.” — because [ADR-021](../adr/ADR-021-action-grounding-and-caveats.md) § 6 rejects weekday and relative date constructs outright and [ADR-027](../adr/ADR-027-commitment-extraction-grounding-and-authority.md) § 4 will not let a model turn “Wednesday” into an instant. The presenter selects a **fixture identifier**; the route reads no case, destination, sender, or body from the caller, and the fixture goes through the same attester a deployed delivery would ([ADR-026](../adr/ADR-026-inbound-reply-trust-and-correlation.md)).
 - Let the `EXTRACT_COMMITMENT` operation propose span-cited terms; the nine deterministic checks create the commitment, and the scheduler adapter creates a real one-time schedule under the deterministic name and client token.
 - Show logical due time, real mapped schedule time, generation, and case `VERIFYING`.
 
@@ -89,6 +89,7 @@ Expected proof: `ACTIONED ≠ RESOLVED`; the system closes the accountability lo
 
 ## Failure handling during the demo
 
+- **Agents unavailable (AgentCore quota or Bedrock access):** do not substitute captured or fake agent output on the deployed path, and label any recorded or local material as such. The deployed Reset Lambda and a direct SES canary need no case state and are safe live proofs. Do not hand-invoke the compiler or sender Lambda instead: a compile needs real, resident-approved fact IDs and commits a view, and a send needs a real `APPROVED` execution.
 - **Agent failure:** show typed operation failure and explain the deterministic state did not advance. One normal retry with the same operation ID may occur; do not load canned output.
 - **Compiler denial:** show reason and fix only by an actual mandate/state decision. Never bypass policy.
 - **SES explicit failure:** show `FAILED`; do not claim sent. A second attempt requires a fresh proposal/action/approval and probably exceeds demo time.

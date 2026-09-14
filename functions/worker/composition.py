@@ -7,7 +7,7 @@ outcome would be a second implementation of one of them.
 
 The worker is the broadest principal in the system after the API, and its boundary is drawn by
 what this root constructs
-([the deployment contract](../../docs/plans/phase-11-deployment-contract.md) § 8.1):
+([the deployment contract](../../docs/plans/deployment-contract.md) § 8.1):
 
 * the three **AgentCore runtime** adapters -- the worker is the only principal that may invoke
   them, and it reaches them through the runtimes, never through Bedrock directly;

@@ -115,7 +115,7 @@ Every identifier in it is UUIDv5-derived from the seed manifest, so two resets o
 
 `counts.messages` is `24` and `corpus_sha256` is the manifest's declared corpus digest, both verified against the bytes on load. A response whose count or digest disagrees with the manifest is a failed reset, not a reset with a warning.
 
-**Ownership.** Phase 10 owns the reset application service, its local invocation path, and this route against local adapters. Phase 11 owns the deployed version: the durable `DemoManifest` row and `DEMO_RESET_LOCK` in the demo-manifest partition, S3 prefix resolution and bounded deletion, and EventBridge schedule deletion. The service is one implementation with one contract; what changes between the two is which adapters it holds, and a local reset therefore deletes local storage and local objects by exactly the manifest-listed enumeration the deployed one uses — never a scan, never a recursive delete, never a table or bucket drop.
+**Ownership.** The reset application service, its local invocation path, and this route run against local adapters. The deployed reset (`chorus.composition.deployed_demo_reset`, invoked through the dedicated reset Lambda) adds the durable `DemoManifest` row and `DEMO_RESET_LOCK` in the demo-manifest partition, S3 prefix resolution and bounded deletion, and EventBridge schedule deletion. The service is one implementation with one contract; what changes between the two is which adapters it holds, and a local reset therefore deletes local storage and local objects by exactly the manifest-listed enumeration the deployed one uses — never a scan, never a recursive delete, never a table or bucket drop.
 
 ### Ingest messages
 
@@ -160,9 +160,9 @@ commitments: [CommitmentSafeProjection]
 privacy_counts: {included,excluded,denied_by_reason}
 ```
 
-`current_action` is the Phase-7 section and is served by `ReadCurrentAction`: the immutable proposal's safe fields, the **regenerated** plain-text and HTML preview with the `preview_hash` the proposal committed and whether the two still agree, and the safe `DRAFT` execution projection. Nothing is read back from a persisted body, because ADR-022 § 3 stores neither. A case with no proposal returns `current_action: null`, which is a state rather than an error. Reading a `DRAFT` here is Phase 7 — approving or sending one is Phase 8, and neither verb exists on this surface.
+`current_action` is the action-proposal section and is served by `ReadCurrentAction`: the immutable proposal's safe fields, the **regenerated** plain-text and HTML preview with the `preview_hash` the proposal committed and whether the two still agree, and the safe `DRAFT` execution projection. Nothing is read back from a persisted body, because ADR-022 § 3 stores neither. A case with no proposal returns `current_action: null`, which is a state rather than an error. This surface only reads a `DRAFT`; approving and sending are separate commands, and neither verb exists here.
 
-**Phase 10 completes the other five sections**, and completes them as *reads over repository methods that already exist*. No section adds domain state, a persisted projection, a new pointer, or a write path; each is a query and a serializer over a method the persistence layer already exposes. Every field below is either an identifier, a closed enum, a count, a digest, a version, or text that is already externally safe.
+**The other five sections** are *reads over repository methods that already exist*. No section adds domain state, a persisted projection, a new pointer, or a write path; each is a query and a serializer over a method the persistence layer already exposes. Every field below is either an identifier, a closed enum, a count, a digest, a version, or text that is already externally safe.
 
 | Section | Source | Shape |
 |---|---|---|
@@ -205,7 +205,7 @@ For `case_approver`, private title/fact labels and privacy exclusion reasons are
 
 #### Execution version on the case surface
 
-`current_action.execution` is `{execution_id, state, version}`. The `version` field is added in Phase 10 and it closes a hole rather than adding a feature: `POST .../approvals`, `POST .../invalidation`, and `POST .../executions` all require `expected_execution_version`, and before this field no read returned one. A browser that cannot read the version can only guess it, and a guessed optimistic-concurrency token is the browser deciding that the row it is about to authorize has not moved — which is precisely the decision [11](11-frontend-and-demo.md) forbids it from making. It is the row's existing OCC version, surfaced; it is not a new counter, and it is not the `authorization_version`.
+`current_action.execution` is `{execution_id, state, version}`. The `version` field closes a hole rather than adding a feature: `POST .../approvals`, `POST .../invalidation`, and `POST .../executions` all require `expected_execution_version`, and before this field no read returned one. A browser that cannot read the version can only guess it, and a guessed optimistic-concurrency token is the browser deciding that the row it is about to authorize has not moved — which is precisely the decision [11](11-frontend-and-demo.md) forbids it from making. It is the row's existing OCC version, surfaced; it is not a new counter, and it is not the `authorization_version`.
 
 #### Private investigation projection
 

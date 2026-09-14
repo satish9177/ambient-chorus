@@ -1,6 +1,6 @@
-# Ambient CHORUS engineering source of truth
+# Ambient CHORUS engineering documentation
 
-This directory is the implementation contract for Ambient CHORUS. Future engineers and coding agents must begin here.
+This directory is the engineering source of truth for Ambient CHORUS: how the system works, why it is built that way, and how it is deployed and demonstrated. For an overview, current status, and the local quickstart, start with the [project README](../README.md). Coding agents must also follow [AGENTS.md](../AGENTS.md).
 
 ## Authority and precedence
 
@@ -9,7 +9,7 @@ Use this precedence order:
 1. Security invariants and frozen product decisions in this index and [01-principles-and-invariants.md](architecture/01-principles-and-invariants.md).
 2. Accepted ADRs in [`docs/adr`](adr/). A newer accepted ADR overrides an older assumption; update the affected architecture documents in the same change.
 3. Normative contracts in [`docs/architecture`](architecture/), read in the order below.
-4. Implementation sequencing in [`docs/plans`](plans/).
+4. Deployment, demo, risk, and scope documents in [`docs/plans`](plans/).
 5. Examples and diagrams, which illustrate but do not override normative prose.
 
 Keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. If two authoritative documents disagree and no ADR resolves the conflict, stop implementation and repair the documentation first.
@@ -90,8 +90,36 @@ Any change to a frozen decision requires an accepted ADR first.
 | [ADR-030](adr/ADR-030-live-ses-receipt-decoding.md) | Decoding a real SES receipt: thread references, correspondent identity, and recipient authority |
 | [ADR-031](adr/ADR-031-demo-reset-mutation-interlock.md) | Atomic DEMO reset interlock and existing side-effect reservations |
 
-## Implementation control
+### Reading phase references in ADRs
 
-The detailed plan is [implementation-plan.md](plans/implementation-plan.md). [build-order.md](plans/build-order.md) is the dependency gate, [demo-plan.md](plans/demo-plan.md) is the five-minute live path, [risk-register.md](plans/risk-register.md) records residual risk, and [cut-list.md](plans/cut-list.md) prevents scope drift. [phase-11-deployment-contract.md](plans/phase-11-deployment-contract.md) freezes how the already-decided system is deployed — identity, region, stack DAG, AgentCore contract, live IAM canaries, rollback, cost, and the prerequisites that currently block deployment. [phase-13-submission-kit.md](plans/phase-13-submission-kit.md) is the hackathon submission package — Devpost copy, the live and fallback demo scripts, the recording shot list, and the claim-safety audit — kept consistent with the live/blocked AWS state recorded here.
+ADRs are dated decision records, so they keep the vocabulary in use when each decision was accepted — for example "the Phase-8 freeze gate", "the static-now, live-in-Phase-11 split", or "Phase 11 Macro B". Those phrases name the sequential build steps the system was built in:
 
-Architecture is ready only when the documents, ADRs, diagrams, failure matrix, and validation report are internally consistent. Application implementation must wait for explicit user approval.
+| Phase | Build step |
+|---|---|
+| 0 | Repository and toolchain foundation |
+| 1 | Domain model, state machines, canonicalization, and the pure privacy compiler |
+| 2 | Persistence ports and DynamoDB adapters |
+| 3 | Ambient ingestion and the Monitor agent |
+| 4 | Private mandate workflow |
+| 5 | Investigator / Skeptic agent |
+| 6 | Compiler Lambda, safe evidence, and `ShareableCaseView` |
+| 7 | Action runtime, proposal validator, and preview renderer |
+| 8 | Human approval and SES execution |
+| 9 | External replies and the commitment watcher |
+| 10 | Three-surface frontend and local demo |
+| 11 | AWS deployment and AgentCore hardening; its "batches" and "Macro A/B" were sub-steps |
+| 12 | End-to-end and adversarial evaluation |
+| 13 | Demo and submission hardening |
+
+"Static now, live in Phase 11" means a resource was defined in code and asserted against the synthesized CDK template first, and deployed to AWS later. ADRs do not track status: current status is in the [project README](../README.md#project-status) and [deployment-contract.md](plans/deployment-contract.md) § 21.
+
+## Deployment, demo, risk, and scope
+
+- [deployment-contract.md](plans/deployment-contract.md) — how the decided system is deployed to AWS: identity, region, model access, AgentCore runtimes, network, IAM, storage, SES, reset, configuration, the live canary matrix, stack order, cost, acceptance criteria, and current deployment status.
+- [demo-plan.md](plans/demo-plan.md) — the five-minute live demo runbook and failure handling.
+- [risk-register.md](plans/risk-register.md) — residual risks, mitigations, triggers, and owners.
+- [cut-list.md](plans/cut-list.md) — the non-negotiable V1 spine, what to cut first, and explicit non-goals.
+
+## Change control
+
+Documentation and code must agree. A change is architectural when it alters trust zones, permissions, persisted contracts, state transitions, hashing or canonicalization, agent inputs, external side effects, package boundaries, or frozen stack choices; such a change needs an accepted ADR and updates to every affected document **before** the code changes. CI runs `tools/check_architecture_links.py` to keep every local link in this directory valid.
